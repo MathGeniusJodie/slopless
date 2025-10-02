@@ -1,6 +1,8 @@
 # Slopless
 A search engine with currated sources free from SEO slop.
 
+**WIP**
+
 ### Safelist Sources
 * Independent blogs
 * Reputable news sources
