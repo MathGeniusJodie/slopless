@@ -59,8 +59,17 @@ Google and Bing suck now, they're overrun by SEO slop. The internet as most peop
 - [ ] google maps listings of brick and mortar places
 - [ ] https://en.wikipedia.org/wiki/Wikipedia:Reliable_sources/Perennial_sources
 
+### To Scrape for Blocklist
+- [ ] https://en.wikipedia.org/wiki/List_of_fake_news_websites
+- [ ] https://github.com/popcar2/BadWebsiteBlocklist
+- [ ] https://github.com/rjaus/awesome-ublacklist
+- [ ] https://github.com/NotaInutilis/Super-SEO-Spam-Suppressor
+
 ### Implementation Todos
 - [ ] Scraper for automatically finding new safelist sources
 - [ ] Actual search engine implementation
 - [ ] Rankings algorithm
 - [ ] Website UI
+
+### AI Content
+I want to add an option to filter out AI generated content because many people want that, but I don't want to make it the default. AI content that was prompted and well-curated by humans is kinda fine in my book.
