@@ -27,6 +27,10 @@ A search engine with currated sources free from SEO slop.
     - [ ] jodie.website
     - [ ] https://smallweb.cc
     - [ ] https://xn--sr8hvo.ws/directory
+- [ ] aggregator blogs
+    - [ ] https://theindieweb.com/
+    - [ ] https://longform.org/
+- [ ] https://marginalia-search.com/
 - [ ] wiby
 - [ ] google maps listings of brick and mortar places
 - [ ] https://en.wikipedia.org/wiki/Wikipedia:Reliable_sources/Perennial_sources
