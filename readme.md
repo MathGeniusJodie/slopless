@@ -1,5 +1,8 @@
 # Slopless
-A search engine with currated sources free from SEO slop.
+A search engine with currated sources free from SEO slop. This project also aims to recommend websites to other aggregators and search engines to help them improve their own results.
+
+# Why?
+Google and Bing suck now, they're overrun by SEO slop. The internet as most people know it is a cesspool of garbage. The good internet that we are all nostaligic for is still out there, but it's not easy to find. This project aims to fix that.
 
 **WIP**
 
@@ -13,6 +16,13 @@ A search engine with currated sources free from SEO slop.
 * Online encyclopedias
 * Open source repositories
 * User customizable additions
+
+### Careful Consideration
+* substack
+* neocities
+* reddit
+* https://lobste.rs/
+* outgoing links from sites in safelist
 
 ### Blocklist Sources
 * SEO slop
@@ -28,6 +38,16 @@ A search engine with currated sources free from SEO slop.
     - [ ] https://smallweb.cc
     - [ ] https://xn--sr8hvo.ws/directory
     - [ ] https://ooh.directory/
+    - [ ] https://blogroll.org/
+    - [ ] https://1mb.club
+    - [ ] https://kagi.com/smallweb/
+    - [ ] https://indieweb.org/blogroll a blogroll of blogrolls
+    - [ ] https://melonland.net/surf-club
+    - [ ] https://theinternetisshit.xyz/
+    - [ ] https://brisray.com/web/webring-list.htm
+    - [ ] https://curlie.org/
+    - [ ] https://www.404pagefound.com/
+    - [ ] https://webring.theoldnet.com/
 - [ ] aggregator blogs
     - [ ] https://theindieweb.com/
     - [ ] https://longform.org/
