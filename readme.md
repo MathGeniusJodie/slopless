@@ -23,13 +23,17 @@ A search engine with currated sources free from SEO slop.
 
 ### To Scrape for Domains
 - [ ] wikipedia citations
-- [ ] various webrings and blogrolls
+- [ ] various webrings, blogrolls and directories
     - [ ] jodie.website
     - [ ] https://smallweb.cc
     - [ ] https://xn--sr8hvo.ws/directory
+    - [ ] https://ooh.directory/
 - [ ] aggregator blogs
     - [ ] https://theindieweb.com/
     - [ ] https://longform.org/
+    - [ ] https://www.metafilter.com
+    - [ ] https://webcurios.co.uk/
+    - [ ] https://fromthesuperhighway.com/
 - [ ] https://marginalia-search.com/
 - [ ] wiby
 - [ ] google maps listings of brick and mortar places
