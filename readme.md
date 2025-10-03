@@ -58,12 +58,16 @@ Google and Bing suck now, they're overrun by SEO slop. The internet as most peop
 - [ ] wiby
 - [ ] google maps listings of brick and mortar places
 - [ ] https://en.wikipedia.org/wiki/Wikipedia:Reliable_sources/Perennial_sources
+- [ ] https://www.wiki.gg/wikis
+- [ ] https://getindie.wiki/listings/
 
 ### To Scrape for Blocklist
 - [ ] https://en.wikipedia.org/wiki/List_of_fake_news_websites
 - [ ] https://github.com/popcar2/BadWebsiteBlocklist
 - [ ] https://github.com/rjaus/awesome-ublacklist
 - [ ] https://github.com/NotaInutilis/Super-SEO-Spam-Suppressor
+- [ ] https://github.com/NotaInutilis/no-qanon
+
 
 ### Implementation Todos
 - [ ] Scraper for automatically finding new safelist sources
