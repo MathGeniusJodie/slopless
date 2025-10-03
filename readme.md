@@ -68,6 +68,9 @@ Google and Bing suck now, they're overrun by SEO slop. The internet as most peop
 - [ ] https://github.com/NotaInutilis/Super-SEO-Spam-Suppressor
 - [ ] https://github.com/NotaInutilis/no-qanon
 
+### Youtube Lists to Scrape
+- [ ] https://github.com/PrejudiceNeutrino/YouTube_Channels
+- [ ] https://github.com/ErikCH/DevYouTubeList
 
 ### Implementation Todos
 - [ ] Scraper for automatically finding new safelist sources
