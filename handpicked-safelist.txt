@@ -48,4 +48,5 @@ bandcamp.com
 suckless.org
 100r.co
 tunebat.com
-
+doublespeakgames.com
+window-swap.com
