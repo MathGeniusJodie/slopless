@@ -32,6 +32,8 @@ Google and Bing suck now, they're overrun by SEO slop. The internet as most peop
 * User customizable additions
 
 ### To Scrape for Domains
+- [ ] https://tinygem.org/
+- [ ] https://www.teclis.com/
 - [ ] wikipedia citations
 - [ ] various webrings, blogrolls and directories
     - [ ] jodie.website
@@ -55,11 +57,15 @@ Google and Bing suck now, they're overrun by SEO slop. The internet as most peop
     - [ ] https://webcurios.co.uk/
     - [ ] https://fromthesuperhighway.com/
 - [ ] https://marginalia-search.com/
+- [ ] https://searchmysite.net/
 - [ ] wiby
 - [ ] google maps listings of brick and mortar places
 - [ ] https://en.wikipedia.org/wiki/Wikipedia:Reliable_sources/Perennial_sources
 - [ ] https://www.wiki.gg/wikis
 - [ ] https://getindie.wiki/listings/
+- [ ] https://mwmbl.org/
+- [ ] https://stract.com/
+- [ ] https://マリウス.com/the-small-web-101/
 
 ### To Scrape for Blocklist
 - [ ] https://en.wikipedia.org/wiki/List_of_fake_news_websites
@@ -77,6 +83,8 @@ Google and Bing suck now, they're overrun by SEO slop. The internet as most peop
 - [ ] Actual search engine implementation
 - [ ] Rankings algorithm
 - [ ] Website UI
+- [ ] Investigate https://yacy.net/
+
 
 ### AI Content
 I want to add an option to filter out AI generated content because many people want that, but I don't want to make it the default. AI content that was prompted and well-curated by humans is kinda fine in my book.
