@@ -52,3 +52,8 @@ doublespeakgames.com
 window-swap.com
 bbemusic.com
 lowtechmagazine.com
+scholarpedia.org
+encyclopediaofmath.org
+switching.software
+prism-break.org
+theoatmeal.com

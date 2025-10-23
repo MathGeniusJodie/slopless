@@ -66,6 +66,7 @@ Google and Bing suck now, they're overrun by SEO slop. The internet as most peop
 - [ ] https://mwmbl.org/
 - [ ] https://stract.com/
 - [ ] https://マリウス.com/the-small-web-101/
+- [ ] https://en.wikipedia.org/wiki/List_of_online_encyclopedias
 
 ### To Scrape for Blocklist
 - [ ] https://en.wikipedia.org/wiki/List_of_fake_news_websites
@@ -84,6 +85,7 @@ Google and Bing suck now, they're overrun by SEO slop. The internet as most peop
 - [ ] Rankings algorithm
 - [ ] Website UI
 - [ ] Investigate https://yacy.net/
+- [ ] Investigate https://github.com/medialab/hyphe 
 
 
 ### AI Content
