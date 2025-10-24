@@ -85,7 +85,8 @@ Google and Bing suck now, they're overrun by SEO slop. The internet as most peop
 - [ ] Rankings algorithm
 - [ ] Website UI
 - [ ] Investigate https://yacy.net/
-- [ ] Investigate https://github.com/medialab/hyphe 
+- [ ] Investigate https://github.com/medialab/hyphe
+- [ ] Offline/datahoarder mode? https://www.httrack.com/
 
 
 ### AI Content
