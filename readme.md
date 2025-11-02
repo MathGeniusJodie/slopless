@@ -67,6 +67,9 @@ Google and Bing suck now, they're overrun by SEO slop. The internet as most peop
 - [ ] https://stract.com/
 - [ ] https://マリウス.com/the-small-web-101/
 - [ ] https://en.wikipedia.org/wiki/List_of_online_encyclopedias
+- [ ] https://fmhy.net
+- [ ] https://github.com/sindresorhus/awesome
+- [ ] https://www.reddit.com/r/InternetIsBeautiful/
 
 ### To Scrape for Blocklist
 - [ ] https://en.wikipedia.org/wiki/List_of_fake_news_websites
@@ -78,6 +81,7 @@ Google and Bing suck now, they're overrun by SEO slop. The internet as most peop
 ### Youtube Lists to Scrape
 - [ ] https://github.com/PrejudiceNeutrino/YouTube_Channels
 - [ ] https://github.com/ErikCH/DevYouTubeList
+- [ ] https://educational-channels.com
 
 ### Implementation Todos
 - [ ] Scraper for automatically finding new safelist sources
@@ -86,7 +90,7 @@ Google and Bing suck now, they're overrun by SEO slop. The internet as most peop
 - [ ] Website UI
 - [ ] Investigate https://yacy.net/
 - [ ] Investigate https://github.com/medialab/hyphe
-- [ ] Offline/datahoarder mode? https://www.httrack.com/
+- [ ] Offline/datahoarder mode? https://www.httrack.com/ https://en.wikipedia.org/wiki/Heritrix
 
 
 ### AI Content
