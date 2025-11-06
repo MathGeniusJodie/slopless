@@ -57,3 +57,5 @@ encyclopediaofmath.org
 switching.software
 prism-break.org
 theoatmeal.com
+scientific.place
+iomoio.com

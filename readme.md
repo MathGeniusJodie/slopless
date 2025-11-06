@@ -70,6 +70,7 @@ Google and Bing suck now, they're overrun by SEO slop. The internet as most peop
 - [ ] https://fmhy.net
 - [ ] https://github.com/sindresorhus/awesome
 - [ ] https://www.reddit.com/r/InternetIsBeautiful/
+- [ ] github.com/atakanaltok/awesome-useful-websites?tab=readme-ov-file
 
 ### To Scrape for Blocklist
 - [ ] https://en.wikipedia.org/wiki/List_of_fake_news_websites
