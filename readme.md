@@ -71,6 +71,14 @@ Google and Bing suck now, they're overrun by SEO slop. The internet as most peop
 - [ ] https://github.com/sindresorhus/awesome
 - [ ] https://www.reddit.com/r/InternetIsBeautiful/
 - [ ] github.com/atakanaltok/awesome-useful-websites?tab=readme-ov-file
+- [ ] https://manuelmoreale.gumroad.com/l/thegalleryio
+- [ ] https://manuelmoreale.com/blogroll
+- [ ] https://webring.bucketfish.me/
+- [ ] https://maplestrip.space/Websites/Websites.html
+- [ ] minimal.gallery
+- [ ] https://george.gh0.pw
+- [ ] https://www.are.na/
+- [ ] https://theforest.link/
 
 ### To Scrape for Blocklist
 - [ ] https://en.wikipedia.org/wiki/List_of_fake_news_websites
