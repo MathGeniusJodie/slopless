@@ -34,6 +34,7 @@ Google and Bing suck now, they're overrun by SEO slop. The internet as most peop
 ### To Scrape for Domains
 - [ ] https://tinygem.org/
 - [ ] https://www.teclis.com/
+- [ ] https://github.com/kagisearch/smallweb
 - [ ] wikipedia citations
 - [ ] various webrings, blogrolls and directories
     - [ ] jodie.website
@@ -42,7 +43,6 @@ Google and Bing suck now, they're overrun by SEO slop. The internet as most peop
     - [ ] https://ooh.directory/
     - [ ] https://blogroll.org/
     - [ ] https://1mb.club
-    - [ ] https://kagi.com/smallweb/
     - [ ] https://indieweb.org/blogroll a blogroll of blogrolls
     - [ ] https://melonland.net/surf-club
     - [ ] https://theinternetisshit.xyz/
