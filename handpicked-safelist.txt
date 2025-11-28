@@ -75,3 +75,7 @@ searchsystem.co
 svgl.app
 journeyofideas.com
 einzelganger.co
+commandlinefu.com
+tldp.org
+thenumb.at
+unixdigest.com

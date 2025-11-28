@@ -34,7 +34,9 @@ Google and Bing suck now, they're overrun by SEO slop. The internet as most peop
 ### To Scrape for Domains
 - [ ] https://tinygem.org/
 - [ ] https://www.teclis.com/
+- [ ] https://thenumb.at/Graphics-Blogroll/
 - [ ] https://github.com/kagisearch/smallweb
+- [ ] https://github.com/sindresorhus/awesome
 - [ ] wikipedia citations
 - [ ] various webrings, blogrolls and directories
     - [ ] jodie.website
