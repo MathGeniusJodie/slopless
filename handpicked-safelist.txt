@@ -82,3 +82,6 @@ unixdigest.com
 applerankings.com
 sctheblog.com
 realtimerendering.com
+0x2hub.w10.site
+archive.ph
+archive.today
