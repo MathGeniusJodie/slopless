@@ -23,6 +23,7 @@ Google and Bing suck now, they're overrun by SEO slop. The internet as most peop
 * reddit
 * https://lobste.rs/
 * outgoing links from sites in safelist
+* hackernews
 
 ### Blocklist Sources
 * SEO slop
@@ -81,6 +82,7 @@ Google and Bing suck now, they're overrun by SEO slop. The internet as most peop
 - [ ] https://george.gh0.pw
 - [ ] https://www.are.na/
 - [ ] https://theforest.link/
+- [ ] https://laughingmeme.org/links/
 
 ### To Scrape for Blocklist
 - [ ] https://en.wikipedia.org/wiki/List_of_fake_news_websites
@@ -88,6 +90,8 @@ Google and Bing suck now, they're overrun by SEO slop. The internet as most peop
 - [ ] https://github.com/rjaus/awesome-ublacklist
 - [ ] https://github.com/NotaInutilis/Super-SEO-Spam-Suppressor
 - [ ] https://github.com/NotaInutilis/no-qanon
+- [ ] https://danny0838.github.io/content-farm-terminator/en/
+- [ ] https://github.com/FranklyRocks/OnlyHuman
 
 ### Youtube Lists to Scrape
 - [ ] https://github.com/PrejudiceNeutrino/YouTube_Channels
