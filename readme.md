@@ -61,12 +61,9 @@ Google and Bing suck now, they're overrun by SEO slop. The internet as most peop
 - [x] https://en.wikipedia.org/wiki/Wikipedia:Reliable_sources/Perennial_sources
 - [x] https://getindie.wiki/listings/
 - [x] https://mwmbl.org/
-- [ ] https://stract.com/
-- [ ] https://マリウス.com/the-small-web-101/
-- [ ] https://en.wikipedia.org/wiki/List_of_online_encyclopedias
-- [ ] https://fmhy.net
-- [ ] https://github.com/sindresorhus/awesome
-- [ ] https://www.reddit.com/r/InternetIsBeautiful/
+- [x] https://マリウス.com/the-small-web-101/
+- [x] https://fmhy.net
+- [x] https://www.reddit.com/r/InternetIsBeautiful/
 - [ ] github.com/atakanaltok/awesome-useful-websites?tab=readme-ov-file
 - [ ] https://manuelmoreale.gumroad.com/l/thegalleryio
 - [ ] https://manuelmoreale.com/blogroll

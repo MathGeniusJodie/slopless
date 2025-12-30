@@ -33,3 +33,10 @@ python3 recurse_crawl.py "https://searchmysite.net/search/browse/" -o searchmysi
 ./scrape-wiby.sh
 
 ./scrape-anchor-tags.sh "https://getindie.wiki/listings/" "getindiewiki.txt"
+./scrape-anchor-tags.sh "https://マリウス.com/the-small-web-101/" "marius.txt"
+
+python3 recurse_crawl.py "https://fmhy.net" -o fmhy.txt -w 20
+
+./scrape-anchor-tags.sh "https://old.reddit.com/r/InternetIsBeautiful/top/?sort=top&t=all" "reddit-iib-1.txt"
+
+./scrape_subreddit.sh InternetIsBeautiful
