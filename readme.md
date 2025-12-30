@@ -33,16 +33,13 @@ Google and Bing suck now, they're overrun by SEO slop. The internet as most peop
 * User customizable additions
 
 ### To Scrape for Domains
-- [ ] https://tinygem.org/
-- [ ] https://www.teclis.com/
-- [ ] https://thenumb.at/Graphics-Blogroll/
-- [ ] https://github.com/kagisearch/smallweb
-- [ ] https://github.com/sindresorhus/awesome
+- [x] https://raw.githubusercontent.com/kagisearch/smallweb/refs/heads/main/smallweb.txt
+- [x] https://thenumb.at/Graphics-Blogroll/
 - [ ] wikipedia citations
 - [ ] various webrings, blogrolls and directories
-    - [ ] jodie.website
-    - [ ] https://smallweb.cc
-    - [ ] https://xn--sr8hvo.ws/directory
+    - [x] jodie.website
+    - [x] https://smallweb.cc
+    - [x] https://xn--sr8hvo.ws/directory
     - [ ] https://ooh.directory/
     - [ ] https://blogroll.org/
     - [ ] https://1mb.club
@@ -99,6 +96,7 @@ Google and Bing suck now, they're overrun by SEO slop. The internet as most peop
 - [ ] https://github.com/PrejudiceNeutrino/YouTube_Channels
 - [ ] https://github.com/ErikCH/DevYouTubeList
 - [ ] https://educational-channels.com
+- [ ] kagi small yt
 
 ### Implementation Todos
 - [ ] Scraper for automatically finding new safelist sources
