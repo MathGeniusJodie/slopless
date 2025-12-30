@@ -5,10 +5,11 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }
-reqwest = { version = "0.13.1"}
+reqwest = { version = "0.13.1", features = ["json", "stream"] }
 lol_html = "2.7.0"
 dashmap = "6.1.0"
 tantivy = "0.25.0"
 url = "2.4"
 anyhow = "1.0"
 futures = "0.3"
+bytes = "1.11.0"
