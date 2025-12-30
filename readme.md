@@ -40,7 +40,7 @@ Google and Bing suck now, they're overrun by SEO slop. The internet as most peop
     - [x] jodie.website
     - [x] https://smallweb.cc
     - [x] https://xn--sr8hvo.ws/directory
-    - [ ] https://ooh.directory/
+    - [x] https://ooh.directory/
     - [ ] https://blogroll.org/
     - [ ] https://1mb.club
     - [ ] https://indieweb.org/blogroll a blogroll of blogrolls

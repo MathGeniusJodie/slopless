@@ -9,3 +9,7 @@
 # todo: automate more pages?
 
 ./scrape-anchor-tags.sh "https://xn--sr8hvo.ws/directory" "sr8hvo.txt"
+
+python3 recurse_crawl.py https://ooh.directory -x https://ooh.directory/blog/ https://ooh.directory/feeds/ "https://o
+oh.directory/updated/?d=" -o ooh.txt -w 20
+
