@@ -3,7 +3,7 @@ use dashmap::DashSet;
 use lol_html::{element, text, HtmlRewriter, Settings};
 use reqwest::Client;
 use std::sync::{Arc, Mutex};
-use tantivy::schema::{IndexRecordOption, STORED, Schema, TEXT, TextFieldIndexing};
+use tantivy::schema::{STORED, Schema, TEXT};
 use tantivy::{doc, Index, IndexWriter};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
@@ -138,7 +138,7 @@ async fn main() -> Result<()> {
     schema_builder.add_text_field("body", TEXT | STORED);
     let schema = schema_builder.build();
     let index = Index::create_in_ram(schema.clone());
-    let index_writer = Arc::new(Mutex::new(index.writer(50_000_000)?));
+    let index_writer = Arc::new(Mutex::new(index.writer(512_000_000)?));
 
     let crawler = Arc::new(Crawler {
         client: Client::builder().user_agent("RustScraper/1.0").build()?,
@@ -146,7 +146,7 @@ async fn main() -> Result<()> {
         domain: domain_name,
         index_writer: index_writer.clone(),
         schema,
-        concurrency_limit: Arc::new(Semaphore::new(20)),
+        concurrency_limit: Arc::new(Semaphore::new(200)),
     });
 
     crawler.run(start_url).await?;
