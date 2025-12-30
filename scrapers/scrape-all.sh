@@ -40,3 +40,23 @@ python3 recurse_crawl.py "https://fmhy.net" -o fmhy.txt -w 20
 ./scrape-anchor-tags.sh "https://old.reddit.com/r/InternetIsBeautiful/top/?sort=top&t=all" "reddit-iib-1.txt"
 
 ./scrape_subreddit.sh InternetIsBeautiful
+
+./scrape-md.sh "https://raw.githubusercontent.com/atakanaltok/awesome-useful-websites/refs/heads/main/README.md" "atakanaltok.txt"
+
+python3 recurse_crawl.py "https://minimal.gallery/" -o minimalgallery.txt -w 20
+
+# make empty file
+> minimalgallery.txt
+for i in $(seq 1 121); do
+    echo "Scraping minimal.gallery page $i..."
+    ./scrape-anchor-tags.sh "https://minimal.gallery/page/$i/" "temp_minimalgallery.txt"
+    cat temp_minimalgallery.txt >> minimalgallery.txt
+    rm temp_minimalgallery.txt
+done
+
+./scrape-anchor-tags.sh "https://manuelmoreale.com/blogroll" "manuelmoreale.txt"
+./scrape-anchor-tags.sh "https://webring.bucketfish.me/" "bucketfishwebring.txt"
+./scrape-anchor-tags.sh "https://laughingmeme.org/links/" "laughingmeme.txt"
+./scrape-anchor-tags.sh "https://maurycyz.com/real_pages/" "maurycyz.txt"
+
+python3 recurse_crawl.py "https://randomdailyurls.com/archive" -o randomdailyurls.txt -w 20
