@@ -1,11 +1,12 @@
 use anyhow::{anyhow, Result};
 use dashmap::DashSet;
+use lol_html::text;
 use lol_html::{element, html_content::ContentType, HtmlRewriter, Settings};
 use reqwest::Client;
 use std::fs::File;
 use std::io::Write;
-use std::sync::Arc;
-use tantivy::schema::{Schema, TEXT, STORED, IndexRecordOption, TextFieldIndexing, TextAnalyzerParams};
+use std::sync::{Arc, Mutex};
+use tantivy::schema::{Schema, TEXT, STORED, IndexRecordOption, TextFieldIndexing};
 use tantivy::{doc, Index, IndexWriter};
 use url::Url;
 
@@ -13,7 +14,7 @@ struct Crawler {
     client: Client,
     visited: Arc<DashSet<String>>,
     domain: String,
-    index_writer: Arc<IndexWriter>,
+    index_writer: Arc<Mutex<IndexWriter>>,
     schema: Schema,
 }
 
@@ -51,11 +52,8 @@ impl Crawler {
                             Ok(())
                         }),
                         // Collect text from body to index
-                        element!("body", |el| {
-                            el.on_text(|chunks| {
-                                page_text.push(chunks.as_str().to_string());
-                                Ok(())
-                            })?;
+                        text!("body", |chunk| {
+                            page_text.push(chunk.as_str().to_string());
                             Ok(())
                         }),
                     ],
@@ -73,7 +71,7 @@ impl Crawler {
         let url_field = self.schema.get_field("url").unwrap();
         let body_field = self.schema.get_field("body").unwrap();
 
-        self.index_writer.add_document(doc!(
+        self.index_writer.lock().unwrap().add_document(doc!(
             url_field => url_str,
             body_field => full_text, // Indexed but NOT stored (see schema setup)
         ))?;
@@ -116,7 +114,6 @@ async fn main() -> Result<()> {
     schema_builder.add_text_field("url", STORED);
     
     // Body: Index it for search, but DO NOT STORE to save memory
-    let text_indexing = TextAnalyzerParams::default();
     let indexing_options = TextFieldIndexing::default()
         .set_tokenizer("default")
         .set_index_option(IndexRecordOption::WithFreqsAndPositions);
@@ -129,7 +126,7 @@ async fn main() -> Result<()> {
     
     let schema = schema_builder.build();
     let index = Index::create_in_ram(schema.clone()); // Using RAM for this example
-    let index_writer = Arc::new(index.writer(50_000_000)?); // 50MB heap
+    let index_writer = Arc::new(Mutex::new(index.writer(50_000_000)?)); // 50MB heap
 
     // --- Crawler Setup ---
     let crawler = Crawler {
@@ -147,7 +144,7 @@ async fn main() -> Result<()> {
     crawler.crawl(start_url).await?;
 
     // Finalize Index
-    crawler.index_writer.commit()?;
+    crawler.index_writer.lock().unwrap().commit()?;
 
     // --- Output to File ---
     let mut file = File::create("urls.txt")?;
