@@ -31,3 +31,5 @@ python3 recurse_crawl.py "https://fromthesuperhighway.com/" -o fromthesuperhighw
 python3 recurse_crawl.py "https://searchmysite.net/search/browse/" -o searchmysite.txt -w 20
 
 ./scrape-wiby.sh
+
+./scrape-anchor-tags.sh "https://getindie.wiki/listings/" "getindiewiki.txt"

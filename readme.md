@@ -58,10 +58,9 @@ Google and Bing suck now, they're overrun by SEO slop. The internet as most peop
 - [x] https://searchmysite.net/
 - [x] wiby
 - [ ] google maps listings of brick and mortar places
-- [ ] https://en.wikipedia.org/wiki/Wikipedia:Reliable_sources/Perennial_sources
-- [ ] https://www.wiki.gg/wikis
-- [ ] https://getindie.wiki/listings/
-- [ ] https://mwmbl.org/
+- [x] https://en.wikipedia.org/wiki/Wikipedia:Reliable_sources/Perennial_sources
+- [x] https://getindie.wiki/listings/
+- [x] https://mwmbl.org/
 - [ ] https://stract.com/
 - [ ] https://マリウス.com/the-small-web-101/
 - [ ] https://en.wikipedia.org/wiki/List_of_online_encyclopedias
@@ -109,3 +108,8 @@ Google and Bing suck now, they're overrun by SEO slop. The internet as most peop
 
 ### AI Content
 I want to add an option to filter out AI generated content because many people want that, but I don't want to make it the default. AI content that was prompted and well-curated by humans is kinda fine in my book.
+
+# wikipedia perennial sources query todo: automate
+```js
+$$(".perennial-sources tr.s-gr td:last-of-type a").map(a=>a.href)
+```

@@ -88,3 +88,5 @@ archive.today
 phatcode.net
 htmhell.dev
 nry.me
+wiki.gg
+mwmbl.org
