@@ -85,3 +85,6 @@ realtimerendering.com
 0x2hub.w10.site
 archive.ph
 archive.today
+phatcode.net
+htmhell.dev
+nry.me

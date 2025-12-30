@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SlopLess 0.0</title>
+    <style>
+        :root {
+            --bg: #121212;
+            --panel: #1f1f1f;
+            --accent: #007bff;
+            --text: #e0e0e0;
+            --button-bg: #2a2a2a;
+            --button-hover: #3a3a3a;
+        }
+
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; 
+            background: var(--bg); 
+            color: var(--text); 
+            margin: 0; 
+            display: flex; 
+            flex-direction: column; 
+            align-items: center; 
+            justify-content: center; 
+            height: 100vh; 
+        }
+
+        .container {
+            width: 100%;
+            max-width: 700px;
+            text-align: center;
+            padding: 20px;
+        }
+
+        h1 {
+            font-size: 1.5rem;
+            margin-bottom: 2rem;
+            color: #888;
+            letter-spacing: 1px;
+        }
+
+        #query { 
+            padding: 15px; 
+            width: 100%; 
+            box-sizing: border-box;
+            border-radius: 8px; 
+            border: 1px solid #444; 
+            background: var(--panel); 
+            color: white; 
+            font-size: 18px; 
+            margin-top: 20px;
+            outline: none;
+        }
+
+        #query:focus {
+            border-color: var(--accent);
+            box-shadow: 0 0 0 2px rgba(0, 123, 255, 0.2);
+        }
+
+        .button-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 12px;
+            width: 100%;
+        }
+
+        .search-btn { 
+            padding: 12px; 
+            cursor: pointer; 
+            border-radius: 6px; 
+            border: 1px solid #333; 
+            color: white;
+            text-shadow: 0 2px 10px rgba(0,0,0,1);
+            font-weight: 600; 
+            font-size: 18px;
+            transition: all 0.2s;
+            text-transform: uppercase;
+        }
+
+        .btn-wiby {
+            background: oklch(50% 0.3 315);
+        }
+        .btn-marginalia {
+            background: oklch(50% 0.3 225);
+        }
+        .btn-duck {
+            background: oklch(50% 0.3 45);
+        }
+        .btn-wikipedia {
+            background: oklch(50% 0.3 270);
+        }
+        .btn-britannica {
+            background: oklch(50% 0.3 180);
+        }
+        .btn-arxiv {
+            background: oklch(55% 0.3 0);
+        }
+        .btn-reddit {
+            background: oklch(50% 0.3 90);
+        }
+        .btn-chatgpt {
+            background: oklch(50% 0.3 135);
+        }
+
+        .search-btn:hover {
+            filter: brightness(1.15) saturate(1.2);
+            border-color: #fff;
+            transform: translateY(-1px);
+        }
+
+        .search-btn:active {
+            transform: translateY(0);
+        }
+
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>SlopLess 0.0</h1>
+    <div class="button-grid">
+        <!-- Web Engines -->
+        <button class="search-btn btn-wiby" onclick="go('https://wiby.me/?q=')">Wiby</button>
+        <button class="search-btn btn-marginalia" onclick="go('https://search.marginalia.nu/search?query=')">Marginalia</button>
+        <button class="search-btn btn-duck" onclick="go('https://duckduckgo.com/?q=')">DuckDuckGo</button>
+        
+        <!-- Reference -->
+        <button class="search-btn btn-wikipedia" onclick="go('https://en.wikipedia.org/wiki/Special:Search?search=')">Wikipedia</button>
+        <button class="search-btn btn-britannica" onclick="go('https://www.britannica.com/search?query=')">Britannica</button>
+        
+        <!-- Academic/Social -->
+        <button class="search-btn btn-arxiv" onclick="go('https://arxiv.org/search/?searchtype=all&source=header&query=')">ArXiv</button>
+        <button class="search-btn btn-reddit" onclick="go('https://old.reddit.com/search?q=')">Reddit</button>
+        <button class="search-btn btn-chatgpt" onclick="go('https://chat.openai.com/?hints=search&prompt=')">ChatGPT</button>
+    </div>
+    <input type="text" id="query" placeholder="Enter search term..." autofocus>
+</div>
+
+<script>
+    function go(baseUrl) {
+        const query = document.getElementById('query').value;
+        if (!query) {
+            alert("Please enter a search term first.");
+            return;
+        }
+        
+        // Construct the full URL and navigate
+        const fullUrl = baseUrl + encodeURIComponent(query);
+        window.location.href = fullUrl;
+    }
+
+    // Allow pressing "Enter" to trigger the first search engine (Wiby)
+    document.getElementById('query').addEventListener('keypress', function (e) {
+        if (e.key === 'Enter') {
+            go('https://wiby.me/?q=');
+        }
+    });
+</script>
+
+</body>
+</html>

@@ -83,6 +83,8 @@ Google and Bing suck now, they're overrun by SEO slop. The internet as most peop
 - [ ] https://www.are.na/
 - [ ] https://theforest.link/
 - [ ] https://laughingmeme.org/links/
+- [ ] https://maurycyz.com/real_pages/
+- [ ] https://randomdailyurls.com/archive
 
 ### To Scrape for Blocklist
 - [ ] https://en.wikipedia.org/wiki/List_of_fake_news_websites
