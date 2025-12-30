@@ -1,13 +1,26 @@
 use anyhow::{anyhow, Result};
+use clap::Parser; // Added clap for better argument handling
 use dashmap::DashSet;
 use lol_html::{element, text, HtmlRewriter, Settings};
 use reqwest::Client;
 use std::sync::{Arc, Mutex};
 use tantivy::schema::{STORED, Schema, TEXT};
-use tantivy::{doc, Index, IndexWriter};
+use tantivy::{Index, IndexSettings, IndexWriter, doc};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 use url::Url;
+
+/// Simple web crawler with Tantivy indexing
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Domain to crawl (e.g., example.com)
+    domain: String,
+
+    /// URL prefixes to exclude from crawling (can be used multiple times)
+    #[arg(short = 'x', long = "exclude")]
+    exclude: Vec<String>,
+}
 
 struct Crawler {
     client: Client,
@@ -16,11 +29,18 @@ struct Crawler {
     index_writer: Arc<Mutex<IndexWriter>>,
     schema: Schema,
     concurrency_limit: Arc<Semaphore>,
+    excluded_prefixes: Vec<String>, // Added field
 }
 
 impl Crawler {
     pub async fn run(self: Arc<Self>, start_url: Url) -> Result<()> {
         let mut join_set = JoinSet::new();
+        
+        // Initial check for the seed URL
+        if self.is_excluded(&start_url.to_string()) {
+            return Err(anyhow!("Start URL is in the exclusion list"));
+        }
+
         join_set.spawn(Arc::clone(&self).crawl(start_url));
 
         while let Some(res) = join_set.join_next().await {
@@ -37,9 +57,16 @@ impl Crawler {
         Ok(())
     }
 
+    // Helper to check if a URL should be skipped
+    fn is_excluded(&self, url: &str) -> bool {
+        self.excluded_prefixes.iter().any(|prefix| url.starts_with(prefix))
+    }
+
     async fn crawl(self: Arc<Self>, current_url: Url) -> Result<Vec<Url>> {
         let url_str = current_url.to_string();
-        if !self.visited.insert(url_str.clone()) {
+        
+        // Double check exclusion and visited set
+        if self.is_excluded(&url_str) || !self.visited.insert(url_str.clone()) {
             return Ok(vec![]);
         }
 
@@ -51,11 +78,8 @@ impl Crawler {
             return Ok(vec![]);
         }
 
-        // --- THE STREAMING BRIDGE ---
-        // Create a channel to pipe bytes from the Async network to the Sync parser
         let (tx, mut rx) = mpsc::unbounded_channel::<bytes::Bytes>();
 
-        // Spawn a blocking task for lol-html (it's not Send, so it must stay on one thread)
         let parse_handle = tokio::task::spawn_blocking(move || -> Result<(Vec<String>, String)> {
             let mut discovered_links = Vec::new();
             let mut page_text = Vec::new();
@@ -79,7 +103,6 @@ impl Crawler {
                 |_: &[u8]| {},
             );
 
-            // Synchronously pull from the channel until it's closed
             while let Some(chunk) = rx.blocking_recv() {
                 rewriter.write(&chunk)?;
             }
@@ -88,13 +111,11 @@ impl Crawler {
             Ok((discovered_links, page_text.join(" ")))
         });
 
-        // Loop to pull from network and send to the parser task
         while let Some(chunk) = response.chunk().await? {
             let _ = tx.send(chunk.into());
         }
-        drop(tx); // Close channel so the parser knows we're done
+        drop(tx);
 
-        // Wait for the parsing thread to finish
         let (raw_links, full_text) = parse_handle.await??;
 
         // --- INDEXING ---
@@ -113,7 +134,10 @@ impl Crawler {
         for link in raw_links {
             if let Ok(mut absolute_url) = current_url.join(&link) {
                 absolute_url.set_fragment(None);
-                if absolute_url.host_str() == Some(&self.domain) {
+                let abs_url_str = absolute_url.as_str();
+
+                // Check domain AND exclusion list
+                if absolute_url.host_str() == Some(&self.domain) && !self.is_excluded(abs_url_str) {
                     next_urls.push(absolute_url);
                 }
             }
@@ -125,19 +149,19 @@ impl Crawler {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // (Same setup as before, but ensure Crawler::run is called)
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 { return Err(anyhow!("Usage: crawler <domain>")); }
-    
-    let input_domain = args[1].trim_start_matches("http://").trim_start_matches("https://");
+    let args = Args::parse();
+
+    let input_domain = args.domain.trim_start_matches("http://").trim_start_matches("https://");
     let start_url = Url::parse(&format!("https://{}", input_domain))?;
-    let domain_name = start_url.host_str().unwrap().to_string();
+    let domain_name = start_url.host_str().ok_or_else(|| anyhow!("Invalid domain"))?.to_string();
 
     let mut schema_builder = Schema::builder();
     schema_builder.add_text_field("url", STORED);
     schema_builder.add_text_field("body", TEXT | STORED);
     let schema = schema_builder.build();
-    let index = Index::create_in_ram(schema.clone());
+    // let index = Index::create_in_ram(schema.clone());
+    let index = Index::create( tantivy::directory::MmapDirectory::open("ooh")?
+        , schema.clone(), IndexSettings::default())?;
     let index_writer = Arc::new(Mutex::new(index.writer(512_000_000)?));
 
     let crawler = Arc::new(Crawler {
@@ -147,12 +171,12 @@ async fn main() -> Result<()> {
         index_writer: index_writer.clone(),
         schema,
         concurrency_limit: Arc::new(Semaphore::new(200)),
+        excluded_prefixes: args.exclude, // Pass the list here
     });
 
     crawler.run(start_url).await?;
     index_writer.lock().unwrap().commit()?;
 
-    // Create a reader and get the number of documents
     let reader = index.reader()?;
     let searcher = reader.searcher();
     let num_docs = searcher.num_docs();
