@@ -16,5 +16,18 @@ oh.directory/updated/?d=" -o ooh.txt -w 20
 ./scrape-anchor-tags.sh "https://blogroll.org/" "blogrollorg.txt"
 ./scrape-anchor-tags.sh "https://1mb.club" "1mbclub.txt"
 
-python3 recurse_crawl.py https://melonland.net/surf-club -x -o surfclub.txt -w 20
+python3 recurse_crawl.py https://melonland.net/surf-club -o surfclub.txt -w 20
 
+./scrape-json.sh "https://theinternetisshit.xyz/sites.json" "theinternetisshit.txt" '.sites[] .url'
+
+# Not updated anymore so commented out, also take a long time to run
+# python3 recurse_crawl.py https://longform.org/sections -o longform.txt -w 20 -x "https://longform.org/player/"
+python3 recurse_crawl.py "https://webcurios.co.uk/all-curios/" -o webcurios.txt -w 20
+python3 recurse_crawl.py "https://fromthesuperhighway.com/" -o fromthesuperhighway.txt -w 20
+
+./scrape-txt-dirty.sh "https://raw.githubusercontent.com/MarginaliaSearch/PublicData/refs/heads/master/sets/blogs.txt" "marginalia-blogs.txt"
+./scrape-txt-dirty.sh "https://raw.githubusercontent.com/MarginaliaSearch/PublicData/refs/heads/master/sets/random-domains.txt" "marginalia-random.txt"
+
+python3 recurse_crawl.py "https://searchmysite.net/search/browse/" -o searchmysite.txt -w 20
+
+./scrape-wiby.sh

@@ -45,20 +45,18 @@ Google and Bing suck now, they're overrun by SEO slop. The internet as most peop
     - [x] https://1mb.club
     - [ ] https://indieweb.org/blogroll a blogroll of blogrolls
     - [x] https://melonland.net/surf-club
-    - [ ] https://theinternetisshit.xyz/
+    - [x] https://theinternetisshit.xyz/
     - [ ] https://brisray.com/web/webring-list.htm
-    - [ ] https://curlie.org/
     - [ ] https://www.404pagefound.com/
     - [ ] https://webring.theoldnet.com/
 - [ ] aggregator blogs
-    - [ ] https://theindieweb.com/
-    - [ ] https://longform.org/
+    - [x] https://longform.org/
     - [ ] https://www.metafilter.com
-    - [ ] https://webcurios.co.uk/
-    - [ ] https://fromthesuperhighway.com/
-- [ ] https://marginalia-search.com/
-- [ ] https://searchmysite.net/
-- [ ] wiby
+    - [x] https://webcurios.co.uk/
+    - [x] https://fromthesuperhighway.com/
+- [x] https://marginalia-search.com/
+- [x] https://searchmysite.net/
+- [x] wiby
 - [ ] google maps listings of brick and mortar places
 - [ ] https://en.wikipedia.org/wiki/Wikipedia:Reliable_sources/Perennial_sources
 - [ ] https://www.wiki.gg/wikis
@@ -106,6 +104,7 @@ Google and Bing suck now, they're overrun by SEO slop. The internet as most peop
 - [ ] Investigate https://yacy.net/
 - [ ] Investigate https://github.com/medialab/hyphe
 - [ ] Offline/datahoarder mode? https://www.httrack.com/ https://en.wikipedia.org/wiki/Heritrix
+- [ ] Make own wiby instance
 
 
 ### AI Content
