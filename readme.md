@@ -41,10 +41,10 @@ Google and Bing suck now, they're overrun by SEO slop. The internet as most peop
     - [x] https://smallweb.cc
     - [x] https://xn--sr8hvo.ws/directory
     - [x] https://ooh.directory/
-    - [ ] https://blogroll.org/
-    - [ ] https://1mb.club
+    - [x] https://blogroll.org/
+    - [x] https://1mb.club
     - [ ] https://indieweb.org/blogroll a blogroll of blogrolls
-    - [ ] https://melonland.net/surf-club
+    - [x] https://melonland.net/surf-club
     - [ ] https://theinternetisshit.xyz/
     - [ ] https://brisray.com/web/webring-list.htm
     - [ ] https://curlie.org/

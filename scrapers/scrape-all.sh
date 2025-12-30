@@ -13,3 +13,8 @@
 python3 recurse_crawl.py https://ooh.directory -x https://ooh.directory/blog/ https://ooh.directory/feeds/ "https://o
 oh.directory/updated/?d=" -o ooh.txt -w 20
 
+./scrape-anchor-tags.sh "https://blogroll.org/" "blogrollorg.txt"
+./scrape-anchor-tags.sh "https://1mb.club" "1mbclub.txt"
+
+python3 recurse_crawl.py https://melonland.net/surf-club -x -o surfclub.txt -w 20
+
