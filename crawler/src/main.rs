@@ -1,16 +1,16 @@
 use anyhow::{anyhow, Result};
-use clap::Parser; // Added clap for better argument handling
+use clap::Parser;
 use dashmap::DashSet;
 use lol_html::{element, text, HtmlRewriter, Settings};
 use reqwest::Client;
 use std::sync::{Arc, Mutex};
 use tantivy::schema::{STORED, Schema, TEXT};
-use tantivy::{Index, IndexSettings, IndexWriter, doc};
+use tantivy::{doc, Index, IndexSettings, IndexWriter};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 use url::Url;
 
-/// Simple web crawler with Tantivy indexing
+/// Simple web crawler with Tantivy indexing and depth limiting
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -20,6 +20,10 @@ struct Args {
     /// URL prefixes to exclude from crawling (can be used multiple times)
     #[arg(short = 'x', long = "exclude")]
     exclude: Vec<String>,
+
+    /// Maximum depth of links to follow
+    #[arg(short = 'd', long = "depth", default_value_t = 5)]
+    max_depth: usize,
 }
 
 struct Crawler {
@@ -29,25 +33,29 @@ struct Crawler {
     index_writer: Arc<Mutex<IndexWriter>>,
     schema: Schema,
     concurrency_limit: Arc<Semaphore>,
-    excluded_prefixes: Vec<String>, // Added field
+    excluded_prefixes: Vec<String>,
+    max_depth: usize, // Added field
 }
 
 impl Crawler {
     pub async fn run(self: Arc<Self>, start_url: Url) -> Result<()> {
         let mut join_set = JoinSet::new();
-        
-        // Initial check for the seed URL
+
         if self.is_excluded(&start_url.to_string()) {
             return Err(anyhow!("Start URL is in the exclusion list"));
         }
 
-        join_set.spawn(Arc::clone(&self).crawl(start_url));
+        // We start at depth 0
+        join_set.spawn(Arc::clone(&self).crawl(start_url, 0));
 
         while let Some(res) = join_set.join_next().await {
             match res {
-                Ok(Ok(new_links)) => {
-                    for link in new_links {
-                        join_set.spawn(Arc::clone(&self).crawl(link));
+                Ok(Ok((new_links, next_depth))) => {
+                    // Only spawn new tasks if we haven't exceeded max depth
+                    if next_depth <= self.max_depth {
+                        for link in new_links {
+                            join_set.spawn(Arc::clone(&self).crawl(link, next_depth));
+                        }
                     }
                 }
                 Ok(Err(e)) => eprintln!("Crawl error: {}", e),
@@ -57,25 +65,24 @@ impl Crawler {
         Ok(())
     }
 
-    // Helper to check if a URL should be skipped
     fn is_excluded(&self, url: &str) -> bool {
         self.excluded_prefixes.iter().any(|prefix| url.starts_with(prefix))
     }
 
-    async fn crawl(self: Arc<Self>, current_url: Url) -> Result<Vec<Url>> {
+    /// Returns the discovered links and the depth for the next level
+    async fn crawl(self: Arc<Self>, current_url: Url, current_depth: usize) -> Result<(Vec<Url>, usize)> {
         let url_str = current_url.to_string();
-        
-        // Double check exclusion and visited set
+
         if self.is_excluded(&url_str) || !self.visited.insert(url_str.clone()) {
-            return Ok(vec![]);
+            return Ok((vec![], current_depth + 1));
         }
 
         let _permit = self.concurrency_limit.acquire().await?;
-        println!("Crawling: {}", url_str);
+        println!("Depth {}: Crawling {}", current_depth, url_str);
 
         let mut response = self.client.get(current_url.clone()).send().await?;
         if !response.status().is_success() {
-            return Ok(vec![]);
+            return Ok((vec![], current_depth + 1));
         }
 
         let (tx, mut rx) = mpsc::unbounded_channel::<bytes::Bytes>();
@@ -131,19 +138,23 @@ impl Crawler {
 
         // --- LINK FILTERING ---
         let mut next_urls = Vec::new();
-        for link in raw_links {
-            if let Ok(mut absolute_url) = current_url.join(&link) {
-                absolute_url.set_fragment(None);
-                let abs_url_str = absolute_url.as_str();
+        let next_depth = current_depth + 1;
 
-                // Check domain AND exclusion list
-                if absolute_url.host_str() == Some(&self.domain) && !self.is_excluded(abs_url_str) {
-                    next_urls.push(absolute_url);
+        // Only extract links if we are actually going to use them in the next iteration
+        if next_depth <= self.max_depth {
+            for link in raw_links {
+                if let Ok(mut absolute_url) = current_url.join(&link) {
+                    absolute_url.set_fragment(None);
+                    let abs_url_str = absolute_url.as_str();
+
+                    if absolute_url.host_str() == Some(&self.domain) && !self.is_excluded(abs_url_str) {
+                        next_urls.push(absolute_url);
+                    }
                 }
             }
         }
 
-        Ok(next_urls)
+        Ok((next_urls, next_depth))
     }
 }
 
@@ -159,10 +170,13 @@ async fn main() -> Result<()> {
     schema_builder.add_text_field("url", STORED);
     schema_builder.add_text_field("body", TEXT | STORED);
     let schema = schema_builder.build();
-    // let index = Index::create_in_ram(schema.clone());
-    let index = Index::create( tantivy::directory::MmapDirectory::open("database")?
-        , schema.clone(), IndexSettings::default())?;
-    let index_writer = Arc::new(Mutex::new(index.writer(1000_000_000)?));
+    
+    let index = Index::create(
+        tantivy::directory::MmapDirectory::open("database")?,
+        schema.clone(),
+        IndexSettings::default(),
+    )?;
+    let index_writer = Arc::new(Mutex::new(index.writer(100_000_000)?));
 
     let crawler = Arc::new(Crawler {
         client: Client::builder().user_agent("RustScraper/1.0").build()?,
@@ -171,7 +185,8 @@ async fn main() -> Result<()> {
         index_writer: index_writer.clone(),
         schema,
         concurrency_limit: Arc::new(Semaphore::new(200)),
-        excluded_prefixes: args.exclude, // Pass the list here
+        excluded_prefixes: args.exclude,
+        max_depth: args.max_depth, // Initialize from args
     });
 
     crawler.run(start_url).await?;
@@ -179,8 +194,7 @@ async fn main() -> Result<()> {
 
     let reader = index.reader()?;
     let searcher = reader.searcher();
-    let num_docs = searcher.num_docs();
+    println!("Finished! Index contains {} pages.", searcher.num_docs());
 
-    println!("Finished! Visited {} pages.", num_docs);
     Ok(())
 }
