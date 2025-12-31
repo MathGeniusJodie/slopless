@@ -24,7 +24,7 @@ struct Args {
     exclude: Vec<String>,
     #[arg(short = 'd', long = "depth", default_value_t = 5)]
     max_depth: usize,
-    #[arg(short = 'c', long = "concurrency", default_value_t = 200)]
+    #[arg(short = 'c', long = "concurrency", default_value_t = 5000)]
     concurrency: usize,
 }
 
@@ -128,7 +128,7 @@ impl Spider {
             return Ok(vec![]);
         }
 
-        let _permit = self.concurrency_limit.acquire().await?;
+        //let _permit = self.concurrency_limit.acquire().await?;
         
         let response = self.client.get(url.clone()).send().await?;
         if !response.status().is_success() { return Ok(vec![]); }
@@ -195,7 +195,7 @@ impl Spider {
     }
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 20)]
 async fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -253,6 +253,11 @@ async fn main() -> Result<()> {
             Client::builder()
             // chrome
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3")
+            // max concurency for multiple hosts
+            .pool_max_idle_per_host(0)
+            .pool_idle_timeout(None)
+            .timeout(std::time::Duration::from_secs(3))
+            .tcp_nodelay(true)
             .build()?
         )
         .with(RetryTransientMiddleware::new_with_policy(retry_policy))
