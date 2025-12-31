@@ -3,7 +3,8 @@ use clap::Parser;
 use dashmap::DashSet;
 use lol_html::{element, text, HtmlRewriter, Settings};
 use reqwest::Client;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
+use std::fs::read_to_string;
 use std::sync::Arc;
 use tantivy::schema::{Schema, STORED, TEXT};
 use tantivy::{doc, Index, IndexSettings};
@@ -14,13 +15,13 @@ use url::Url;
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Args {
-    #[arg(help = "Domain to crawl (e.g., example.com)")]
-    domain: String,
+    #[arg(help = "Path to text file containing domains (one per line)")]
+    input_file: String,
     #[arg(short = 'x', long = "exclude")]
     exclude: Vec<String>,
     #[arg(short = 'd', long = "depth", default_value_t = 5)]
     max_depth: usize,
-    #[arg(short = 'c', long = "concurrency", default_value_t = 50)]
+    #[arg(short = 'c', long = "concurrency", default_value_t = 1000)]
     concurrency: usize,
 }
 
@@ -32,7 +33,8 @@ struct CrawledData {
 struct Spider {
     client: Client,
     visited_urls: DashSet<String>,
-    target_domain: String,
+    // Changed from String to HashSet for multiple domain support
+    allowed_domains: HashSet<String>,
     excluded_prefixes: Vec<String>,
     max_depth: usize,
     concurrency_limit: Arc<Semaphore>,
@@ -40,8 +42,13 @@ struct Spider {
 }
 
 impl Spider {
-    pub async fn run(self: Arc<Self>, start_url: Url) -> Result<()> {
-        let mut queue = VecDeque::from([(start_url, 0)]);
+    // Modified to take a Vec of starting URLs
+    pub async fn run(self: Arc<Self>, start_urls: Vec<Url>) -> Result<()> {
+        let mut queue = VecDeque::new();
+        for url in start_urls {
+            queue.push_back((url, 0));
+        }
+
         let mut workers = JoinSet::new();
 
         loop {
@@ -84,14 +91,20 @@ impl Spider {
 
         let (links, body_text) = self.parse_stream(response).await?;
 
-        // Send to indexer
         let _ = self.index_tx.send(CrawledData { url: url_str, body: body_text });
 
         let next_depth = depth + 1;
         let normalized = links.into_iter()
             .filter_map(|l| url.join(&l).ok())
             .map(|mut u| { u.set_fragment(None); u })
-            .filter(|u| u.host_str() == Some(&self.target_domain))
+            // Check if the host is in our allowed list
+            .filter(|u| {
+                if let Some(host) = u.host_str() {
+                    self.allowed_domains.contains(host)
+                } else {
+                    false
+                }
+            })
             .map(|u| (u, next_depth))
             .collect();
 
@@ -138,17 +151,56 @@ impl Spider {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // 1. Tantivy Setup
+    // 1. Read domains from file
+    let content = read_to_string(&args.input_file)
+        .with_context(|| format!("Failed to read input file: {}", args.input_file))?;
+    
+    let mut start_urls = Vec::new();
+    let mut allowed_domains = HashSet::new();
+
+    for line in content.lines() {
+        let domain = line.trim();
+        if domain.is_empty() { continue; }
+
+        // Clean domain and create start URL
+        let clean_domain = domain.trim_start_matches("http://").trim_start_matches("https://");
+        let start_url = match Url::parse(&format!("https://{clean_domain}")) {
+            Ok(url) => url,
+            Err(_) => {
+            eprintln!("Skipping invalid domain in file: {domain}");
+            continue;
+            }
+        };
+        
+        if let Some(host) = start_url.host_str() {
+            allowed_domains.insert(host.to_string());
+            start_urls.push(start_url);
+        }
+    }
+
+    if start_urls.is_empty() {
+        anyhow::bail!("No valid domains found in input file.");
+    }
+
+    // 2. Tantivy Setup
     let mut schema_builder = Schema::builder();
     let url_field = schema_builder.add_text_field("url", STORED);
     let body_field = schema_builder.add_text_field("body", TEXT | STORED);
     let schema = schema_builder.build();
     
-    std::fs::create_dir_all("search_db")?;
-    let index = Index::create(tantivy::directory::MmapDirectory::open("search_db")?, schema, IndexSettings::default())?;
-    let mut writer = index.writer(100_000_000)?;
+    //std::fs::create_dir_all("search_db")?;
+    //let index = Index::create(tantivy::directory::MmapDirectory::open("search_db")?, schema, IndexSettings::default())?;
+    // keep old index if exists
+    let index = if std::path::Path::new("search_db").exists() {
+        Index::open_in_dir("search_db")?
+    } else {
+        std::fs::create_dir_all("search_db")?;
+        Index::create(tantivy::directory::MmapDirectory::open("search_db")?, schema, IndexSettings::default())?
+    };
 
-    // 2. Indexer Task
+    let mut writer = index.writer(1000_000_000)?;
+
+    // 3. Indexer Task
     let (index_tx, mut index_rx) = mpsc::unbounded_channel::<CrawledData>();
     let indexer_handle = tokio::spawn(async move {
         let mut count = 0;
@@ -160,29 +212,26 @@ async fn main() -> Result<()> {
         writer.commit().expect("Failed to commit index");
     });
 
-    // 3. Run Spider in a block
-    let clean_domain = args.domain.trim_start_matches("http://").trim_start_matches("https://");
-    let start_url = Url::parse(&format!("https://{clean_domain}"))?;
-
+    // 4. Run Spider
     {
         let spider = Arc::new(Spider {
             client: Client::builder().user_agent("RustSpider/1.0").build()?,
-            index_tx, // This is the sender we need to drop eventually
+            index_tx,
             visited_urls: DashSet::new(),
-            target_domain: start_url.host_str().context("Invalid domain")?.to_string(),
+            allowed_domains,
             excluded_prefixes: args.exclude,
             max_depth: args.max_depth,
             concurrency_limit: Arc::new(Semaphore::new(args.concurrency)),
         });
 
-        spider.run(start_url).await?;
+        spider.run(start_urls).await?;
         println!("Crawl loop finished.");
-    } // <--- Spider is dropped here, closing the index_tx channel!
+    } 
 
-    // 4. Wait for Indexer to finish committing
+    // 5. Wait for Indexer
     indexer_handle.await.context("Indexer task panicked")?;
     
-    // 5. Verify
+    // 6. Verify
     let reader = index.reader()?;
     println!("Verified docs in index: {}", reader.searcher().num_docs());
 
