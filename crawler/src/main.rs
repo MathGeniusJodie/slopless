@@ -6,7 +6,7 @@ use reqwest::Client;
 use reqwest_middleware::{ClientWithMiddleware, ClientBuilder};
 use reqwest_retry::RetryTransientMiddleware;
 use reqwest_retry::policies::ExponentialBackoff;
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::fs::read_to_string;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -41,7 +41,7 @@ struct CrawledData {
 /// RAII Guard to ensure a domain is marked as "inactive" when the worker finishes.
 struct DomainGuard {
     host: String,
-    active_domains: Arc<DashSet<String>>,
+    active_domains: Arc<DashSet<String, ahash::RandomState>>,
 }
 
 impl Drop for DomainGuard {
@@ -52,9 +52,8 @@ impl Drop for DomainGuard {
 
 struct Spider {
     client: ClientWithMiddleware,
-    visited_urls: DashSet<String>,
-    active_domains: Arc<DashSet<String>>, // Tracks which domains are currently being requested
-    allowed_domains: HashSet<String>,
+    visited_urls: DashSet<String, ahash::RandomState>,
+    active_domains: Arc<DashSet<String, ahash::RandomState>>, // Tracks which domains are currently being requested
     excluded_prefixes: Vec<String>,
     max_depth: usize,
     concurrency_limit: usize,
@@ -63,6 +62,7 @@ struct Spider {
     crawled_count: AtomicU64,
     failed_count: AtomicU64,
     verbose: bool,
+    stemmer: rust_stemmers::Stemmer,
 }
 
 
@@ -197,8 +197,6 @@ impl Spider {
             return Ok(vec![]);
         }
 
-        //let _permit = self.concurrency_limit.acquire().await?;
-        
         let response = self.client.get(url.clone()).send().await?;
         if !response.status().is_success() { return Ok(vec![]); }
         
@@ -210,9 +208,7 @@ impl Spider {
             
         if !content_type.starts_with("text/html") { return Ok(vec![]); }
         
-        
-
-        let (links, body_text, title) = self.parse_stream(response,url.clone()).await?;
+        let (links, body_text, title) = self.parse_stream(response).await?;
         let _ = self.index_tx.send(CrawledData { url: url_str, body: body_text, title });
 
         //println!("Depth {depth}: Crawling {url_str}");
@@ -223,7 +219,7 @@ impl Spider {
             .filter_map(|l| url.join(&l).ok())
             .map(|mut u| { u.set_fragment(None); u })
             .filter(|u| {
-                u.host_str().map_or(false, |h| self.allowed_domains.contains(h))
+                u.host_str().map_or(false, |host| url.host_str().map_or(false, |base_host| host == base_host))
             })
             .map(|u| (u, next_depth, retries))
             .collect();
@@ -231,7 +227,7 @@ impl Spider {
         Ok(normalized)
     }
 
-    async fn parse_stream(&self, mut response: reqwest::Response, url:Url) -> Result<(Vec<String>, String, String)> {
+    async fn parse_stream(&self, mut response: reqwest::Response) -> Result<(Vec<String>, String, String)> {
         let (tx, mut rx) = mpsc::unbounded_channel::<bytes::Bytes>();
         let parse_handle = tokio::task::spawn_blocking(move || -> Result<(Vec<String>, String, String)> {
             let mut links = Vec::new();
@@ -261,27 +257,19 @@ impl Spider {
 
             Ok((links, titles.join(" "), body_text))
         });
-/*
-        let body_text = rust_stemmers::Stemmer::create(rust_stemmers::Algorithm::English)
-            .stem(&body_text)
-            .to_string();
-        // truncate body text to 10k characters
-        let body_text = if body_text.len() > 10000 {
-            body_text[..10000].to_string()
-        } else {
-            body_text
-        };*/
 
         while let Some(chunk) = response.chunk().await? { let _ = tx.send(chunk); }
         drop(tx);
         let meta = parse_handle.await??;
 
-        let mut parser = readability_rust::Readability::new(&meta.2, None)?;
-        let body_text = match parser.parse().map(|doc| doc.text_content) {
-            Some(Some(text)) => text,
-            None | Some(None) => meta.2,
-        };
-        let mut body_text = rust_stemmers::Stemmer::create(rust_stemmers::Algorithm::English)
+        //println!("html title: {}",meta.2);
+
+        use dom_smoothie::{Readability, Article, Config};
+        let readability_config = Config::default();
+        let mut readability = Readability::new(meta.2, None, Some(readability_config))?;
+        let article: Article = readability.parse()?;
+        let body_text = article.text_content;
+        let mut body_text = self.stemmer
             .stem(&body_text.to_lowercase())
             .to_string();
         // truncate body text to 10k characters
@@ -309,7 +297,6 @@ async fn main() -> Result<()> {
         .with_context(|| format!("Failed to read input file: {}", args.input_file))?;
     
     let mut start_urls = Vec::new();
-    let mut allowed_domains = HashSet::new();
 
     for line in content.lines() {
         let domain = line.trim();
@@ -324,8 +311,8 @@ async fn main() -> Result<()> {
                 }
             };
         
-        if let Some(host) = start_url.host_str() {
-            allowed_domains.insert(host.to_string());
+        if let Some(_host) = start_url.host_str() {
+            //allowed_domains.insert(host.to_string());
             start_urls.push(start_url);
         }
     }
@@ -371,15 +358,15 @@ async fn main() -> Result<()> {
         .with(RetryTransientMiddleware::new_with_policy(retry_policy))
         .build(),
         index_tx,
-        visited_urls: DashSet::new(),
-        active_domains: Arc::new(DashSet::new()),
-        allowed_domains,
+        visited_urls: DashSet::with_hasher(ahash::RandomState::new()),
+        active_domains: Arc::new(DashSet::with_hasher(ahash::RandomState::new())),
         excluded_prefixes: args.exclude,
         max_depth: args.max_depth,
         concurrency_limit: args.concurrency,
         crawled_count: AtomicU64::new(0),
         failed_count: AtomicU64::new(0),
         verbose: args.verbose,
+        stemmer: rust_stemmers::Stemmer::create(rust_stemmers::Algorithm::English)
     });
 
     spider.run(start_urls).await?;
