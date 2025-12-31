@@ -212,7 +212,7 @@ impl Spider {
         
         
 
-        let (links, body_text, title) = self.parse_stream(response).await?;
+        let (links, body_text, title) = self.parse_stream(response,url.clone()).await?;
         let _ = self.index_tx.send(CrawledData { url: url_str, body: body_text, title });
 
         //println!("Depth {depth}: Crawling {url_str}");
@@ -231,21 +231,16 @@ impl Spider {
         Ok(normalized)
     }
 
-    async fn parse_stream(&self, mut response: reqwest::Response) -> Result<(Vec<String>, String, String)> {
+    async fn parse_stream(&self, mut response: reqwest::Response, url:Url) -> Result<(Vec<String>, String, String)> {
         let (tx, mut rx) = mpsc::unbounded_channel::<bytes::Bytes>();
-        let parse_handle = tokio::task::spawn_blocking(move || -> Result<(Vec<String>, String, String)> {
+        let parse_handle = tokio::task::spawn_blocking(move || -> Result<(Vec<String>, String)> {
             let mut links = Vec::new();
-            let mut texts = Vec::new();
             let mut titles = Vec::new();
             let mut rewriter = HtmlRewriter::new(
                 Settings {
                     element_content_handlers: vec![
                         element!("a[href]", |el| {
                             if let Some(href) = el.get_attribute("href") { links.push(href); }
-                            Ok(())
-                        }),
-                        text!("body", |chunk| {
-                            texts.push(chunk.as_str().to_string());
                             Ok(())
                         }),
                         text!("title", |chunk| {
@@ -259,12 +254,25 @@ impl Spider {
             );
             while let Some(chunk) = rx.blocking_recv() { rewriter.write(&chunk)?; }
             rewriter.end()?;
-            Ok((links, texts.join(" "), titles.join(" ")))
+
+            Ok((links, titles.join(" ")))
         });
+
+        let body_text = readability::extractor::scrape(&url.to_string())?.text;
+        let body_text = rust_stemmers::Stemmer::create(rust_stemmers::Algorithm::English)
+            .stem(&body_text)
+            .to_string();
+        // truncate body text to 10k characters
+        let body_text = if body_text.len() > 10000 {
+            body_text[..10000].to_string()
+        } else {
+            body_text
+        };
 
         while let Some(chunk) = response.chunk().await? { let _ = tx.send(chunk); }
         drop(tx);
-        parse_handle.await?
+        let meta = parse_handle.await??;
+        Ok((meta.0, body_text, meta.1))
     }
 
     fn should_skip(&self, url: &str) -> bool {

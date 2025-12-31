@@ -16,3 +16,5 @@ bytes = "1.11.0"
 clap = { version = "4.0", features = ["derive"] }
 reqwest-middleware = "0.4.2"
 reqwest-retry = "0.8.0"
+readability = "0.3.0"
+rust-stemmers = "1.2.0"
