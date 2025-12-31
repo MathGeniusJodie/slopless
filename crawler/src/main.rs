@@ -68,19 +68,28 @@ impl Crawler {
             }
 
             // 3. Wait for the next task to complete and process discovered links
-            if let Some(res) = join_set.join_next().await {
-                match res {
-                    Ok(Ok(new_links)) => {
-                        for (link, depth) in new_links {
-                            // Only add to queue if within depth limit and not visited
-                            if depth <= self.max_depth && !self.visited.contains(link.as_str()) {
-                                queue.push_back((link, depth));
-                            }
-                        }
-                    }
-                    Ok(Err(e)) => eprintln!("Crawl error: {}", e),
-                    Err(e) => eprintln!("Task join error: {}", e),
+            let res = match join_set.join_next().await {
+                Some(r) => r,
+                None => continue,
+            };
+
+            let new_links = match res {
+                Ok(Ok(links)) => links,
+                Ok(Err(e)) => {
+                    eprintln!("Crawl error: {}", e);
+                    continue;
                 }
+                Err(e) => {
+                    eprintln!("Task join error: {}", e);
+                    continue;
+                }
+            };
+
+            for (link, depth) in new_links {
+                if depth > self.max_depth || self.visited.contains(link.as_str()) {
+                    continue;
+                }
+                queue.push_back((link, depth));
             }
         }
 
@@ -163,17 +172,29 @@ impl Crawler {
         let mut next_urls = Vec::new();
         let next_depth = current_depth + 1;
 
-        if next_depth <= self.max_depth {
-            for link in raw_links {
-                if let Ok(mut absolute_url) = current_url.join(&link) {
-                    absolute_url.set_fragment(None);
-                    let abs_url_str = absolute_url.as_str();
+        if next_depth > self.max_depth {
+            return Ok(next_urls);
+        }
 
-                    if absolute_url.host_str() == Some(&self.domain) && !self.is_excluded(abs_url_str) {
-                        next_urls.push((absolute_url, next_depth));
-                    }
-                }
+        for link in raw_links {
+            let absolute_url = match current_url.join(&link) {
+            Ok(mut url) => {
+                url.set_fragment(None);
+                url
             }
+            Err(_) => continue,
+            };
+
+            let abs_url_str = absolute_url.as_str();
+
+            if absolute_url.host_str() != Some(&self.domain) {
+            continue;
+            }
+            if self.is_excluded(abs_url_str) {
+            continue;
+            }
+
+            next_urls.push((absolute_url, next_depth));
         }
 
         Ok(next_urls)
