@@ -9,9 +9,10 @@ use reqwest_retry::policies::ExponentialBackoff;
 use std::collections::{HashSet, VecDeque};
 use std::fs::read_to_string;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use tantivy::schema::{Schema, STORED, TEXT};
 use tantivy::{doc, Index};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use url::Url;
 
@@ -24,12 +25,16 @@ struct Args {
     exclude: Vec<String>,
     #[arg(short = 'd', long = "depth", default_value_t = 5)]
     max_depth: usize,
-    #[arg(short = 'c', long = "concurrency", default_value_t = 5000)]
+    #[arg(short = 'c', long = "concurrency", default_value_t = 500)]
     concurrency: usize,
+    // verbosity flag could be added here
+    #[arg(short = 'v', long = "verbose", default_value_t = false)]
+    verbose: bool,
 }
 
 struct CrawledData {
     url: String,
+    title: String,
     body: String,
 }
 
@@ -52,12 +57,16 @@ struct Spider {
     allowed_domains: HashSet<String>,
     excluded_prefixes: Vec<String>,
     max_depth: usize,
-    concurrency_limit: Arc<Semaphore>,
+    concurrency_limit: usize,
     index_tx: mpsc::UnboundedSender<CrawledData>,
+    // atomic counter for crawled pages and failures
+    crawled_count: AtomicU64,
+    failed_count: AtomicU64,
+    verbose: bool,
 }
 
 
-fn insert_sorted_depth(deque: &mut VecDeque<(Url, usize)>, item: (Url, usize), depth: usize) {
+fn insert_sorted_depth(deque: &mut VecDeque<(Url, usize, usize)>, item: (Url, usize, usize), depth: usize) {
     let target_depth = item.1;
 
     // 1. Add to the end of the deque: O(1)
@@ -96,16 +105,17 @@ impl Spider {
     pub async fn run(self: Arc<Self>, start_urls: Vec<Url>) -> Result<()> {
         let mut queue = VecDeque::new();
         for url in start_urls {
-            queue.push_back((url, 0));
+            queue.push_back((url, 0, 0));
         }
 
         let mut workers = JoinSet::new();
 
+        let mut last_debug_time = std::time::Instant::now();
         loop {
             // 1. Try to spawn workers up to the concurrency limit
-            while workers.len() < self.concurrency_limit.available_permits() {
+            while workers.len() < self.concurrency_limit {
                 // Find the URL with the smallest depth whose domain is NOT currently being processed
-                let next_idx = queue.iter().position(|(url, _)| {
+                let next_idx = queue.iter().position(|(url, _, _)| {
                     if let Some(host) = url.host_str() {
                         !self.active_domains.contains(host)
                     } else {
@@ -116,7 +126,7 @@ impl Spider {
                 if let Some(idx) = next_idx {
                     //let (url, depth) = queue.remove(idx).expect("Index must exist");
                     // swap remove to avoid shifting elements
-                    let (url, depth) = {
+                    let (url, depth, retries) = {
                         queue.swap(idx, 0);
                         queue.pop_front().expect("Index must exist")
                     };
@@ -132,7 +142,7 @@ impl Spider {
                     workers.spawn(async move { 
                         // The guard is created inside the task to release the domain when finished
                         let _guard = DomainGuard { host, active_domains: Arc::clone(&spider.active_domains) };
-                        spider.process_url(url, depth).await 
+                        spider.process_url(url, depth, retries).await 
                     });
                 } else {
                     // No URLs available for idle domains, stop trying to spawn for now
@@ -149,21 +159,37 @@ impl Spider {
             if let Some(worker_result) = workers.join_next().await {
                 match worker_result? {
                     Ok(found_links) => {
-                        for (link, depth) in found_links {
+                        for (link, depth, retries) in found_links {
                             if depth <= self.max_depth && !self.visited_urls.contains(link.as_str()) {
-                                insert_sorted_depth(&mut queue, (link, depth), self.max_depth);
-                                
+                                insert_sorted_depth(&mut queue, (link, depth, retries), self.max_depth);
                             }
                         }
                     }
-                    Err(e) => eprintln!("Worker error: {:?}", e),
+                    Err(e) => {
+                        if self.verbose {
+                            eprintln!("Worker error: {:?}", e);
+                        }
+                        
+                        self.failed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // todo: re-queuing the URL with incremented retry count
+                    }
                 }
+            }
+            // Periodic debug output
+            if last_debug_time.elapsed().as_secs() >= 10 {
+                println!("Crawled: {}, Failed: {}, Queue size: {}, Active domains: {}",
+                    self.crawled_count.load(std::sync::atomic::Ordering::Relaxed),
+                    self.failed_count.load(std::sync::atomic::Ordering::Relaxed),
+                    queue.len(),
+                    self.active_domains.len(),
+                );
+                last_debug_time = std::time::Instant::now();
             }
         }
         Ok(())
     }
 
-    async fn process_url(&self, url: Url, depth: usize) -> Result<Vec<(Url, usize)>> {
+    async fn process_url(&self, url: Url, depth: usize, retries: usize) -> Result<Vec<(Url, usize, usize)>> {
         let url_str = url.to_string();
         
         // Double check visited (checked again here to prevent race conditions)
@@ -184,10 +210,13 @@ impl Spider {
             
         if !content_type.starts_with("text/html") { return Ok(vec![]); }
         
-        println!("Depth {depth}: Crawling {url_str}");
+        
 
-        let (links, body_text) = self.parse_stream(response).await?;
-        let _ = self.index_tx.send(CrawledData { url: url_str, body: body_text });
+        let (links, body_text, title) = self.parse_stream(response).await?;
+        let _ = self.index_tx.send(CrawledData { url: url_str, body: body_text, title });
+
+        //println!("Depth {depth}: Crawling {url_str}");
+        self.crawled_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let next_depth = depth + 1;
         let normalized = links.into_iter()
@@ -196,17 +225,18 @@ impl Spider {
             .filter(|u| {
                 u.host_str().map_or(false, |h| self.allowed_domains.contains(h))
             })
-            .map(|u| (u, next_depth))
+            .map(|u| (u, next_depth, retries))
             .collect();
 
         Ok(normalized)
     }
 
-    async fn parse_stream(&self, mut response: reqwest::Response) -> Result<(Vec<String>, String)> {
+    async fn parse_stream(&self, mut response: reqwest::Response) -> Result<(Vec<String>, String, String)> {
         let (tx, mut rx) = mpsc::unbounded_channel::<bytes::Bytes>();
-        let parse_handle = tokio::task::spawn_blocking(move || -> Result<(Vec<String>, String)> {
+        let parse_handle = tokio::task::spawn_blocking(move || -> Result<(Vec<String>, String, String)> {
             let mut links = Vec::new();
             let mut texts = Vec::new();
+            let mut titles = Vec::new();
             let mut rewriter = HtmlRewriter::new(
                 Settings {
                     element_content_handlers: vec![
@@ -218,6 +248,10 @@ impl Spider {
                             texts.push(chunk.as_str().to_string());
                             Ok(())
                         }),
+                        text!("title", |chunk| {
+                            titles.push(chunk.as_str().to_string());
+                            Ok(())
+                        }),
                     ],
                     ..Settings::default()
                 },
@@ -225,7 +259,7 @@ impl Spider {
             );
             while let Some(chunk) = rx.blocking_recv() { rewriter.write(&chunk)?; }
             rewriter.end()?;
-            Ok((links, texts.join(" ")))
+            Ok((links, texts.join(" "), titles.join(" ")))
         });
 
         while let Some(chunk) = response.chunk().await? { let _ = tx.send(chunk); }
@@ -268,7 +302,8 @@ async fn main() -> Result<()> {
     }
 
     let mut schema_builder = Schema::builder();
-    let url_field = schema_builder.add_text_field("url", STORED);
+    let url_field = schema_builder.add_text_field("url", TEXT | STORED);
+    let title_field = schema_builder.add_text_field("title", TEXT | STORED);
     let body_field = schema_builder.add_text_field("body", TEXT);
     let schema = schema_builder.build();
     
@@ -276,7 +311,8 @@ async fn main() -> Result<()> {
         Index::open_in_dir("search_db")?
     } else {
         std::fs::create_dir_all("search_db")?;
-        Index::create(tantivy::directory::MmapDirectory::open("search_db")?, schema, tantivy::IndexSettings::default())?
+        let settings = tantivy::IndexSettings::default();
+        Index::create(tantivy::directory::MmapDirectory::open("search_db")?, schema, settings)?
     };
 
     let mut writer = index.writer(1_000_000_000)?;
@@ -284,7 +320,7 @@ async fn main() -> Result<()> {
     
     let indexer_handle = tokio::spawn(async move {
         while let Some(data) = index_rx.recv().await {
-            let _ = writer.add_document(doc!(url_field => data.url, body_field => data.body));
+            let _ = writer.add_document(doc!(url_field => data.url, body_field => data.body, title_field => data.title));
         }
         writer.commit().expect("Failed to commit index");
     });
@@ -311,7 +347,10 @@ async fn main() -> Result<()> {
         allowed_domains,
         excluded_prefixes: args.exclude,
         max_depth: args.max_depth,
-        concurrency_limit: Arc::new(Semaphore::new(args.concurrency)),
+        concurrency_limit: args.concurrency,
+        crawled_count: AtomicU64::new(0),
+        failed_count: AtomicU64::new(0),
+        verbose: args.verbose,
     });
 
     spider.run(start_urls).await?;
