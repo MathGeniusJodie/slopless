@@ -233,7 +233,7 @@ impl Spider {
 
     async fn parse_stream(&self, mut response: reqwest::Response, url:Url) -> Result<(Vec<String>, String, String)> {
         let (tx, mut rx) = mpsc::unbounded_channel::<bytes::Bytes>();
-        let parse_handle = tokio::task::spawn_blocking(move || -> Result<(Vec<String>, String)> {
+        let parse_handle = tokio::task::spawn_blocking(move || -> Result<(Vec<String>, String, String)> {
             let mut links = Vec::new();
             let mut titles = Vec::new();
             let mut rewriter = HtmlRewriter::new(
@@ -252,13 +252,16 @@ impl Spider {
                 },
                 |_: &[u8]| {},
             );
-            while let Some(chunk) = rx.blocking_recv() { rewriter.write(&chunk)?; }
+            let mut body_text = String::new();
+            while let Some(chunk) = rx.blocking_recv() { 
+                rewriter.write(&chunk)?;
+                body_text.push_str(std::str::from_utf8(&chunk).unwrap_or(""));
+            }
             rewriter.end()?;
 
-            Ok((links, titles.join(" ")))
+            Ok((links, titles.join(" "), body_text))
         });
-
-        let body_text = readability::extractor::scrape(&url.to_string())?.text;
+/*
         let body_text = rust_stemmers::Stemmer::create(rust_stemmers::Algorithm::English)
             .stem(&body_text)
             .to_string();
@@ -267,11 +270,29 @@ impl Spider {
             body_text[..10000].to_string()
         } else {
             body_text
-        };
+        };*/
 
         while let Some(chunk) = response.chunk().await? { let _ = tx.send(chunk); }
         drop(tx);
         let meta = parse_handle.await??;
+
+        let mut parser = readability_rust::Readability::new(&meta.2, None)?;
+        let body_text = match parser.parse().map(|doc| doc.text_content) {
+            Some(Some(text)) => text,
+            None | Some(None) => meta.2,
+        };
+        let mut body_text = rust_stemmers::Stemmer::create(rust_stemmers::Algorithm::English)
+            .stem(&body_text.to_lowercase())
+            .to_string();
+        // truncate body text to 10k characters
+        if body_text.len() > 10000 {
+            let mut end  = 10000;
+            while !body_text.is_char_boundary(end) {
+                end -= 1;
+            }
+            body_text.truncate(end);
+        }
+
         Ok((meta.0, body_text, meta.1))
     }
 
