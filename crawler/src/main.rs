@@ -3,6 +3,7 @@ use clap::Parser;
 use dashmap::DashSet;
 use lol_html::{element, text, HtmlRewriter, Settings};
 use reqwest::Client;
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tantivy::schema::{STORED, Schema, TEXT};
 use tantivy::{doc, Index, IndexSettings, IndexWriter};
@@ -10,20 +11,20 @@ use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 use url::Url;
 
-/// Simple web crawler with Tantivy indexing and depth limiting
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Domain to crawl (e.g., example.com)
+    #[arg(help = "Domain to crawl (e.g., example.com)")]
     domain: String,
 
-    /// URL prefixes to exclude from crawling (can be used multiple times)
     #[arg(short = 'x', long = "exclude")]
     exclude: Vec<String>,
 
-    /// Maximum depth of links to follow
     #[arg(short = 'd', long = "depth", default_value_t = 5)]
     max_depth: usize,
+
+    #[arg(short = 'c', long = "concurrency", default_value_t = 50)]
+    concurrency: usize,
 }
 
 struct Crawler {
@@ -34,34 +35,55 @@ struct Crawler {
     schema: Schema,
     concurrency_limit: Arc<Semaphore>,
     excluded_prefixes: Vec<String>,
-    max_depth: usize, // Added field
+    max_depth: usize,
 }
 
 impl Crawler {
+    /// The main loop: manages the queue and orchestrates tasks
     pub async fn run(self: Arc<Self>, start_url: Url) -> Result<()> {
+        let mut queue = VecDeque::new();
         let mut join_set = JoinSet::new();
 
         if self.is_excluded(&start_url.to_string()) {
             return Err(anyhow!("Start URL is in the exclusion list"));
         }
 
-        // We start at depth 0
-        join_set.spawn(Arc::clone(&self).crawl(start_url, 0));
+        // BFS initialization
+        queue.push_back((start_url, 0));
 
-        while let Some(res) = join_set.join_next().await {
-            match res {
-                Ok(Ok((new_links, next_depth))) => {
-                    // Only spawn new tasks if we haven't exceeded max depth
-                    if next_depth <= self.max_depth {
-                        for link in new_links {
-                            join_set.spawn(Arc::clone(&self).crawl(link, next_depth));
+        loop {
+            // 1. Fill the JoinSet with tasks from the queue up to the concurrency limit
+            while !queue.is_empty() && join_set.len() < self.concurrency_limit.available_permits() {
+                if let Some((url, depth)) = queue.pop_front() {
+                    let crawler_clone = Arc::clone(&self);
+                    join_set.spawn(async move {
+                        crawler_clone.crawl(url, depth).await
+                    });
+                }
+            }
+
+            // 2. If no tasks are running and the queue is empty, we are finished
+            if join_set.is_empty() {
+                break;
+            }
+
+            // 3. Wait for the next task to complete and process discovered links
+            if let Some(res) = join_set.join_next().await {
+                match res {
+                    Ok(Ok(new_links)) => {
+                        for (link, depth) in new_links {
+                            // Only add to queue if within depth limit and not visited
+                            if depth <= self.max_depth && !self.visited.contains(link.as_str()) {
+                                queue.push_back((link, depth));
+                            }
                         }
                     }
+                    Ok(Err(e)) => eprintln!("Crawl error: {}", e),
+                    Err(e) => eprintln!("Task join error: {}", e),
                 }
-                Ok(Err(e)) => eprintln!("Crawl error: {}", e),
-                Err(e) => eprintln!("Join error: {}", e),
             }
         }
+
         Ok(())
     }
 
@@ -69,24 +91,25 @@ impl Crawler {
         self.excluded_prefixes.iter().any(|prefix| url.starts_with(prefix))
     }
 
-    /// Returns the discovered links and the depth for the next level
-    async fn crawl(self: Arc<Self>, current_url: Url, current_depth: usize) -> Result<(Vec<Url>, usize)> {
+    async fn crawl(self: Arc<Self>, current_url: Url, current_depth: usize) -> Result<Vec<(Url, usize)>> {
         let url_str = current_url.to_string();
 
+        // Double-check visited/excluded inside the task for thread safety
         if self.is_excluded(&url_str) || !self.visited.insert(url_str.clone()) {
-            return Ok((vec![], current_depth + 1));
+            return Ok(vec![]);
         }
 
+        // Rate limiting / Concurrency control
         let _permit = self.concurrency_limit.acquire().await?;
         println!("Depth {}: Crawling {}", current_depth, url_str);
 
         let mut response = self.client.get(current_url.clone()).send().await?;
         if !response.status().is_success() {
-            return Ok((vec![], current_depth + 1));
+            return Ok(vec![]);
         }
 
+        // Stream body to the parser
         let (tx, mut rx) = mpsc::unbounded_channel::<bytes::Bytes>();
-
         let parse_handle = tokio::task::spawn_blocking(move || -> Result<(Vec<String>, String)> {
             let mut discovered_links = Vec::new();
             let mut page_text = Vec::new();
@@ -119,7 +142,7 @@ impl Crawler {
         });
 
         while let Some(chunk) = response.chunk().await? {
-            let _ = tx.send(chunk.into());
+            let _ = tx.send(chunk);
         }
         drop(tx);
 
@@ -140,7 +163,6 @@ impl Crawler {
         let mut next_urls = Vec::new();
         let next_depth = current_depth + 1;
 
-        // Only extract links if we are actually going to use them in the next iteration
         if next_depth <= self.max_depth {
             for link in raw_links {
                 if let Ok(mut absolute_url) = current_url.join(&link) {
@@ -148,13 +170,13 @@ impl Crawler {
                     let abs_url_str = absolute_url.as_str();
 
                     if absolute_url.host_str() == Some(&self.domain) && !self.is_excluded(abs_url_str) {
-                        next_urls.push(absolute_url);
+                        next_urls.push((absolute_url, next_depth));
                     }
                 }
             }
         }
 
-        Ok((next_urls, next_depth))
+        Ok(next_urls)
     }
 }
 
@@ -171,6 +193,8 @@ async fn main() -> Result<()> {
     schema_builder.add_text_field("body", TEXT | STORED);
     let schema = schema_builder.build();
     
+    // Ensure the directory exists
+    std::fs::create_dir_all("database")?;
     let index = Index::create(
         tantivy::directory::MmapDirectory::open("database")?,
         schema.clone(),
@@ -179,17 +203,22 @@ async fn main() -> Result<()> {
     let index_writer = Arc::new(Mutex::new(index.writer(100_000_000)?));
 
     let crawler = Arc::new(Crawler {
-        client: Client::builder().user_agent("RustScraper/1.0").build()?,
+        client: Client::builder()
+            .user_agent("RustScraper/1.0")
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?,
         visited: Arc::new(DashSet::new()),
         domain: domain_name,
         index_writer: index_writer.clone(),
         schema,
-        concurrency_limit: Arc::new(Semaphore::new(200)),
+        concurrency_limit: Arc::new(Semaphore::new(args.concurrency)),
         excluded_prefixes: args.exclude,
-        max_depth: args.max_depth, // Initialize from args
+        max_depth: args.max_depth,
     });
 
     crawler.run(start_url).await?;
+    
+    // Explicitly commit the index
     index_writer.lock().unwrap().commit()?;
 
     let reader = index.reader()?;
