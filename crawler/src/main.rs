@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use dashmap::DashSet;
 use lol_html::{element, text, HtmlRewriter, Settings};
-use reqwest::{Client, RequestBuilder};
+use reqwest::Client;
 use reqwest_middleware::{ClientWithMiddleware, ClientBuilder};
 use reqwest_retry::RetryTransientMiddleware;
 use reqwest_retry::policies::ExponentialBackoff;
@@ -269,7 +269,7 @@ async fn main() -> Result<()> {
 
     let mut schema_builder = Schema::builder();
     let url_field = schema_builder.add_text_field("url", STORED);
-    let body_field = schema_builder.add_text_field("body", TEXT | STORED);
+    let body_field = schema_builder.add_text_field("body", TEXT);
     let schema = schema_builder.build();
     
     let index = if std::path::Path::new("search_db").exists() {
