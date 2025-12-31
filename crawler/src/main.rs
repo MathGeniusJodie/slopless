@@ -56,6 +56,42 @@ struct Spider {
     index_tx: mpsc::UnboundedSender<CrawledData>,
 }
 
+
+fn insert_sorted_depth(deque: &mut VecDeque<(Url, usize)>, item: (Url, usize), depth: usize) {
+    let target_depth = item.1;
+
+    // 1. Add to the end of the deque: O(1)
+    deque.push_back(item);
+    let mut current_idx = deque.len() - 1;
+
+    // 2. Step through each possible depth level deeper than our target.
+    // We go from 4 down to (target_depth + 1).
+    for d in (target_depth + 1..depth).rev() {
+        // binary_search_by can exit as soon as it finds ANY element with depth 'd'.
+        // In a very long deque with only 5 levels, the 'mid' point of your 
+        // search is extremely likely to hit this depth immediately.
+        let search_result = deque.binary_search_by(|probe| probe.1.cmp(&d));
+
+        match search_result {
+            // Found an element with depth 'd' at 'swap_idx'
+            Ok(swap_idx) => {
+                if swap_idx < current_idx {
+                    deque.swap(current_idx, swap_idx);
+                    current_idx = swap_idx;
+                }
+            }
+            // Depth 'd' doesn't exist. 'idx' is where it WOULD be (the boundary).
+            // We can swap with this boundary to jump past all levels > d.
+            Err(idx) => {
+                if idx < current_idx {
+                    deque.swap(current_idx, idx);
+                    current_idx = idx;
+                }
+            }
+        }
+    }
+}
+
 impl Spider {
     pub async fn run(self: Arc<Self>, start_urls: Vec<Url>) -> Result<()> {
         let mut queue = VecDeque::new();
@@ -69,15 +105,21 @@ impl Spider {
             // 1. Try to spawn workers up to the concurrency limit
             while workers.len() < self.concurrency_limit.available_permits() {
                 // Find the URL with the smallest depth whose domain is NOT currently being processed
-                let next_idx = queue
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, (url, _))| url.host_str().map_or(false, |h| !self.active_domains.contains(h)))
-                    .min_by_key(|&(_, (_, depth))| depth)
-                    .map(|(i, _)| i);
+                let next_idx = queue.iter().position(|(url, _)| {
+                    if let Some(host) = url.host_str() {
+                        !self.active_domains.contains(host)
+                    } else {
+                        false
+                    }
+                });
 
                 if let Some(idx) = next_idx {
-                    let (url, depth) = queue.remove(idx).expect("Index must exist");
+                    //let (url, depth) = queue.remove(idx).expect("Index must exist");
+                    // swap remove to avoid shifting elements
+                    let (url, depth) = {
+                        queue.swap(idx, 0);
+                        queue.pop_front().expect("Index must exist")
+                    };
                     let host = match url.host_str() {
                         Some(h) => h.to_string(),
                         None => continue, // Skip URLs without a valid host
@@ -109,7 +151,8 @@ impl Spider {
                     Ok(found_links) => {
                         for (link, depth) in found_links {
                             if depth <= self.max_depth && !self.visited_urls.contains(link.as_str()) {
-                                queue.push_back((link, depth));
+                                insert_sorted_depth(&mut queue, (link, depth), self.max_depth);
+                                
                             }
                         }
                     }
@@ -256,7 +299,7 @@ async fn main() -> Result<()> {
             // max concurency for multiple hosts
             .pool_max_idle_per_host(0)
             .pool_idle_timeout(None)
-            .timeout(std::time::Duration::from_secs(3))
+            //.timeout(std::time::Duration::from_secs(5))
             .tcp_nodelay(true)
             .build()?
         )
