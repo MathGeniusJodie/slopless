@@ -1,2 +1,3 @@
 crawler/target/
 get_domains/*.txt
+crawler/search_db/*

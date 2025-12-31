@@ -2,12 +2,15 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use dashmap::DashSet;
 use lol_html::{element, text, HtmlRewriter, Settings};
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder};
+use reqwest_middleware::{ClientWithMiddleware, ClientBuilder};
+use reqwest_retry::RetryTransientMiddleware;
+use reqwest_retry::policies::ExponentialBackoff;
 use std::collections::{HashSet, VecDeque};
 use std::fs::read_to_string;
 use std::sync::Arc;
 use tantivy::schema::{Schema, STORED, TEXT};
-use tantivy::{doc, Index, IndexSettings};
+use tantivy::{doc, Index};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 use url::Url;
@@ -30,10 +33,22 @@ struct CrawledData {
     body: String,
 }
 
+/// RAII Guard to ensure a domain is marked as "inactive" when the worker finishes.
+struct DomainGuard {
+    host: String,
+    active_domains: Arc<DashSet<String>>,
+}
+
+impl Drop for DomainGuard {
+    fn drop(&mut self) {
+        self.active_domains.remove(&self.host);
+    }
+}
+
 struct Spider {
-    client: Client,
+    client: ClientWithMiddleware,
     visited_urls: DashSet<String>,
-    // Changed from String to HashSet for multiple domain support
+    active_domains: Arc<DashSet<String>>, // Tracks which domains are currently being requested
     allowed_domains: HashSet<String>,
     excluded_prefixes: Vec<String>,
     max_depth: usize,
@@ -42,7 +57,6 @@ struct Spider {
 }
 
 impl Spider {
-    // Modified to take a Vec of starting URLs
     pub async fn run(self: Arc<Self>, start_urls: Vec<Url>) -> Result<()> {
         let mut queue = VecDeque::new();
         for url in start_urls {
@@ -52,22 +66,44 @@ impl Spider {
         let mut workers = JoinSet::new();
 
         loop {
-            while !queue.is_empty() && workers.len() < self.concurrency_limit.available_permits() {
-                // get smallest depth url
-                let smallest_depth_url = match queue.iter().enumerate()
-                    .min_by_key(|&(_, &(_, depth))| depth)
-                    .map(|(index, _)| index) {
-                        Some(index) => queue.remove(index),
-                        None => break,
+            // 1. Try to spawn workers up to the concurrency limit
+            while workers.len() < self.concurrency_limit.available_permits() {
+                // Find the URL with the smallest depth whose domain is NOT currently being processed
+                let next_idx = queue
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (url, _))| url.host_str().map_or(false, |h| !self.active_domains.contains(h)))
+                    .min_by_key(|&(_, (_, depth))| depth)
+                    .map(|(i, _)| i);
+
+                if let Some(idx) = next_idx {
+                    let (url, depth) = queue.remove(idx).expect("Index must exist");
+                    let host = match url.host_str() {
+                        Some(h) => h.to_string(),
+                        None => continue, // Skip URLs without a valid host
                     };
-                if let Some((url, depth)) = smallest_depth_url {
+                    
+                    // Mark domain as active
+                    self.active_domains.insert(host.clone());
+
                     let spider = Arc::clone(&self);
-                    workers.spawn(async move { spider.process_url(url, depth).await });
+                    workers.spawn(async move { 
+                        // The guard is created inside the task to release the domain when finished
+                        let _guard = DomainGuard { host, active_domains: Arc::clone(&spider.active_domains) };
+                        spider.process_url(url, depth).await 
+                    });
+                } else {
+                    // No URLs available for idle domains, stop trying to spawn for now
+                    break;
                 }
             }
 
-            if workers.is_empty() { break; }
+            if workers.is_empty() && queue.is_empty() {
+                break;
+            }
 
+            // 2. Wait for at least one worker to finish. 
+            // This frees up a concurrency slot and potentially a domain lock.
             if let Some(worker_result) = workers.join_next().await {
                 match worker_result? {
                     Ok(found_links) => {
@@ -86,6 +122,8 @@ impl Spider {
 
     async fn process_url(&self, url: Url, depth: usize) -> Result<Vec<(Url, usize)>> {
         let url_str = url.to_string();
+        
+        // Double check visited (checked again here to prevent race conditions)
         if self.should_skip(&url_str) || !self.visited_urls.insert(url_str.clone()) {
             return Ok(vec![]);
         }
@@ -94,30 +132,26 @@ impl Spider {
         
         let response = self.client.get(url.clone()).send().await?;
         if !response.status().is_success() { return Ok(vec![]); }
-        // cancel if not html
+        
         let content_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
+            
         if !content_type.starts_with("text/html") { return Ok(vec![]); }
+        
         println!("Depth {depth}: Crawling {url_str}");
 
         let (links, body_text) = self.parse_stream(response).await?;
-
         let _ = self.index_tx.send(CrawledData { url: url_str, body: body_text });
 
         let next_depth = depth + 1;
         let normalized = links.into_iter()
             .filter_map(|l| url.join(&l).ok())
             .map(|mut u| { u.set_fragment(None); u })
-            // Check if the host is in our allowed list
             .filter(|u| {
-                if let Some(host) = u.host_str() {
-                    self.allowed_domains.contains(host)
-                } else {
-                    false
-                }
+                u.host_str().map_or(false, |h| self.allowed_domains.contains(h))
             })
             .map(|u| (u, next_depth))
             .collect();
@@ -165,7 +199,6 @@ impl Spider {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // 1. Read domains from file
     let content = read_to_string(&args.input_file)
         .with_context(|| format!("Failed to read input file: {}", args.input_file))?;
     
@@ -175,16 +208,15 @@ async fn main() -> Result<()> {
     for line in content.lines() {
         let domain = line.trim();
         if domain.is_empty() { continue; }
-
-        // Clean domain and create start URL
         let clean_domain = domain.trim_start_matches("http://").trim_start_matches("https://");
-        let start_url = match Url::parse(&format!("https://{clean_domain}")) {
-            Ok(url) => url,
-            Err(_) => {
-            eprintln!("Skipping invalid domain in file: {domain}");
-            continue;
-            }
-        };
+        let start_url = match Url::parse(&format!("https://{clean_domain}"))
+            .context("Invalid domain") {
+                Ok(url) => url,
+                Err(e) => {
+                    eprintln!("Skipping invalid domain '{}': {:?}", domain, e);
+                    continue;
+                }
+            };
         
         if let Some(host) = start_url.host_str() {
             allowed_domains.insert(host.to_string());
@@ -192,62 +224,52 @@ async fn main() -> Result<()> {
         }
     }
 
-    if start_urls.is_empty() {
-        anyhow::bail!("No valid domains found in input file.");
-    }
-
-    // 2. Tantivy Setup
     let mut schema_builder = Schema::builder();
     let url_field = schema_builder.add_text_field("url", STORED);
     let body_field = schema_builder.add_text_field("body", TEXT | STORED);
     let schema = schema_builder.build();
     
-    //std::fs::create_dir_all("search_db")?;
-    //let index = Index::create(tantivy::directory::MmapDirectory::open("search_db")?, schema, IndexSettings::default())?;
-    // keep old index if exists
     let index = if std::path::Path::new("search_db").exists() {
         Index::open_in_dir("search_db")?
     } else {
         std::fs::create_dir_all("search_db")?;
-        Index::create(tantivy::directory::MmapDirectory::open("search_db")?, schema, IndexSettings::default())?
+        Index::create(tantivy::directory::MmapDirectory::open("search_db")?, schema, tantivy::IndexSettings::default())?
     };
 
-    let mut writer = index.writer(1000_000_000)?;
-
-    // 3. Indexer Task
+    let mut writer = index.writer(1_000_000_000)?;
     let (index_tx, mut index_rx) = mpsc::unbounded_channel::<CrawledData>();
+    
     let indexer_handle = tokio::spawn(async move {
-        let mut count = 0;
         while let Some(data) = index_rx.recv().await {
             let _ = writer.add_document(doc!(url_field => data.url, body_field => data.body));
-            count += 1;
         }
-        println!("Indexer received shutdown signal. Committing {count} docs...");
         writer.commit().expect("Failed to commit index");
     });
 
-    // 4. Run Spider
-    {
-        let spider = Arc::new(Spider {
-            client: Client::builder().user_agent("RustSpider/1.0").build()?,
-            index_tx,
-            visited_urls: DashSet::new(),
-            allowed_domains,
-            excluded_prefixes: args.exclude,
-            max_depth: args.max_depth,
-            concurrency_limit: Arc::new(Semaphore::new(args.concurrency)),
-        });
+    let retry_policy = ExponentialBackoff::builder().build_with_max_retries(4);
 
-        spider.run(start_urls).await?;
-        println!("Crawl loop finished.");
-    } 
+    let spider = Arc::new(Spider {
+        client: ClientBuilder::new(
+            Client::builder()
+            // chrome
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3")
+            .build()?
+        )
+        .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+        .build(),
+        index_tx,
+        visited_urls: DashSet::new(),
+        active_domains: Arc::new(DashSet::new()),
+        allowed_domains,
+        excluded_prefixes: args.exclude,
+        max_depth: args.max_depth,
+        concurrency_limit: Arc::new(Semaphore::new(args.concurrency)),
+    });
 
-    // 5. Wait for Indexer
-    indexer_handle.await.context("Indexer task panicked")?;
+    spider.run(start_urls).await?;
     
-    // 6. Verify
-    let reader = index.reader()?;
-    println!("Verified docs in index: {}", reader.searcher().num_docs());
+    indexer_handle.await.context("Indexer task panicked")?;
+    println!("Crawl finished. Docs in index: {}", index.reader()?.searcher().num_docs());
 
     Ok(())
 }
