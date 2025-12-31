@@ -160,9 +160,9 @@ async fn main() -> Result<()> {
     schema_builder.add_text_field("body", TEXT | STORED);
     let schema = schema_builder.build();
     // let index = Index::create_in_ram(schema.clone());
-    let index = Index::create( tantivy::directory::MmapDirectory::open("ooh")?
+    let index = Index::create( tantivy::directory::MmapDirectory::open("database")?
         , schema.clone(), IndexSettings::default())?;
-    let index_writer = Arc::new(Mutex::new(index.writer(512_000_000)?));
+    let index_writer = Arc::new(Mutex::new(index.writer(1000_000_000)?));
 
     let crawler = Arc::new(Crawler {
         client: Client::builder().user_agent("RustScraper/1.0").build()?,
