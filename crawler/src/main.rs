@@ -21,7 +21,7 @@ struct Args {
     exclude: Vec<String>,
     #[arg(short = 'd', long = "depth", default_value_t = 5)]
     max_depth: usize,
-    #[arg(short = 'c', long = "concurrency", default_value_t = 1000)]
+    #[arg(short = 'c', long = "concurrency", default_value_t = 200)]
     concurrency: usize,
 }
 
@@ -53,7 +53,14 @@ impl Spider {
 
         loop {
             while !queue.is_empty() && workers.len() < self.concurrency_limit.available_permits() {
-                if let Some((url, depth)) = queue.pop_front() {
+                // get smallest depth url
+                let smallest_depth_url = match queue.iter().enumerate()
+                    .min_by_key(|&(_, &(_, depth))| depth)
+                    .map(|(index, _)| index) {
+                        Some(index) => queue.remove(index),
+                        None => break,
+                    };
+                if let Some((url, depth)) = smallest_depth_url {
                     let spider = Arc::clone(&self);
                     workers.spawn(async move { spider.process_url(url, depth).await });
                 }
@@ -70,7 +77,7 @@ impl Spider {
                             }
                         }
                     }
-                    Err(e) => eprintln!("Crawl error: {e}"),
+                    Err(e) => eprintln!("Worker error: {:?}", e),
                 }
             }
         }
@@ -84,10 +91,17 @@ impl Spider {
         }
 
         let _permit = self.concurrency_limit.acquire().await?;
-        println!("Depth {depth}: Crawling {url_str}");
         
         let response = self.client.get(url.clone()).send().await?;
         if !response.status().is_success() { return Ok(vec![]); }
+        // cancel if not html
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !content_type.starts_with("text/html") { return Ok(vec![]); }
+        println!("Depth {depth}: Crawling {url_str}");
 
         let (links, body_text) = self.parse_stream(response).await?;
 
