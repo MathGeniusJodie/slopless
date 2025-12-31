@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }
-reqwest = { version = "0.12.1", features = ["json", "stream"] }
+reqwest = { version = "0.12.1", features = ["json", "stream", "rustls-tls"] }
 lol_html = "2.7.0"
 dashmap = "6.1.0"
 tantivy = "0.25.0"
