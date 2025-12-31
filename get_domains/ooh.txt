@@ -22,6 +22,7 @@ aaugh.com
 abakcus.com
 abandoned.photos
 abetterbeerblog427.com
+aboutfeeds.com
 abscond.org
 accessibility.blog.gov.uk
 accidentalwoodworker.blogspot.com
@@ -69,7 +70,6 @@ alisonwilder.com
 alisonwilder.net
 allenpike.com
 alliamaredhead.com
-alliwantforchristmas.is
 allthingslinguistic.com
 almad.blog
 alondoninheritance.com
@@ -272,6 +272,7 @@ blog.zarfhome.com
 blog.zmh.org
 blog.zsec.uk
 blognomic.com
+blogroll.org
 blogs.agu.org
 blogs.library.duke.edu
 blogs.loc.gov
@@ -426,6 +427,7 @@ cloudfour.com
 cmhb.de
 coastalwalker.co.uk
 coastkid.blogspot.com
+codemanship.wordpress.com
 coffeegeek.com
 coffeesnobblog.com
 colinmorris.github.io
@@ -616,6 +618,8 @@ faroutliers.wordpress.com
 fasterthanli.me
 fastestslowguy.blogspot.com
 fberriman.com
+feedland.org
+feedle.world
 feelinglistless.blogspot.com
 fgiesen.wordpress.com
 fiftydresses.com
@@ -685,6 +689,7 @@ gemmacope.land
 genesistemple.com
 george08.blogspot.com
 geotripper.blogspot.com
+getblogging.org
 ggwash.org
 gigawho.wordpress.com
 gilest.org
@@ -1481,6 +1486,7 @@ scrivenerserror.blogspot.com
 scytheassociation.org
 seanbonner.com
 seandietrich.com
+searchmysite.net
 sebald.wordpress.com
 secondglancehistory.com
 seekingstars.tumblr.com
@@ -1512,7 +1518,6 @@ shoptalkshow.com
 sia.codes
 siderea.dreamwidth.org
 sidewalken.com
-sightlessscribbles.com
 silentfilmlivemusic.blogspot.com
 silentlocations.com
 silentlondon.co.uk
@@ -1756,6 +1761,7 @@ thisisnthappiness.com
 thiswayupzine.blogspot.com
 thisweekinthe90s.com
 thomasguignard.photo
+thomaswc.com
 thonyc.wordpress.com
 throneofsalt.blogspot.com
 thundergolfer.com
@@ -2031,7 +2037,6 @@ www.dummies-for-destruction.co.uk
 www.dutchgenealogy.nl
 www.earth.org.uk
 www.econlib.org
-www.econtalk.org
 www.eduwonk.com
 www.edwardianpromenade.com
 www.edwardseckerson.biz
@@ -2106,7 +2111,6 @@ www.iainsinclair.org.uk
 www.iamcal.com
 www.ianbetteridge.com
 www.ianvisits.co.uk
-www.ibtimes.co.uk
 www.idiotking.org
 www.ikkaro.com
 www.ilike.org.uk
@@ -2174,7 +2178,6 @@ www.leonarddavid.com
 www.librarian.net
 www.linusakesson.net
 www.lisaspangenberg.com
-www.listenlater.net
 www.livefreeordichotomize.com
 www.lkhrs.com
 www.lloydatkinson.net
@@ -2447,6 +2450,7 @@ www.truefitt-baker.co.uk
 www.tryanphotos.com
 www.tumblr.com
 www.typewolf.com
+www.uapcheck.com
 www.uncharted-worlds.org
 www.underconsideration.com
 www.universetoday.com

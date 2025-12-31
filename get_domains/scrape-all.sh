@@ -36,13 +36,9 @@ python3 recurse_crawl.py "https://searchmysite.net/search/browse/" -o searchmysi
 
 python3 recurse_crawl.py "https://fmhy.net" -o fmhy.txt -w 20
 
-./scrape-anchor-tags.sh "https://old.reddit.com/r/InternetIsBeautiful/top/?sort=top&t=all" "reddit-iib-1.txt"
-
 ./scrape_subreddit.sh InternetIsBeautiful
 
 ./scrape-md.sh "https://raw.githubusercontent.com/atakanaltok/awesome-useful-websites/refs/heads/main/README.md" "atakanaltok.txt"
-
-python3 recurse_crawl.py "https://minimal.gallery/" -o minimalgallery.txt -w 20
 
 # make empty file
 > minimalgallery.txt
@@ -59,3 +55,8 @@ done
 ./scrape-anchor-tags.sh "https://maurycyz.com/real_pages/" "maurycyz.txt"
 
 python3 recurse_crawl.py "https://randomdailyurls.com/archive" -o randomdailyurls.txt -w 20
+
+
+# concat all txt files into one big file and dedupe
+cat *.txt | sort -u > all_domains.txt
+wc -l ./all_domains.txt

@@ -11,3 +11,5 @@ for i in $(seq 1 5992); do
 done
 
 sort -u wiby.txt -o wiby.txt
+
+# last scrape only got to page 950 because of throttling 
