@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use dashmap::DashSet;
+use futures::FutureExt;
 use lol_html::{element, text, HtmlRewriter, Settings};
 use reqwest::Client;
 use reqwest_middleware::{ClientWithMiddleware, ClientBuilder};
@@ -30,7 +31,7 @@ struct Args {
     exclude: Vec<String>,
     #[arg(short = 'd', long = "depth", default_value_t = 5)]
     max_depth: usize,
-    #[arg(short = 'c', long = "concurrency", default_value_t = 200)]
+    #[arg(short = 'c', long = "concurrency", default_value_t = 500)]
     concurrency: usize,
     // verbosity flag could be added here
     #[arg(short = 'v', long = "verbose", default_value_t = false)]
@@ -104,7 +105,7 @@ impl Spider {
         let mut last_debug_time = std::time::Instant::now();
         loop {
             // 1. Try to spawn workers up to the concurrency limit
-            while workers.len() < self.concurrency_limit {
+            while workers.len() <= self.concurrency_limit {
                 // Pop items until we find one whose domain is not active, buffering the others.
                 let mut buffer: Vec<HeapItem> = Vec::new();
                 let mut found: Option<HeapItem> = None;
@@ -148,22 +149,31 @@ impl Spider {
 
             // 2. Wait for at least one worker to finish. 
             // This frees up a concurrency slot and potentially a domain lock.
-            if let Some(worker_result) = workers.join_next().await {
-                match worker_result? {
-                    Ok(found_links) => {
-                        for (link, depth, retries) in found_links {
-                            if depth <= self.max_depth && !self.visited_urls.contains(link.as_str()) {
-                                queue.push(HeapItem { url: link, depth, retries });
+            // wait for at least one worker to finish
+            if let Some(first_result) = workers.join_next().await {
+                // iterator: first the awaited result, then any already-ready results (non-blocking)
+                let iter = std::iter::once(first_result)
+                    .chain(std::iter::from_fn(|| match workers.join_next().now_or_never() {
+                        Some(r) => r,
+                        None => None,
+                    }));
+                for worker_result in iter {
+                    match worker_result? {
+                        Ok(found_links) => {
+                            for (link, depth, retries) in found_links {
+                                if depth <= self.max_depth && !self.visited_urls.contains(link.as_str()) {
+                                    queue.push(HeapItem { url: link, depth, retries });
+                                }
                             }
                         }
-                    }
-                    Err(e) => {
-                        if self.verbose {
-                            eprintln!("Worker error: {:?}", e);
+                        Err(e) => {
+                            if self.verbose {
+                                eprintln!("Worker error: {:?}", e);
+                            }
+                            
+                            self.failed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            // todo: re-queuing the URL with incremented retry count
                         }
-                        
-                        self.failed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        // todo: re-queuing the URL with incremented retry count
                     }
                 }
             }
