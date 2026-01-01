@@ -6,15 +6,18 @@ use reqwest::Client;
 use reqwest_middleware::{ClientWithMiddleware, ClientBuilder};
 use reqwest_retry::RetryTransientMiddleware;
 use reqwest_retry::policies::ExponentialBackoff;
+use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
 use std::collections::VecDeque;
 use std::fs::read_to_string;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use tantivy::schema::{Schema, STORED, TEXT};
+use tantivy::schema::{IndexRecordOption, STORED, Schema, TEXT, TextFieldIndexing, TextOptions};
 use tantivy::{doc, Index};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use url::Url;
+use nlprule::{Rules, Tokenizer, tokenizer_filename, rules_filename};
+
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -62,7 +65,9 @@ struct Spider {
     crawled_count: AtomicU64,
     failed_count: AtomicU64,
     verbose: bool,
-    stemmer: rust_stemmers::Stemmer,
+    //stemmer: rust_stemmers::Stemmer,
+    rules: Rules,
+    tokenizer: Tokenizer,
 }
 
 
@@ -176,7 +181,7 @@ impl Spider {
                 }
             }
             // Periodic debug output
-            if last_debug_time.elapsed().as_secs() >= 10 {
+            if last_debug_time.elapsed().as_secs() >= 5 {
                 println!("Crawled: {}, Failed: {}, Queue size: {}, Active domains: {}",
                     self.crawled_count.load(std::sync::atomic::Ordering::Relaxed),
                     self.failed_count.load(std::sync::atomic::Ordering::Relaxed),
@@ -269,17 +274,26 @@ impl Spider {
         let mut readability = Readability::new(meta.2, None, Some(readability_config))?;
         let article: Article = readability.parse()?;
         let body_text = article.text_content;
-        let mut body_text = self.stemmer
-            .stem(&body_text.to_lowercase())
-            .to_string();
-        // truncate body text to 10k characters
-        if body_text.len() > 10000 {
-            let mut end  = 10000;
-            while !body_text.is_char_boundary(end) {
-                end -= 1;
+        
+        //unicode normalization
+        use unicode_normalization::UnicodeNormalization;
+        let body_text = body_text.nfkc().collect::<String>();
+        /*
+        // nlprule
+        let body_text = self.rules.correct(&body_text, &self.tokenizer);
+
+        // lemmaize
+        let tokens = self.tokenizer.pipe(&body_text);
+        let mut decomp_body_text = String::new();
+        for sentence in tokens {
+            for token in sentence.iter() {
+                let lemma = token.word().tags()[0].lemma().as_str();
+                decomp_body_text.push_str(lemma);
+                decomp_body_text.push(' ');
             }
-            body_text.truncate(end);
         }
+        let body_text = decomp_body_text;*/
+        // commented because too slow, in future add a flag to enable/disable it
 
         Ok((meta.0, body_text, meta.1))
     }
@@ -291,6 +305,29 @@ impl Spider {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 20)]
 async fn main() -> Result<()> {
+    let mut tokenizer_bytes: &'static [u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/",
+        tokenizer_filename!("en")
+    ));
+    let mut rules_bytes: &'static [u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/",
+        rules_filename!("en")
+    ));
+
+    //let tokenizer = Tokenizer::from_reader(&mut tokenizer_bytes).expect("tokenizer binary is valid");
+    let tantivy_tokenizer = TextAnalyzer::builder(SimpleTokenizer::default())
+        .filter(LowerCaser)
+        //.filter(tantivy::tokenizer::AsciiFoldingFilter)
+        .filter(tantivy::tokenizer::Stemmer::new(tantivy::tokenizer::Language::English))
+        //.filter(  tantivy::tokenizer::SplitCompoundWords::from_dictionary(dict))
+        .build();
+    let tokenizer = Tokenizer::from_reader(&mut tokenizer_bytes).expect("tokenizer binary is valid");
+    let rules = Rules::from_reader(&mut rules_bytes).expect("rules binary is valid");
+
+
+
     let args = Args::parse();
 
     let content = read_to_string(&args.input_file)
@@ -317,10 +354,17 @@ async fn main() -> Result<()> {
         }
     }
 
+    let text_field_indexing = TextFieldIndexing::default()
+    .set_tokenizer("norm_tokenizer")
+    .set_index_option(IndexRecordOption::WithFreqsAndPositions);
+
+    let text_options = TextOptions::default()
+    .set_indexing_options(text_field_indexing);
+
     let mut schema_builder = Schema::builder();
     let url_field = schema_builder.add_text_field("url", TEXT | STORED);
     let title_field = schema_builder.add_text_field("title", TEXT | STORED);
-    let body_field = schema_builder.add_text_field("body", TEXT);
+    let body_field = schema_builder.add_text_field("body", text_options);
     let schema = schema_builder.build();
     
     let index = if std::path::Path::new("search_db").exists() {
@@ -330,6 +374,8 @@ async fn main() -> Result<()> {
         let settings = tantivy::IndexSettings::default();
         Index::create(tantivy::directory::MmapDirectory::open("search_db")?, schema, settings)?
     };
+    index.tokenizers()
+        .register("norm_tokenizer", tantivy_tokenizer);
 
     let mut writer = index.writer(1_000_000_000)?;
     let (index_tx, mut index_rx) = mpsc::unbounded_channel::<CrawledData>();
@@ -366,7 +412,9 @@ async fn main() -> Result<()> {
         crawled_count: AtomicU64::new(0),
         failed_count: AtomicU64::new(0),
         verbose: args.verbose,
-        stemmer: rust_stemmers::Stemmer::create(rust_stemmers::Algorithm::English)
+        //stemmer: rust_stemmers::Stemmer::create(rust_stemmers::Algorithm::English),
+        rules,
+        tokenizer,
     });
 
     spider.run(start_urls).await?;
