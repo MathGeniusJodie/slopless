@@ -16,6 +16,7 @@ use tantivy::{doc, Index};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use url::Url;
+#[cfg(feature = "nlprule")]
 use nlprule::{Rules, Tokenizer, tokenizer_filename, rules_filename};
 
 
@@ -66,7 +67,9 @@ struct Spider {
     failed_count: AtomicU64,
     verbose: bool,
     //stemmer: rust_stemmers::Stemmer,
+    #[cfg(feature = "nlprule")]
     rules: Rules,
+    #[cfg(feature = "nlprule")]
     tokenizer: Tokenizer,
 }
 
@@ -277,23 +280,28 @@ impl Spider {
         
         //unicode normalization
         use unicode_normalization::UnicodeNormalization;
+        #[cfg(feature = "nlprule")]
+        let mut body_text = body_text.nfkc().collect::<String>();
+        #[cfg(not(feature = "nlprule"))]
         let body_text = body_text.nfkc().collect::<String>();
-        /*
-        // nlprule
-        let body_text = self.rules.correct(&body_text, &self.tokenizer);
+        
+        // nlprule feature flag
+        #[cfg(feature = "nlprule")]
+        {
+            //let body_text = self.rules.correct(&body_text, &self.tokenizer);
 
-        // lemmaize
-        let tokens = self.tokenizer.pipe(&body_text);
-        let mut decomp_body_text = String::new();
-        for sentence in tokens {
-            for token in sentence.iter() {
-                let lemma = token.word().tags()[0].lemma().as_str();
-                decomp_body_text.push_str(lemma);
-                decomp_body_text.push(' ');
+            // lemmaize
+            let tokens = self.tokenizer.pipe(&body_text);
+            let mut decomp_body_text = String::new();
+            for sentence in tokens {
+                for token in sentence.iter() {
+                    let lemma = token.word().tags()[0].lemma().as_str();
+                    decomp_body_text.push_str(lemma);
+                    decomp_body_text.push(' ');
+                }
             }
+            body_text = decomp_body_text;
         }
-        let body_text = decomp_body_text;*/
-        // commented because too slow, in future add a flag to enable/disable it
 
         Ok((meta.0, body_text, meta.1))
     }
@@ -305,28 +313,21 @@ impl Spider {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 20)]
 async fn main() -> Result<()> {
-    let mut tokenizer_bytes: &'static [u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/",
-        tokenizer_filename!("en")
-    ));
-    let mut rules_bytes: &'static [u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/",
-        rules_filename!("en")
-    ));
+    #[cfg(feature = "nlprule")]
+    let mut tokenizer_bytes: &'static [u8] = include_bytes!(concat!(env!("OUT_DIR"),"/",tokenizer_filename!("en")));
+    #[cfg(feature = "nlprule")]
+    let mut rules_bytes: &'static [u8] = include_bytes!(concat!(env!("OUT_DIR"),"/",rules_filename!("en")));
+    #[cfg(feature = "nlprule")]
+    let tokenizer = Tokenizer::from_reader(&mut tokenizer_bytes).expect("tokenizer binary is valid");
+    #[cfg(feature = "nlprule")]
+    let rules = Rules::from_reader(&mut rules_bytes).expect("rules binary is valid");
 
-    //let tokenizer = Tokenizer::from_reader(&mut tokenizer_bytes).expect("tokenizer binary is valid");
     let tantivy_tokenizer = TextAnalyzer::builder(SimpleTokenizer::default())
         .filter(LowerCaser)
         //.filter(tantivy::tokenizer::AsciiFoldingFilter)
         .filter(tantivy::tokenizer::Stemmer::new(tantivy::tokenizer::Language::English))
         //.filter(  tantivy::tokenizer::SplitCompoundWords::from_dictionary(dict))
         .build();
-    let tokenizer = Tokenizer::from_reader(&mut tokenizer_bytes).expect("tokenizer binary is valid");
-    let rules = Rules::from_reader(&mut rules_bytes).expect("rules binary is valid");
-
-
 
     let args = Args::parse();
 
@@ -412,8 +413,9 @@ async fn main() -> Result<()> {
         crawled_count: AtomicU64::new(0),
         failed_count: AtomicU64::new(0),
         verbose: args.verbose,
-        //stemmer: rust_stemmers::Stemmer::create(rust_stemmers::Algorithm::English),
+        #[cfg(feature = "nlprule")]
         rules,
+        #[cfg(feature = "nlprule")]
         tokenizer,
     });
 
