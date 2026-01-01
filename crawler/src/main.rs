@@ -8,6 +8,7 @@ use reqwest::Client;
 use reqwest_middleware::{ClientWithMiddleware, ClientBuilder};
 use reqwest_retry::RetryTransientMiddleware;
 use reqwest_retry::policies::ExponentialBackoff;
+use tantivy::query::Query;
 use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
 use std::collections::BinaryHeap;
 use std::cmp::Ordering;
@@ -16,7 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use tantivy::schema::{FAST, IndexRecordOption, STORED, Schema, TEXT, TextFieldIndexing, TextOptions};
 use tantivy::{doc, Index};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio::task::JoinSet;
 use url::Url;
 #[cfg(feature = "nlprule")]
@@ -45,6 +46,11 @@ struct CrawledData {
     body: String,
 }
 
+struct QueryMessage {
+    url: String,
+    resp: oneshot::Sender<bool>,
+}
+
 /// RAII Guard to ensure a domain is marked as "inactive" when the worker finishes.
 struct DomainGuard {
     host: String,
@@ -66,6 +72,7 @@ struct Spider {
     max_depth: usize,
     concurrency_limit: usize,
     index_tx: mpsc::UnboundedSender<CrawledData>,
+    db_query_tx: mpsc::UnboundedSender<QueryMessage>,
     // atomic counter for crawled pages and failures
     crawled_count: AtomicU64,
     failed_count: AtomicU64,
@@ -163,11 +170,16 @@ impl Spider {
                     match worker_result? {
                         Ok(found_links) => {
                             for (link, depth, retries) in found_links {
-                                let mut was_visited = self.visited_urls.contains(&link.to_string());
+                                let was_visited = self.visited_urls.contains(&link.to_string());
+                                /*
                                 if was_visited {
-                                    // double check
-                                    
-                                }
+                                    // double check against the persistent index (tantivy)
+                                    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                                    let _ = self.db_query_tx.send(QueryMessage { url: link.to_string(), resp: resp_tx });
+                                    if let Ok(found) = resp_rx.await {
+                                        was_visited = found;
+                                    }
+                                }*/
                                 if depth <= self.max_depth && !was_visited {
                                     queue.push(HeapItem { url: link, depth, retries });
                                 }
@@ -366,6 +378,27 @@ async fn main() -> Result<()> {
     };
     index.tokenizers()
         .register("norm_tokenizer", tantivy_tokenizer);
+    // Create an index reader and a DB query channel so other tasks can ask
+    // whether a URL exists in the persistent index (used to double-check bloomfilter hits).
+    let reader = index.reader()?;
+    let (db_query_tx, mut db_query_rx) = mpsc::unbounded_channel::<QueryMessage>();
+    let url_field_for_task = url_field;
+
+    tokio::spawn(async move {
+        use tantivy::collector::Count;
+        use tantivy::query::TermQuery;
+        while let Some(q) = db_query_rx.recv().await {
+            let _ = reader.reload();
+            let searcher = reader.searcher();
+            let term = tantivy::Term::from_field_text(url_field_for_task, &q.url);
+            let query = TermQuery::new(term, IndexRecordOption::Basic);
+            let found = match searcher.search(&query, &Count) {
+                Ok(count) => count > 0,
+                Err(_) => false,
+            };
+            let _ = q.resp.send(found);
+        }
+    });
 
     let mut writer = index.writer(1_000_000_000)?;
     let (index_tx, mut index_rx) = mpsc::unbounded_channel::<CrawledData>();
@@ -378,6 +411,8 @@ async fn main() -> Result<()> {
     });
 
     let retry_policy = ExponentialBackoff::builder().build_with_max_retries(4);
+
+    let expected_items = 100_000_000;
 
     let spider = Arc::new(Spider {
         client: ClientBuilder::new(
@@ -394,7 +429,8 @@ async fn main() -> Result<()> {
         .with(RetryTransientMiddleware::new_with_policy(retry_policy))
         .build(),
         index_tx,
-        visited_urls: AtomicBloomFilter::with_false_pos(0.001).hasher(ahash::RandomState::new()).expected_items(100_000_000),
+        db_query_tx,
+        visited_urls: AtomicBloomFilter::with_false_pos(1.0/(expected_items as f64)).hasher(ahash::RandomState::new()).expected_items(expected_items),
         active_domains: Arc::new(DashSet::with_hasher(ahash::RandomState::new())),
         excluded_prefixes: args.exclude,
         max_depth: args.max_depth,
