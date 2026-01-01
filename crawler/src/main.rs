@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use dashmap::DashSet;
+use fastbloom::{AtomicBloomFilter, AtomicBuilderWithFalsePositiveRate, BloomFilter};
 use futures::FutureExt;
 use lol_html::{element, text, HtmlRewriter, Settings};
 use reqwest::Client;
@@ -13,9 +14,9 @@ use std::cmp::Ordering;
 use std::fs::read_to_string;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use tantivy::schema::{IndexRecordOption, STORED, Schema, TEXT, TextFieldIndexing, TextOptions};
+use tantivy::schema::{FAST, IndexRecordOption, STORED, Schema, TEXT, TextFieldIndexing, TextOptions};
 use tantivy::{doc, Index};
-use tokio::sync::mpsc;
+use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinSet;
 use url::Url;
 #[cfg(feature = "nlprule")]
@@ -58,7 +59,8 @@ impl Drop for DomainGuard {
 
 struct Spider {
     client: ClientWithMiddleware,
-    visited_urls: DashSet<String, ahash::RandomState>,
+    //visited_urls: DashSet<String, ahash::RandomState>,
+    visited_urls: AtomicBloomFilter<ahash::RandomState>,
     active_domains: Arc<DashSet<String, ahash::RandomState>>, // Tracks which domains are currently being requested
     excluded_prefixes: Vec<String>,
     max_depth: usize,
@@ -161,7 +163,12 @@ impl Spider {
                     match worker_result? {
                         Ok(found_links) => {
                             for (link, depth, retries) in found_links {
-                                if depth <= self.max_depth && !self.visited_urls.contains(link.as_str()) {
+                                let mut was_visited = self.visited_urls.contains(&link.to_string());
+                                if was_visited {
+                                    // double check
+                                    
+                                }
+                                if depth <= self.max_depth && !was_visited {
                                     queue.push(HeapItem { url: link, depth, retries });
                                 }
                             }
@@ -195,7 +202,8 @@ impl Spider {
         let url_str = url.to_string();
         
         // Double check visited (checked again here to prevent race conditions)
-        if self.should_skip(&url_str) || !self.visited_urls.insert(url_str.clone()) {
+        self.visited_urls.insert(&url_str);
+        if self.should_skip(&url_str) {
             return Ok(vec![]);
         }
 
@@ -344,7 +352,7 @@ async fn main() -> Result<()> {
     .set_indexing_options(text_field_indexing);
 
     let mut schema_builder = Schema::builder();
-    let url_field = schema_builder.add_text_field("url", TEXT | STORED);
+    let url_field = schema_builder.add_text_field("url", TEXT | FAST);
     let title_field = schema_builder.add_text_field("title", TEXT | STORED);
     let body_field = schema_builder.add_text_field("body", text_options);
     let schema = schema_builder.build();
@@ -386,7 +394,7 @@ async fn main() -> Result<()> {
         .with(RetryTransientMiddleware::new_with_policy(retry_policy))
         .build(),
         index_tx,
-        visited_urls: DashSet::with_hasher(ahash::RandomState::new()),
+        visited_urls: AtomicBloomFilter::with_false_pos(0.001).hasher(ahash::RandomState::new()).expected_items(100_000_000),
         active_domains: Arc::new(DashSet::with_hasher(ahash::RandomState::new())),
         excluded_prefixes: args.exclude,
         max_depth: args.max_depth,
