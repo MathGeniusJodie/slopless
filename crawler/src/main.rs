@@ -30,7 +30,7 @@ struct Args {
     exclude: Vec<String>,
     #[arg(short = 'd', long = "depth", default_value_t = 5)]
     max_depth: usize,
-    #[arg(short = 'c', long = "concurrency", default_value_t = 500)]
+    #[arg(short = 'c', long = "concurrency", default_value_t = 200)]
     concurrency: usize,
     // verbosity flag could be added here
     #[arg(short = 'v', long = "verbose", default_value_t = false)]
@@ -219,46 +219,33 @@ impl Spider {
         Ok(normalized)
     }
 
-    async fn parse_stream(&self, mut response: reqwest::Response) -> Result<(Vec<String>, String, String)> {
-        let (tx, mut rx) = mpsc::unbounded_channel::<bytes::Bytes>();
-        let parse_handle = tokio::task::spawn_blocking(move || -> Result<(Vec<String>, String, String)> {
-            let mut links = Vec::new();
-            let mut titles = Vec::new();
-            let mut rewriter = HtmlRewriter::new(
-                Settings {
-                    element_content_handlers: vec![
-                        element!("a[href]", |el| {
-                            if let Some(href) = el.get_attribute("href") { links.push(href); }
-                            Ok(())
-                        }),
-                        text!("title", |chunk| {
-                            titles.push(chunk.as_str().to_string());
-                            Ok(())
-                        }),
-                    ],
-                    ..Settings::default()
-                },
-                |_: &[u8]| {},
-            );
-            let mut body_text = String::new();
-            while let Some(chunk) = rx.blocking_recv() { 
-                rewriter.write(&chunk)?;
-                body_text.push_str(std::str::from_utf8(&chunk).unwrap_or(""));
-            }
-            rewriter.end()?;
+    async fn parse_stream(&self, response: reqwest::Response) -> Result<(Vec<String>, String, String)> {
+        let response_text = response.text().await?;
+        let mut links = Vec::new();
+        let mut title = String::new();
+        let mut rewriter = HtmlRewriter::new(
+            Settings {
+                element_content_handlers: vec![
+                    element!("a[href]", |el| {
+                        if let Some(href) = el.get_attribute("href") { links.push(href); }
+                        Ok(())
+                    }),
+                    text!("title", |chunk| {
+                        title = chunk.as_str().to_string();
+                        Ok(())
+                    }),
+                ],
+                ..Settings::default()
+            },
+            |_: &[u8]| {},
+        );
 
-            Ok((links, titles.join(" "), body_text))
-        });
-
-        while let Some(chunk) = response.chunk().await? { let _ = tx.send(chunk); }
-        drop(tx);
-        let meta = parse_handle.await??;
-
-        //println!("html title: {}",meta.2);
+        rewriter.write(response_text.as_bytes())?;
+        rewriter.end()?;
 
         use dom_smoothie::{Readability, Article, Config};
         let readability_config = Config::default();
-        let mut readability = Readability::new(meta.2, None, Some(readability_config))?;
+        let mut readability = Readability::new(response_text, None, Some(readability_config))?;
         let article: Article = readability.parse()?;
         let body_text = article.text_content;
         
@@ -287,7 +274,7 @@ impl Spider {
             body_text = decomp_body_text;
         }
 
-        Ok((meta.0, body_text, meta.1))
+        Ok((links, body_text, title))
     }
 
     fn should_skip(&self, url: &str) -> bool {
