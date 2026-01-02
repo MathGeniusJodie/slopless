@@ -108,19 +108,36 @@ fn setup_search_index() -> Result<SearchIndex> {
     })
 }
 
-fn pop_available_task(
+fn pop_available_tasks(
     task_queue: &mut BTreeSet<CrawlTask>,
     domains_in_progress: &HashSet<String, ahash::RandomState>,
-) -> Option<CrawlTask> {
-    let task = task_queue
+    max_tasks: usize,
+) -> Vec<CrawlTask> {
+    let mut result = Vec::with_capacity(max_tasks);
+    let mut domains_claimed: HashSet<&str, ahash::RandomState> =
+        HashSet::with_hasher(ahash::RandomState::new());
+
+    // Single scan: collect tasks for domains not in progress and not yet claimed this batch
+    let tasks_to_take: Vec<CrawlTask> = task_queue
         .iter()
-        .find(|task| {
-            task.target_url
-                .host_str()
-                .map_or(false, |d| !domains_in_progress.contains(d))
+        .filter_map(|task| {
+            let domain = task.target_url.host_str()?;
+            if !domains_in_progress.contains(domain) && !domains_claimed.contains(domain) {
+                domains_claimed.insert(domain);
+                Some(task.clone())
+            } else {
+                None
+            }
         })
-        .cloned()?;
-    task_queue.take(&task)
+        .take(max_tasks)
+        .collect();
+
+    for task in tasks_to_take {
+        if let Some(t) = task_queue.take(&task) {
+            result.push(t);
+        }
+    }
+    result
 }
 
 fn extract_page_content(html_body: String) -> Result<(Vec<String>, String, String)> {
@@ -299,10 +316,9 @@ async fn main() -> Result<()> {
     let mut last_status_report = std::time::Instant::now();
 
     loop {
-        while worker_pool.len() <= max_concurrent_requests {
-            let Some(task) = pop_available_task(&mut task_queue, &domains_in_progress) else {
-                break;
-            };
+        let slots_available = max_concurrent_requests.saturating_sub(worker_pool.len());
+        let tasks = pop_available_tasks(&mut task_queue, &domains_in_progress, slots_available);
+        for task in tasks {
             let Some(domain) = task.target_url.host_str().map(String::from) else {
                 continue;
             };
