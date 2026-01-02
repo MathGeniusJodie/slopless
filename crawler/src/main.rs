@@ -107,12 +107,14 @@ struct CrawlDb {
 impl CrawlDb {
     fn new(search_index: SearchIndex, expected_url_count: usize) -> Result<Self> {
         let index_writer = search_index.index.writer(50_000_000)?;
-        let seen_urls = BloomFilter::with_num_bits(expected_url_count * 4)
+        let seen_urls = BloomFilter::with_num_bits(expected_url_count * 8)
             .hasher(ahash::RandomState::new())
             .expected_items(expected_url_count);
         let collisions = BloomFilter::with_num_bits(expected_url_count * 2)
             .hasher(ahash::RandomState::new())
             .expected_items(expected_url_count);
+        // 15% need to double check and 0.1% false positive rate w 600 million bits
+        // 2% need to double check and no false positives w 1 billion bits
         let uncommitted_hashes = HashSet::with_hasher(ahash::RandomState::new());
         let uncommitted_urls = HashSet::with_hasher(ahash::RandomState::new());
         
@@ -516,6 +518,10 @@ async fn main() -> Result<()> {
                 "Crawled: {pages_crawled}, Failed: {pages_failed}, Queue: {}, Active: {}",
                 task_queue.len(),
                 domains_in_progress.len()
+            );
+            println!(" Uncommitted: URLs {}, Hashes {}",
+                db.uncommitted_urls.len(),
+                db.uncommitted_hashes.len(),
             );
             last_status_report = std::time::Instant::now();
             db.commit().expect("Failed to commit index");
