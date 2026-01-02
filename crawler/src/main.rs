@@ -204,27 +204,19 @@ impl WebCrawler {
         let (extracted_links, page_content, page_title) = extract_page_content(html_body)?;
 
         let next_depth = crawl_depth + 1;
+        let base_host = target_url.host_str();
         let child_tasks = extracted_links
             .into_iter()
-            .filter_map(|link| target_url.join(&link).ok())
-            .map(|mut resolved_url| {
-                resolved_url.set_fragment(None);
-                resolved_url
-            })
-            .filter(|resolved_url| {
-                resolved_url.host_str().map_or(false, |link_host| {
-                    target_url
-                        .host_str()
-                        .map_or(false, |base_host| link_host == base_host)
+            .filter_map(|link| {
+                let mut url = target_url.join(&link).ok()?;
+                url.set_fragment(None);
+                (url.host_str() == base_host).then_some(CrawlTask {
+                    target_url: url,
+                    crawl_depth: next_depth,
+                    retry_count,
                 })
             })
-            .map(|resolved_url| CrawlTask {
-                target_url: resolved_url,
-                crawl_depth: next_depth,
-                retry_count,
-            })
             .collect();
-
         Ok((
             child_tasks,
             Some(IndexedPage {
