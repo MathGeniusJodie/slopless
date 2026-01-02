@@ -68,6 +68,7 @@ impl CrawlTask {
         excluded_prefixes: &[String],
         db: &CrawlDb,
         searcher: &tantivy::Searcher,
+        queued_urls: &HashSet<String, ahash::RandomState>,
     ) -> bool {
         let url_str = self.target_url.to_string();
         self.crawl_depth > max_depth
@@ -75,6 +76,7 @@ impl CrawlTask {
             || excluded_prefixes
                 .iter()
                 .any(|prefix| self.target_url.as_str().starts_with(prefix))
+            || queued_urls.contains(&url_str)
     }
 }
 
@@ -431,10 +433,12 @@ async fn main() -> Result<()> {
 
     let (mut pages_crawled, mut pages_failed) = (0usize, 0usize);
     let mut domains_in_progress = HashSet::with_hasher(ahash::RandomState::new());
+    let mut queued_urls: HashSet<String, ahash::RandomState> = HashSet::with_hasher(ahash::RandomState::new());
     let mut task_queue: BTreeSet<CrawlTask> = seed_urls
         .into_iter()
         .map(|url| {
             db.mark_seen(url.as_str());
+            queued_urls.insert(url.to_string());
             CrawlTask {
                 target_url: url,
                 crawl_depth: 0,
@@ -453,6 +457,7 @@ async fn main() -> Result<()> {
                 continue;
             };
             let url_str = task.target_url.to_string();
+            queued_urls.remove(&url_str);
             let url_hash = db.url_hash(&url_str);
             domains_in_progress.insert(domain.clone());
             let crawler = Arc::clone(&crawler);
@@ -486,8 +491,11 @@ async fn main() -> Result<()> {
                 &cli_args.excluded_url_prefixes,
                 &db,
                 &searcher,
+                &queued_urls,
             ) {
-                db.mark_seen(&task.target_url.to_string());
+                let url_str = task.target_url.to_string();
+                db.mark_seen(&url_str);
+                queued_urls.insert(url_str);
                 task_queue.insert(task);
             }
         }
