@@ -7,7 +7,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet};
 use std::fs::read_to_string;
 use std::sync::Arc;
-use tantivy::schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions, STORED, TEXT};
+use tantivy::schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions, STORED, STRING, TEXT};
 use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
 use tantivy::{doc, Index};
 use tokio::task::JoinSet;
@@ -67,9 +67,12 @@ impl CrawlTask {
         max_depth: usize,
         seen_urls: &BloomFilter<ahash::RandomState>,
         excluded_prefixes: &[String],
+        searcher: &tantivy::Searcher,
+        url_field: tantivy::schema::Field,
     ) -> bool {
         self.crawl_depth > max_depth
-            || seen_urls.contains(&self.target_url.to_string())
+            || (seen_urls.contains(&self.target_url.to_string())
+                && url_exists_in_index(searcher, url_field, &self.target_url.to_string()))
             || excluded_prefixes
                 .iter()
                 .any(|prefix| self.target_url.as_str().starts_with(prefix))
@@ -81,6 +84,20 @@ struct SearchIndex {
     url_field: tantivy::schema::Field,
     title_field: tantivy::schema::Field,
     body_field: tantivy::schema::Field,
+}
+
+/// Fast existence check by querying the term dictionary directly per segment.
+/// Bypasses query executor entirely - O(log n) term dictionary lookup.
+fn url_exists_in_index(searcher: &tantivy::Searcher, url_field: tantivy::schema::Field, url: &str) -> bool {
+    let term = tantivy::Term::from_field_text(url_field, url);
+    for segment_reader in searcher.segment_readers() {
+        if let Ok(inverted_index) = segment_reader.inverted_index(url_field) {
+            if inverted_index.terms().term_ord(term.serialized_value_bytes()).is_ok_and(|o| o.is_some()) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn setup_search_index() -> Result<SearchIndex> {
@@ -95,7 +112,7 @@ fn setup_search_index() -> Result<SearchIndex> {
         .set_index_option(IndexRecordOption::WithFreqsAndPositions);
     let body_field_options = TextOptions::default().set_indexing_options(body_field_indexing);
     let mut schema_builder = Schema::builder();
-    let url_field = schema_builder.add_text_field("url", TEXT | STORED);
+    let url_field = schema_builder.add_text_field("url", STRING | STORED);
     let title_field = schema_builder.add_text_field("title", TEXT | STORED);
     let body_field = schema_builder.add_text_field("body", body_field_options);
     let schema = schema_builder.build();
@@ -293,7 +310,8 @@ async fn main() -> Result<()> {
 
     let (mut pages_crawled, mut pages_failed) = (0usize, 0usize);
     let expected_url_count = 100_000_000;
-    let mut seen_urls = BloomFilter::with_false_pos(1.0 / (expected_url_count as f64))
+    // querying tantvy is relatively fast so we don't need a very low false positive rate here
+    let mut seen_urls = BloomFilter::with_false_pos(0.1)
         .hasher(ahash::RandomState::new())
         .expected_items(expected_url_count);
     let mut domains_in_progress = HashSet::with_hasher(ahash::RandomState::new());
@@ -341,9 +359,10 @@ async fn main() -> Result<()> {
                 continue;
             }
         };
+        let searcher = index.reader()?.searcher();
         let discovered_links = discovered_links
             .into_iter()
-            .filter(|t| !t.should_skip(cli_args.max_crawl_depth, &seen_urls, &cli_args.excluded_url_prefixes));
+            .filter(|t| !t.should_skip(cli_args.max_crawl_depth, &seen_urls, &cli_args.excluded_url_prefixes, &searcher, url_field));
 
         // Queue newly discovered links
         task_queue.extend(discovered_links);
