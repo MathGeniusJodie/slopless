@@ -28,7 +28,4 @@ nlprule = "0.6.4"
 debug = true # Adds debug symbols to the optimized binary
 
 [build-dependencies]
-nlprule-build = "0.6.4" 
-
-[features]
-nlprule = []
+nlprule-build = "0.6.4"

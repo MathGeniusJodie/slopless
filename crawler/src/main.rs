@@ -1,28 +1,23 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use dashmap::DashSet;
-use fastbloom::{AtomicBloomFilter, AtomicBuilderWithFalsePositiveRate, BloomFilter};
+use fastbloom::BloomFilter;
 use futures::FutureExt;
 use lol_html::{element, text, HtmlRewriter, Settings};
 use reqwest::Client;
 use reqwest_middleware::{ClientWithMiddleware, ClientBuilder};
 use reqwest_retry::RetryTransientMiddleware;
 use reqwest_retry::policies::ExponentialBackoff;
-use tantivy::query::Query;
 use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
 use std::cmp::Ordering;
 use std::fs::read_to_string;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use tantivy::schema::{FAST, IndexRecordOption, STORED, Schema, TEXT, TextFieldIndexing, TextOptions};
+use tantivy::schema::{IndexRecordOption, STORED, Schema, TEXT, TextFieldIndexing, TextOptions};
 use tantivy::{doc, Index};
-use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use url::Url;
-#[cfg(feature = "nlprule")]
-use nlprule::{Rules, Tokenizer, tokenizer_filename, rules_filename};
-
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -46,42 +41,14 @@ struct CrawledData {
     body: String,
 }
 
-struct QueryMessage {
-    url: String,
-    resp: oneshot::Sender<bool>,
-}
-
-/// RAII Guard to ensure a domain is marked as "inactive" when the worker finishes.
-struct DomainGuard {
-    host: String,
-    active_domains: Arc<DashSet<String, ahash::RandomState>>,
-}
-
-impl Drop for DomainGuard {
-    fn drop(&mut self) {
-        self.active_domains.remove(&self.host);
-    }
-}
-
 struct Spider {
     client: ClientWithMiddleware,
-    //visited_urls: DashSet<String, ahash::RandomState>,
-    visited_urls: AtomicBloomFilter<ahash::RandomState>,
-    active_domains: Arc<DashSet<String, ahash::RandomState>>, // Tracks which domains are currently being requested
     excluded_prefixes: Vec<String>,
     max_depth: usize,
     concurrency_limit: usize,
-    index_tx: mpsc::UnboundedSender<CrawledData>,
-    db_query_tx: mpsc::UnboundedSender<QueryMessage>,
-    // atomic counter for crawled pages and failures
     crawled_count: AtomicU64,
     failed_count: AtomicU64,
     verbose: bool,
-    //stemmer: rust_stemmers::Stemmer,
-    #[cfg(feature = "nlprule")]
-    rules: Rules,
-    #[cfg(feature = "nlprule")]
-    tokenizer: Tokenizer,
 }
 
 #[derive(Eq, PartialEq)]
@@ -104,6 +71,45 @@ impl PartialOrd for HeapItem {
 
 impl Spider {
     pub async fn run(self: Arc<Self>, start_urls: Vec<Url>) -> Result<()> {
+        ////////////////////////////////////////////////////////////////////////////////////////////////////////////
+        // Set up Tantivy index
+        ////////////////////////////////////////////////////////////////////////////////////////////////////////////
+        let tantivy_tokenizer = TextAnalyzer::builder(SimpleTokenizer::default())
+            .filter(LowerCaser)
+            .filter(tantivy::tokenizer::Stemmer::new(tantivy::tokenizer::Language::English))
+            //.filter(  tantivy::tokenizer::SplitCompoundWords::from_dictionary(dict))
+            .build();
+        let text_field_indexing = TextFieldIndexing::default()
+            .set_tokenizer("norm_tokenizer")
+            .set_index_option(IndexRecordOption::WithFreqsAndPositions);
+
+        let text_options = TextOptions::default()
+            .set_indexing_options(text_field_indexing);
+        let mut schema_builder = Schema::builder();
+        let url_field = schema_builder.add_text_field("url", TEXT | STORED);
+        let title_field = schema_builder.add_text_field("title", TEXT | STORED);
+        let body_field = schema_builder.add_text_field("body", text_options);
+        let schema = schema_builder.build();
+        let index = if std::path::Path::new("search_db").exists() {
+            Index::open_in_dir("search_db")?
+        } else {
+            std::fs::create_dir_all("search_db")?;
+            let settings = tantivy::IndexSettings::default();
+            Index::create(tantivy::directory::MmapDirectory::open("search_db")?, schema, settings)?
+        };
+        index.tokenizers()
+            .register("norm_tokenizer", tantivy_tokenizer);
+
+        let mut writer = index.writer(1_000_000_000)?;
+        ////////////////////////////////////////////////////////////////////////////////////////////////////////////
+        // End set up Tantivy index
+        ////////////////////////////////////////////////////////////////////////////////////////////////////////////
+        
+        let expected_items = 100_000_000;
+        let mut visited_urls = BloomFilter::with_false_pos(1.0/(expected_items as f64))
+            .hasher(ahash::RandomState::new())
+            .expected_items(expected_items);
+        let mut active_domains = HashSet::with_hasher(ahash::RandomState::new());
         let mut queue: BinaryHeap<HeapItem> = BinaryHeap::new();
         for url in start_urls {
             queue.push(HeapItem { url, depth: 0, retries: 0 });
@@ -113,7 +119,6 @@ impl Spider {
 
         let mut last_debug_time = std::time::Instant::now();
         loop {
-            // 1. Try to spawn workers up to the concurrency limit
             while workers.len() <= self.concurrency_limit {
                 // Pop items until we find one whose domain is not active, buffering the others.
                 let mut buffer: Vec<HeapItem> = Vec::new();
@@ -121,10 +126,14 @@ impl Spider {
 
                 while let Some(item) = queue.pop() {
                     if let Some(host_str) = item.url.host_str() {
-                        if !self.active_domains.contains(host_str) {
+                        if !active_domains.contains(host_str) {
                             found = Some(item);
                             break;
                         }
+                    }
+                    if visited_urls.contains(&item.url.to_string()) {
+                        // already visited, skip
+                        continue;
                     }
                     buffer.push(item);
                 }
@@ -142,13 +151,12 @@ impl Spider {
                     None => continue,
                 };
 
-                // Mark domain as active
-                self.active_domains.insert(host.clone());
-
                 let spider = Arc::clone(&self);
+                let bind_url = item.url.to_string();
+                visited_urls.insert(&bind_url);
+                active_domains.insert(host.clone());
                 workers.spawn(async move {
-                    let _guard = DomainGuard { host, active_domains: Arc::clone(&spider.active_domains) };
-                    spider.process_url(item.url, item.depth, item.retries).await
+                    (host,spider.process_url(item).await)
                 });
             }
 
@@ -156,42 +164,30 @@ impl Spider {
                 break;
             }
 
-            // 2. Wait for at least one worker to finish. 
-            // This frees up a concurrency slot and potentially a domain lock.
-            // wait for at least one worker to finish
-            if let Some(first_result) = workers.join_next().await {
-                // iterator: first the awaited result, then any already-ready results (non-blocking)
-                let iter = std::iter::once(first_result)
-                    .chain(std::iter::from_fn(|| match workers.join_next().now_or_never() {
-                        Some(r) => r,
-                        None => None,
-                    }));
-                for worker_result in iter {
-                    match worker_result? {
-                        Ok(found_links) => {
-                            for (link, depth, retries) in found_links {
-                                let was_visited = self.visited_urls.contains(&link.to_string());
-                                /*
-                                if was_visited {
-                                    // double check against the persistent index (tantivy)
-                                    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                                    let _ = self.db_query_tx.send(QueryMessage { url: link.to_string(), resp: resp_tx });
-                                    if let Ok(found) = resp_rx.await {
-                                        was_visited = found;
-                                    }
-                                }*/
-                                if depth <= self.max_depth && !was_visited {
-                                    queue.push(HeapItem { url: link, depth, retries });
+            if let Some(res) = workers.join_next().await {
+                match res{
+                    Ok((host,ret)) => {
+                        active_domains.remove(&host);
+                        let (links, data) = ret;
+                        if let Some(crawled) = data {
+                            match writer.add_document(doc!(url_field => crawled.url, body_field => crawled.body, title_field => crawled.title)) {
+                                Ok(_opstamp) => {},
+                                Err(e) => {
+                                    eprintln!("Indexing error: {:?}", e);
                                 }
                             }
+                            writer.commit().expect("Failed to commit index");
                         }
-                        Err(e) => {
-                            if self.verbose {
-                                eprintln!("Worker error: {:?}", e);
+                        for item in links {
+                            let was_visited = visited_urls.contains(&item.url.to_string());
+                            if item.depth <= self.max_depth && !was_visited && !self.should_skip(&item.url.to_string()) {
+                                queue.push(item);
                             }
-                            
-                            self.failed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            // todo: re-queuing the URL with incremented retry count
+                        }
+                    },
+                    Err(e) => {
+                        if self.verbose {
+                            eprintln!("Worker task failed: {:?}", e);
                         }
                     }
                 }
@@ -202,25 +198,29 @@ impl Spider {
                     self.crawled_count.load(std::sync::atomic::Ordering::Relaxed),
                     self.failed_count.load(std::sync::atomic::Ordering::Relaxed),
                     queue.len(),
-                    self.active_domains.len(),
+                    active_domains.len(),
                 );
                 last_debug_time = std::time::Instant::now();
             }
         }
+        println!("Crawl finished. Docs in index: {}", index.reader()?.searcher().num_docs());
         Ok(())
     }
 
-    async fn process_url(&self, url: Url, depth: usize, retries: usize) -> Result<Vec<(Url, usize, usize)>> {
-        let url_str = url.to_string();
+    async fn process_url(&self, item : HeapItem) -> (Vec<HeapItem>,Option<CrawledData>) {
+        let HeapItem { url, depth, retries } = item;
         
-        // Double check visited (checked again here to prevent race conditions)
-        self.visited_urls.insert(&url_str);
-        if self.should_skip(&url_str) {
-            return Ok(vec![]);
-        }
-
-        let response = self.client.get(url.clone()).send().await?;
-        if !response.status().is_success() { return Ok(vec![]); }
+        let response = match self.client.get(url.clone()).send().await{
+            Ok(resp) => resp,
+            Err(e) => {
+                if self.verbose {
+                    eprintln!("Network error: {:?}", e);
+                }        
+                self.failed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return (vec![], None);
+            }
+        };
+        if !response.status().is_success() { return (vec![], None); }
         
         let content_type = response
             .headers()
@@ -228,10 +228,18 @@ impl Spider {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
             
-        if !content_type.starts_with("text/html") { return Ok(vec![]); }
+        if !content_type.starts_with("text/html") { return (vec![], None); }
         
-        let (links, body_text, title) = self.parse_stream(response).await?;
-        let _ = self.index_tx.send(CrawledData { url: url_str, body: body_text, title });
+        let (links, body_text, title) = match self.parse_stream(response).await {
+            Ok(res) => res,
+            Err(e) => {
+                if self.verbose {
+                    eprintln!("Parse error for {}: {:?}", url, e);
+                }        
+                self.failed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return (vec![], None);
+            }
+        };
 
         //println!("Depth {depth}: Crawling {url_str}");
         self.crawled_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -243,10 +251,10 @@ impl Spider {
             .filter(|u| {
                 u.host_str().map_or(false, |host| url.host_str().map_or(false, |base_host| host == base_host))
             })
-            .map(|u| (u, next_depth, retries))
+            .map(|url| HeapItem{url, depth:next_depth, retries})
             .collect();
 
-        Ok(normalized)
+        (normalized, Some(CrawledData { url: url.to_string(), body: body_text, title }))
     }
 
     async fn parse_stream(&self, response: reqwest::Response) -> Result<(Vec<String>, String, String)> {
@@ -278,32 +286,8 @@ impl Spider {
         let mut readability = Readability::new(response_text, None, Some(readability_config))?;
         let article: Article = readability.parse()?;
         let body_text = article.text_content;
-        
-        //unicode normalization
         use unicode_normalization::UnicodeNormalization;
-        #[cfg(feature = "nlprule")]
-        let mut body_text = body_text.nfkc().collect::<String>();
-        #[cfg(not(feature = "nlprule"))]
         let body_text = body_text.nfkc().collect::<String>();
-        
-        // nlprule feature flag
-        #[cfg(feature = "nlprule")]
-        {
-            //let body_text = self.rules.correct(&body_text, &self.tokenizer);
-
-            // lemmaize
-            let tokens = self.tokenizer.pipe(&body_text);
-            let mut decomp_body_text = String::new();
-            for sentence in tokens {
-                for token in sentence.iter() {
-                    let lemma = token.word().tags()[0].lemma().as_str();
-                    decomp_body_text.push_str(lemma);
-                    decomp_body_text.push(' ');
-                }
-            }
-            body_text = decomp_body_text;
-        }
-
         Ok((links, body_text, title))
     }
 
@@ -314,21 +298,6 @@ impl Spider {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 20)]
 async fn main() -> Result<()> {
-    #[cfg(feature = "nlprule")]
-    let mut tokenizer_bytes: &'static [u8] = include_bytes!(concat!(env!("OUT_DIR"),"/",tokenizer_filename!("en")));
-    #[cfg(feature = "nlprule")]
-    let mut rules_bytes: &'static [u8] = include_bytes!(concat!(env!("OUT_DIR"),"/",rules_filename!("en")));
-    #[cfg(feature = "nlprule")]
-    let tokenizer = Tokenizer::from_reader(&mut tokenizer_bytes).expect("tokenizer binary is valid");
-    #[cfg(feature = "nlprule")]
-    let rules = Rules::from_reader(&mut rules_bytes).expect("rules binary is valid");
-
-    let tantivy_tokenizer = TextAnalyzer::builder(SimpleTokenizer::default())
-        .filter(LowerCaser)
-        //.filter(tantivy::tokenizer::AsciiFoldingFilter)
-        .filter(tantivy::tokenizer::Stemmer::new(tantivy::tokenizer::Language::English))
-        //.filter(  tantivy::tokenizer::SplitCompoundWords::from_dictionary(dict))
-        .build();
 
     let args = Args::parse();
 
@@ -351,69 +320,11 @@ async fn main() -> Result<()> {
             };
         
         if let Some(_host) = start_url.host_str() {
-            //allowed_domains.insert(host.to_string());
             start_urls.push(start_url);
         }
     }
 
-    let text_field_indexing = TextFieldIndexing::default()
-    .set_tokenizer("norm_tokenizer")
-    .set_index_option(IndexRecordOption::WithFreqsAndPositions);
-
-    let text_options = TextOptions::default()
-    .set_indexing_options(text_field_indexing);
-
-    let mut schema_builder = Schema::builder();
-    let url_field = schema_builder.add_text_field("url", TEXT | FAST);
-    let title_field = schema_builder.add_text_field("title", TEXT | STORED);
-    let body_field = schema_builder.add_text_field("body", text_options);
-    let schema = schema_builder.build();
-    
-    let index = if std::path::Path::new("search_db").exists() {
-        Index::open_in_dir("search_db")?
-    } else {
-        std::fs::create_dir_all("search_db")?;
-        let settings = tantivy::IndexSettings::default();
-        Index::create(tantivy::directory::MmapDirectory::open("search_db")?, schema, settings)?
-    };
-    index.tokenizers()
-        .register("norm_tokenizer", tantivy_tokenizer);
-    // Create an index reader and a DB query channel so other tasks can ask
-    // whether a URL exists in the persistent index (used to double-check bloomfilter hits).
-    let reader = index.reader()?;
-    let (db_query_tx, mut db_query_rx) = mpsc::unbounded_channel::<QueryMessage>();
-    let url_field_for_task = url_field;
-
-    tokio::spawn(async move {
-        use tantivy::collector::Count;
-        use tantivy::query::TermQuery;
-        while let Some(q) = db_query_rx.recv().await {
-            let _ = reader.reload();
-            let searcher = reader.searcher();
-            let term = tantivy::Term::from_field_text(url_field_for_task, &q.url);
-            let query = TermQuery::new(term, IndexRecordOption::Basic);
-            let found = match searcher.search(&query, &Count) {
-                Ok(count) => count > 0,
-                Err(_) => false,
-            };
-            let _ = q.resp.send(found);
-        }
-    });
-
-    let mut writer = index.writer(1_000_000_000)?;
-    let (index_tx, mut index_rx) = mpsc::unbounded_channel::<CrawledData>();
-    
-    let indexer_handle = tokio::spawn(async move {
-        while let Some(data) = index_rx.recv().await {
-            let _ = writer.add_document(doc!(url_field => data.url, body_field => data.body, title_field => data.title));
-        }
-        writer.commit().expect("Failed to commit index");
-    });
-
     let retry_policy = ExponentialBackoff::builder().build_with_max_retries(4);
-
-    let expected_items = 100_000_000;
-
     let spider = Arc::new(Spider {
         client: ClientBuilder::new(
             Client::builder()
@@ -428,26 +339,15 @@ async fn main() -> Result<()> {
         )
         .with(RetryTransientMiddleware::new_with_policy(retry_policy))
         .build(),
-        index_tx,
-        db_query_tx,
-        visited_urls: AtomicBloomFilter::with_false_pos(1.0/(expected_items as f64)).hasher(ahash::RandomState::new()).expected_items(expected_items),
-        active_domains: Arc::new(DashSet::with_hasher(ahash::RandomState::new())),
         excluded_prefixes: args.exclude,
         max_depth: args.max_depth,
         concurrency_limit: args.concurrency,
         crawled_count: AtomicU64::new(0),
         failed_count: AtomicU64::new(0),
         verbose: args.verbose,
-        #[cfg(feature = "nlprule")]
-        rules,
-        #[cfg(feature = "nlprule")]
-        tokenizer,
     });
 
     spider.run(start_urls).await?;
-    
-    indexer_handle.await.context("Indexer task panicked")?;
-    println!("Crawl finished. Docs in index: {}", index.reader()?.searcher().num_docs());
 
     Ok(())
 }
