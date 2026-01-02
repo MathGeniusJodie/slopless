@@ -7,7 +7,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet};
 use std::fs::read_to_string;
 use std::sync::Arc;
-use tantivy::schema::{FAST, IndexRecordOption, STORED, STRING, Schema, TEXT, TextFieldIndexing, TextOptions};
+use tantivy::schema::{FAST, IndexRecordOption, STORED, STRING, Schema, TEXT, TextFieldIndexing, TextOptions, Value};
 use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
 use tantivy::{doc, Index};
 use tokio::task::JoinSet;
@@ -68,11 +68,13 @@ impl CrawlTask {
         seen_urls: &BloomFilter<ahash::RandomState>,
         excluded_prefixes: &[String],
         searcher: &tantivy::Searcher,
+        url_hash_field: tantivy::schema::Field,
         url_field: tantivy::schema::Field,
     ) -> bool {
+        let url_str = self.target_url.to_string();
         self.crawl_depth > max_depth
-            || (seen_urls.contains(&self.target_url.to_string())
-                && url_exists_in_index(searcher, url_field, &self.target_url.to_string()))
+            || (seen_urls.contains(&url_str)
+                && url_exists_in_index(searcher, url_hash_field, url_field, seen_urls.source_hash(&url_str), &url_str))
             || excluded_prefixes
                 .iter()
                 .any(|prefix| self.target_url.as_str().starts_with(prefix))
@@ -82,22 +84,47 @@ impl CrawlTask {
 struct SearchIndex {
     index: Index,
     url_field: tantivy::schema::Field,
+    url_hash_field: tantivy::schema::Field,
     title_field: tantivy::schema::Field,
     body_field: tantivy::schema::Field,
 }
 
-/// Fast existence check by querying the term dictionary directly per segment.
-/// Bypasses query executor entirely - O(log n) term dictionary lookup.
-fn url_exists_in_index(searcher: &tantivy::Searcher, url_field: tantivy::schema::Field, url: &str) -> bool {
-    let term = tantivy::Term::from_field_text(url_field, url);
-    for segment_reader in searcher.segment_readers() {
-        if let Ok(inverted_index) = segment_reader.inverted_index(url_field) {
-            if inverted_index.terms().term_ord(term.serialized_value_bytes()).is_ok_and(|o| o.is_some()) {
-                return true;
+/// Checks if a URL exists in the index by querying by hash.
+/// If exactly one match, it's a true positive. If multiple matches (hash collision), verify the URL.
+fn url_exists_in_index(
+    searcher: &tantivy::Searcher,
+    url_hash_field: tantivy::schema::Field,
+    url_field: tantivy::schema::Field,
+    url_hash: u64,
+    url: &str,
+) -> bool {
+    use tantivy::collector::DocSetCollector;
+    use tantivy::query::TermQuery;
+    
+    let term = tantivy::Term::from_field_u64(url_hash_field, url_hash);
+    let query = TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
+    
+    let Ok(doc_addresses) = searcher.search(&query, &DocSetCollector) else {
+        return false;
+    };
+    
+    match doc_addresses.len() {
+        0 => false,
+        1 => true, // Single match means it's our URL (same hash = same URL)
+        _ => {
+            // Hash collision: must check actual URLs
+            for doc_address in doc_addresses {
+                if let Ok(doc) = searcher.doc::<tantivy::TantivyDocument>(doc_address) {
+                    if let Some(stored_url) = doc.get_first(url_field).and_then(|v| v.as_str()) {
+                        if stored_url == url {
+                            return true;
+                        }
+                    }
+                }
             }
+            false
         }
     }
-    false
 }
 
 fn setup_search_index() -> Result<SearchIndex> {
@@ -113,6 +140,7 @@ fn setup_search_index() -> Result<SearchIndex> {
     let body_field_options = TextOptions::default().set_indexing_options(body_field_indexing);
     let mut schema_builder = Schema::builder();
     let url_field = schema_builder.add_text_field("url", STRING | STORED | FAST);
+    let url_hash_field = schema_builder.add_u64_field("url_hash", tantivy::schema::INDEXED | FAST);
     let title_field = schema_builder.add_text_field("title", TEXT | STORED);
     let body_field = schema_builder.add_text_field("body", body_field_options);
     let schema = schema_builder.build();
@@ -132,6 +160,7 @@ fn setup_search_index() -> Result<SearchIndex> {
     Ok(SearchIndex {
         index,
         url_field,
+        url_hash_field,
         title_field,
         body_field,
     })
@@ -303,6 +332,7 @@ async fn main() -> Result<()> {
     let SearchIndex {
         index,
         url_field,
+        url_hash_field,
         title_field,
         body_field,
     } = setup_search_index()?;
@@ -336,10 +366,12 @@ async fn main() -> Result<()> {
             let Some(domain) = task.target_url.host_str().map(String::from) else {
                 continue;
             };
-            seen_urls.insert(&task.target_url.to_string());
+            let url_str = task.target_url.to_string();
+            seen_urls.insert(&url_str);
+            let url_hash = seen_urls.source_hash(&url_str);
             domains_in_progress.insert(domain.clone());
             let crawler = Arc::clone(&crawler);
-            worker_pool.spawn(async move { (domain, crawler.fetch_and_process_page(task).await) });
+            worker_pool.spawn(async move { (domain, url_hash, crawler.fetch_and_process_page(task).await) });
         }
 
         if worker_pool.is_empty() && task_queue.is_empty() {
@@ -347,7 +379,7 @@ async fn main() -> Result<()> {
         }
 
         // Process completed task
-        let Some(Ok((domain, crawl_result))) = worker_pool.join_next().await else {
+        let Some(Ok((domain, url_hash, crawl_result))) = worker_pool.join_next().await else {
             continue;
         };
         domains_in_progress.remove(&domain);
@@ -365,7 +397,7 @@ async fn main() -> Result<()> {
         let searcher = index.reader()?.searcher();
         let discovered_links = discovered_links
             .into_iter()
-            .filter(|t| !t.should_skip(cli_args.max_crawl_depth, &seen_urls, &cli_args.excluded_url_prefixes, &searcher, url_field));
+            .filter(|t| !t.should_skip(cli_args.max_crawl_depth, &seen_urls, &cli_args.excluded_url_prefixes, &searcher, url_hash_field, url_field));
 
         // Queue newly discovered links
         task_queue.extend(discovered_links);
@@ -374,6 +406,7 @@ async fn main() -> Result<()> {
         if let Some(page) = page_data {
             let doc = doc!(
                 url_field => page.page_url,
+                url_hash_field => url_hash,
                 title_field => page.page_title,
                 body_field => page.page_content
             );
