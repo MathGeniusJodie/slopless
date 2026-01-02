@@ -355,9 +355,10 @@ async fn main() -> Result<()> {
                 continue;
             }
         };
-        let discovered_links = discovered_links.into_iter()
-                .filter(|t| !t.should_skip(max_crawl_depth, &seen_urls, &excluded_url_prefixes));
-        
+        let discovered_links = discovered_links
+            .into_iter()
+            .filter(|t| !t.should_skip(max_crawl_depth, &seen_urls, &excluded_url_prefixes));
+
         // Queue newly discovered links
         task_queue.extend(discovered_links);
 
