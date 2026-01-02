@@ -289,7 +289,7 @@ async fn main() -> Result<()> {
         title_field,
         body_field,
     } = setup_search_index()?;
-    let mut index_writer = index.writer(10_000_000)?;
+    let mut index_writer = index.writer(50_000_000)?;
 
     let (mut pages_crawled, mut pages_failed) = (0usize, 0usize);
     let expected_url_count = 100_000_000;
