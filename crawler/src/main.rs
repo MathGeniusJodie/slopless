@@ -70,13 +70,16 @@ impl CrawlTask {
         searcher: &tantivy::Searcher,
         queued_urls: &HashSet<String, ahash::RandomState>,
     ) -> bool {
+        if self.crawl_depth > max_depth {
+            return true;
+        }
+        if excluded_prefixes
+            .iter()
+            .any(|prefix| self.target_url.as_str().starts_with(prefix)) {
+            return true;
+        }
         let url_str = self.target_url.to_string();
-        self.crawl_depth > max_depth
-            || db.should_skip_url(&url_str, searcher)
-            || excluded_prefixes
-                .iter()
-                .any(|prefix| self.target_url.as_str().starts_with(prefix))
-            || queued_urls.contains(&url_str)
+        queued_urls.contains(&url_str) || db.should_skip_url(&url_str, searcher)   
     }
 }
 
@@ -183,11 +186,6 @@ impl CrawlDb {
     }
 
     fn index_page(&mut self, page: IndexedPage, url_hash: u64, searcher: &tantivy::Searcher) -> Result<()> {
-        // Skip if this exact URL is already pending commit
-        if self.uncommitted_urls.contains(&page.page_url) {
-            return Ok(());
-        }
-        
         // Check if this hash already exists (committed or uncommitted) - if so, mark as collision
         // If URL not in seen_urls bloom filter, it's definitely not in the index (no false negatives)
         let hash_in_index = if self.seen_urls.contains(&page.page_url) {
