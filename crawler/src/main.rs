@@ -7,7 +7,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet};
 use std::fs::read_to_string;
 use std::sync::Arc;
-use tantivy::schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions, STORED, STRING, TEXT};
+use tantivy::schema::{FAST, IndexRecordOption, STORED, STRING, Schema, TEXT, TextFieldIndexing, TextOptions};
 use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
 use tantivy::{doc, Index};
 use tokio::task::JoinSet;
@@ -112,7 +112,7 @@ fn setup_search_index() -> Result<SearchIndex> {
         .set_index_option(IndexRecordOption::WithFreqsAndPositions);
     let body_field_options = TextOptions::default().set_indexing_options(body_field_indexing);
     let mut schema_builder = Schema::builder();
-    let url_field = schema_builder.add_text_field("url", STRING | STORED);
+    let url_field = schema_builder.add_text_field("url", STRING | STORED | FAST);
     let title_field = schema_builder.add_text_field("title", TEXT | STORED);
     let body_field = schema_builder.add_text_field("body", body_field_options);
     let schema = schema_builder.build();
@@ -311,7 +311,10 @@ async fn main() -> Result<()> {
     let (mut pages_crawled, mut pages_failed) = (0usize, 0usize);
     let expected_url_count = 100_000_000;
     // querying tantvy is relatively fast so we don't need a very low false positive rate here
-    let mut seen_urls = BloomFilter::with_false_pos(0.1)
+    let mut seen_urls = BloomFilter::with_num_bits(expected_url_count * 4)
+        .hasher(ahash::RandomState::new())
+        .expected_items(expected_url_count);
+    let mut collisions = BloomFilter::with_num_bits(expected_url_count * 2)
         .hasher(ahash::RandomState::new())
         .expected_items(expected_url_count);
     let mut domains_in_progress = HashSet::with_hasher(ahash::RandomState::new());
