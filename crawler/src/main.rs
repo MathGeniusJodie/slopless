@@ -189,13 +189,16 @@ impl CrawlDb {
         }
         
         // Check if this hash already exists (committed or uncommitted) - if so, mark as collision
-        let hash_in_index = {
+        // If URL not in seen_urls bloom filter, it's definitely not in the index (no false negatives)
+        let hash_in_index = if self.seen_urls.contains(&page.page_url) {
             let term = tantivy::Term::from_field_u64(self.url_hash_field, url_hash);
             searcher.segment_readers().iter().any(|segment_reader| {
                 segment_reader
                     .inverted_index(self.url_hash_field)
                     .is_ok_and(|idx| idx.terms().term_ord(term.serialized_value_bytes()).is_ok_and(|o| o.is_some()))
             })
+        } else {
+            false
         };
         if self.uncommitted_hashes.contains(&url_hash) || hash_in_index {
             self.collisions.insert(&url_hash);
