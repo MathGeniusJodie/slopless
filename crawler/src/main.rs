@@ -7,7 +7,7 @@ use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::policies::ExponentialBackoff;
 use reqwest_retry::RetryTransientMiddleware;
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::fs::read_to_string;
 use std::sync::Arc;
 use tantivy::schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions, STORED, TEXT};
@@ -46,7 +46,7 @@ struct WebCrawler {
     verbose_logging: bool,
 }
 
-#[derive(Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 struct CrawlTask {
     crawl_depth: usize,
     target_url: Url,
@@ -55,8 +55,10 @@ struct CrawlTask {
 
 impl Ord for CrawlTask {
     fn cmp(&self, other: &Self) -> Ordering {
-        // BinaryHeap is a max-heap; reverse depth comparison to get a min-heap by depth.
-        other.crawl_depth.cmp(&self.crawl_depth)
+        // Order by depth (ascending), then by URL for uniqueness in BTreeSet
+        self.crawl_depth
+            .cmp(&other.crawl_depth)
+            .then_with(|| self.target_url.as_str().cmp(other.target_url.as_str()))
     }
 }
 
@@ -111,27 +113,18 @@ fn setup_search_index() -> Result<SearchIndex> {
 }
 
 fn pop_available_task(
-    task_queue: &mut BinaryHeap<CrawlTask>,
+    task_queue: &mut BTreeSet<CrawlTask>,
     domains_in_progress: &HashSet<String, ahash::RandomState>,
-    seen_urls: &BloomFilter<ahash::RandomState>,
 ) -> Option<CrawlTask> {
-    let mut deferred_tasks = Vec::new();
-    let mut result = None;
-    while let Some(task) = task_queue.pop() {
-        let dominated = task
-            .target_url
-            .host_str()
-            .map_or(true, |d| domains_in_progress.contains(d));
-        if !dominated {
-            result = Some(task);
-            break;
-        }
-        if !seen_urls.contains(&task.target_url.to_string()) {
-            deferred_tasks.push(task);
-        }
-    }
-    task_queue.extend(deferred_tasks);
-    result
+    let task = task_queue
+        .iter()
+        .find(|task| {
+            task.target_url
+                .host_str()
+                .map_or(false, |d| !domains_in_progress.contains(d))
+        })
+        .cloned()?;
+    task_queue.take(&task)
 }
 
 fn extract_page_content(html_body: String) -> Result<(Vec<String>, String, String)> {
@@ -185,7 +178,7 @@ impl WebCrawler {
             .hasher(ahash::RandomState::new())
             .expected_items(expected_url_count);
         let mut domains_in_progress = HashSet::with_hasher(ahash::RandomState::new());
-        let mut task_queue: BinaryHeap<CrawlTask> = seed_urls
+        let mut task_queue: BTreeSet<CrawlTask> = seed_urls
             .into_iter()
             .map(|url| CrawlTask {
                 target_url: url,
@@ -198,9 +191,7 @@ impl WebCrawler {
 
         loop {
             while worker_pool.len() <= self.max_concurrent_requests {
-                let Some(task) =
-                    pop_available_task(&mut task_queue, &domains_in_progress, &seen_urls)
-                else {
+                let Some(task) = pop_available_task(&mut task_queue, &domains_in_progress) else {
                     break;
                 };
                 let Some(domain) = task.target_url.host_str().map(String::from) else {
@@ -253,7 +244,7 @@ impl WebCrawler {
                     || seen_urls.contains(&task.target_url.to_string())
                     || self.is_excluded_url(&task.target_url.to_string());
                 if !dominated {
-                    task_queue.push(task);
+                    task_queue.insert(task);
                 }
             }
             pages_crawled += 1;
