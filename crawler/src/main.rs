@@ -48,9 +48,9 @@ struct CrawlTask {
 
 impl Ord for CrawlTask {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Order by depth (ascending), then by URL for uniqueness in BTreeSet
-        self.crawl_depth
-            .cmp(&other.crawl_depth)
+        // Order by depth (DESCENDING - process deepest first), then by URL for uniqueness
+        other.crawl_depth  // Swap self/other to reverse order
+            .cmp(&self.crawl_depth)
             .then_with(|| self.target_url.as_str().cmp(other.target_url.as_str()))
     }
 }
