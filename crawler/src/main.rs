@@ -136,14 +136,11 @@ impl CrawlDb {
 
     fn should_skip_url(&self, url: &str, searcher: &tantivy::Searcher) -> bool {
         let maybe_in_index = self.seen_urls.contains(url);
-        if !maybe_in_index {
-            return false;
-        }
-        
-        let url_hash = self.seen_urls.source_hash(url);
-        // if this hash has no known collisions, we can trust the bloom filter
-        if !self.collisions.contains(&url_hash) {
-            return false;
+        if maybe_in_index {
+            let url_hash = self.seen_urls.source_hash(url);
+            if !self.collisions.contains(&url_hash) {
+                return true;
+            }
         }
         
         // possible collision: must verify db
@@ -159,7 +156,7 @@ impl CrawlDb {
 
         // cannot be a false positive if there's only one document with this hash
         if doc_addresses.len() == 1 {
-            return false;
+            return true;
         }
         
         // multiple documents with this hash - check actual URLs
