@@ -135,22 +135,57 @@ impl CrawlDb {
     }
 
     fn should_skip_url(&self, url: &str, searcher: &tantivy::Searcher) -> bool {
-        url_exists_in_index(
-            searcher,
-            self.url_hash_field,
-            self.url_field,
-            self.seen_urls.source_hash(url),
-            url,
-            &self.collisions,
-            &self.seen_urls,
-        )
+        let maybe_in_index = self.seen_urls.contains(url);
+        if !maybe_in_index {
+            return false;
+        }
+        
+        let url_hash = self.seen_urls.source_hash(url);
+        // if this hash has no known collisions, we can trust the bloom filter
+        if !self.collisions.contains(&url_hash) {
+            return false;
+        }
+        
+        // possible collision: must verify db
+        use tantivy::collector::DocSetCollector;
+        use tantivy::query::TermQuery;
+        
+        let term = tantivy::Term::from_field_u64(self.url_hash_field, url_hash);
+        let query = TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
+        
+        let Ok(doc_addresses) = searcher.search(&query, &DocSetCollector) else {
+            return false;
+        };
+
+        // cannot be a false positive if there's only one document with this hash
+        if doc_addresses.len() == 1 {
+            return false;
+        }
+        
+        // multiple documents with this hash - check actual URLs
+        for doc_address in doc_addresses {
+            if let Ok(doc) = searcher.doc::<tantivy::TantivyDocument>(doc_address) {
+                if let Some(stored_url) = doc.get_first(self.url_field).and_then(|v| v.as_str()) {
+                    if stored_url == url {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     fn index_page(&mut self, page: IndexedPage, url_hash: u64, searcher: &tantivy::Searcher) -> Result<()> {
         // Check if this hash already exists (committed or uncommitted) - if so, mark as collision
-        if self.uncommitted_hashes.contains(&url_hash) 
-            || hash_exists_in_index(searcher, self.url_hash_field, url_hash) 
-        {
+        let hash_in_index = {
+            let term = tantivy::Term::from_field_u64(self.url_hash_field, url_hash);
+            searcher.segment_readers().iter().any(|segment_reader| {
+                segment_reader
+                    .inverted_index(self.url_hash_field)
+                    .is_ok_and(|idx| idx.terms().term_ord(term.serialized_value_bytes()).is_ok_and(|o| o.is_some()))
+            })
+        };
+        if self.uncommitted_hashes.contains(&url_hash) || hash_in_index {
             self.collisions.insert(&url_hash);
         }
         self.uncommitted_hashes.insert(url_hash);
@@ -176,72 +211,6 @@ impl CrawlDb {
     }
 }
 
-/// Checks if a URL exists in the index by querying by hash.
-/// Uses collisions bloom filter: if hash is not a known collision, a single match is definitive.
-/// Only fetches actual URLs when the hash is known to have collisions.
-fn url_exists_in_index(
-    searcher: &tantivy::Searcher,
-    url_hash_field: tantivy::schema::Field,
-    url_field: tantivy::schema::Field,
-    url_hash: u64,
-    url: &str,
-    collisions: &BloomFilter<ahash::RandomState>,
-    seen_urls: &BloomFilter<ahash::RandomState>,
-) -> bool {
-    let maybe_in_index = seen_urls.contains(url);
-    if !maybe_in_index {
-        return false;
-    }
-    // if this hash has no known collisions, we can trust the bloom filter
-    if !collisions.contains(&url_hash) {
-        return false
-    }
-    
-    // possible collision: must verify db
-    use tantivy::collector::DocSetCollector;
-    use tantivy::query::TermQuery;
-    
-    let term = tantivy::Term::from_field_u64(url_hash_field, url_hash);
-    let query = TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
-    
-    let Ok(doc_addresses) = searcher.search(&query, &DocSetCollector) else {
-        return false;
-    };
-
-    // cannot be a false positive if there's only one document with this hash
-    if doc_addresses.len() == 1 {
-        return false;
-    }
-    
-    // multiple documents with this hash - check actual URLs
-    for doc_address in doc_addresses {
-        if let Ok(doc) = searcher.doc::<tantivy::TantivyDocument>(doc_address) {
-            if let Some(stored_url) = doc.get_first(url_field).and_then(|v| v.as_str()) {
-                if stored_url == url {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
-/// Fast check if a hash exists in the index (for collision detection at insert time)
-fn hash_exists_in_index(
-    searcher: &tantivy::Searcher,
-    url_hash_field: tantivy::schema::Field,
-    url_hash: u64,
-) -> bool {
-    let term = tantivy::Term::from_field_u64(url_hash_field, url_hash);
-    for segment_reader in searcher.segment_readers() {
-        if let Ok(inverted_index) = segment_reader.inverted_index(url_hash_field) {
-            if inverted_index.terms().term_ord(term.serialized_value_bytes()).is_ok_and(|o| o.is_some()) {
-                return true;
-            }
-        }
-    }
-    false
-}
 fn setup_search_index() -> Result<SearchIndex> {
     let search_tokenizer = TextAnalyzer::builder(SimpleTokenizer::default())
         .filter(LowerCaser)
