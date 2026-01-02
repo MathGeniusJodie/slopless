@@ -96,6 +96,7 @@ struct CrawlDb {
     seen_urls: BloomFilter<ahash::RandomState>,
     collisions: BloomFilter<ahash::RandomState>,
     uncommitted_hashes: HashSet<u64, ahash::RandomState>,
+    uncommitted_urls: HashSet<String, ahash::RandomState>,
 }
 
 impl CrawlDb {
@@ -108,6 +109,7 @@ impl CrawlDb {
             .hasher(ahash::RandomState::new())
             .expected_items(expected_url_count);
         let uncommitted_hashes = HashSet::with_hasher(ahash::RandomState::new());
+        let uncommitted_urls = HashSet::with_hasher(ahash::RandomState::new());
         
         Ok(Self {
             index: search_index.index,
@@ -119,6 +121,7 @@ impl CrawlDb {
             seen_urls,
             collisions,
             uncommitted_hashes,
+            uncommitted_urls,
         })
     }
 
@@ -135,6 +138,11 @@ impl CrawlDb {
     }
 
     fn should_skip_url(&self, url: &str, searcher: &tantivy::Searcher) -> bool {
+        // Check uncommitted URLs first (already added to tantivy but not committed)
+        if self.uncommitted_urls.contains(url) {
+            return true;
+        }
+        
         let maybe_in_index = self.seen_urls.contains(url);
         let url_hash = self.seen_urls.source_hash(url);
         if maybe_in_index {
@@ -173,6 +181,11 @@ impl CrawlDb {
     }
 
     fn index_page(&mut self, page: IndexedPage, url_hash: u64, searcher: &tantivy::Searcher) -> Result<()> {
+        // Skip if this exact URL is already pending commit
+        if self.uncommitted_urls.contains(&page.page_url) {
+            return Ok(());
+        }
+        
         // Check if this hash already exists (committed or uncommitted) - if so, mark as collision
         let hash_in_index = {
             let term = tantivy::Term::from_field_u64(self.url_hash_field, url_hash);
@@ -186,6 +199,7 @@ impl CrawlDb {
             self.collisions.insert(&url_hash);
         }
         self.uncommitted_hashes.insert(url_hash);
+        self.uncommitted_urls.insert(page.page_url.clone());
         
         let doc = doc!(
             self.url_field => page.page_url,
@@ -200,6 +214,7 @@ impl CrawlDb {
     fn commit(&mut self) -> Result<()> {
         self.index_writer.commit()?;
         self.uncommitted_hashes.clear();
+        self.uncommitted_urls.clear();
         Ok(())
     }
 
@@ -418,10 +433,13 @@ async fn main() -> Result<()> {
     let mut domains_in_progress = HashSet::with_hasher(ahash::RandomState::new());
     let mut task_queue: BTreeSet<CrawlTask> = seed_urls
         .into_iter()
-        .map(|url| CrawlTask {
-            target_url: url,
-            crawl_depth: 0,
-            retry_count: 0,
+        .map(|url| {
+            db.mark_seen(url.as_str());
+            CrawlTask {
+                target_url: url,
+                crawl_depth: 0,
+                retry_count: 0,
+            }
         })
         .collect();
     let mut worker_pool = JoinSet::new();
@@ -435,7 +453,6 @@ async fn main() -> Result<()> {
                 continue;
             };
             let url_str = task.target_url.to_string();
-            db.mark_seen(&url_str);
             let url_hash = db.url_hash(&url_str);
             domains_in_progress.insert(domain.clone());
             let crawler = Arc::clone(&crawler);
@@ -470,6 +487,7 @@ async fn main() -> Result<()> {
                 &db,
                 &searcher,
             ) {
+                db.mark_seen(&task.target_url.to_string());
                 task_queue.insert(task);
             }
         }
