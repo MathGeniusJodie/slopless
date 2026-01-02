@@ -65,16 +65,13 @@ impl CrawlTask {
     fn should_skip(
         &self,
         max_depth: usize,
-        seen_urls: &BloomFilter<ahash::RandomState>,
         excluded_prefixes: &[String],
+        db: &CrawlDb,
         searcher: &tantivy::Searcher,
-        url_hash_field: tantivy::schema::Field,
-        url_field: tantivy::schema::Field,
-        collisions: &BloomFilter<ahash::RandomState>,
     ) -> bool {
         let url_str = self.target_url.to_string();
         self.crawl_depth > max_depth
-            || url_exists_in_index(searcher, url_hash_field, url_field, seen_urls.source_hash(&url_str), &url_str, collisions, seen_urls)
+            || db.should_skip_url(&url_str, searcher)
             || excluded_prefixes
                 .iter()
                 .any(|prefix| self.target_url.as_str().starts_with(prefix))
@@ -87,6 +84,96 @@ struct SearchIndex {
     url_hash_field: tantivy::schema::Field,
     title_field: tantivy::schema::Field,
     body_field: tantivy::schema::Field,
+}
+
+struct CrawlDb {
+    index: Index,
+    index_writer: tantivy::IndexWriter,
+    url_field: tantivy::schema::Field,
+    url_hash_field: tantivy::schema::Field,
+    title_field: tantivy::schema::Field,
+    body_field: tantivy::schema::Field,
+    seen_urls: BloomFilter<ahash::RandomState>,
+    collisions: BloomFilter<ahash::RandomState>,
+    uncommitted_hashes: HashSet<u64, ahash::RandomState>,
+}
+
+impl CrawlDb {
+    fn new(search_index: SearchIndex, expected_url_count: usize) -> Result<Self> {
+        let index_writer = search_index.index.writer(50_000_000)?;
+        let seen_urls = BloomFilter::with_num_bits(expected_url_count * 4)
+            .hasher(ahash::RandomState::new())
+            .expected_items(expected_url_count);
+        let collisions = BloomFilter::with_num_bits(expected_url_count * 2)
+            .hasher(ahash::RandomState::new())
+            .expected_items(expected_url_count);
+        let uncommitted_hashes = HashSet::with_hasher(ahash::RandomState::new());
+        
+        Ok(Self {
+            index: search_index.index,
+            index_writer,
+            url_field: search_index.url_field,
+            url_hash_field: search_index.url_hash_field,
+            title_field: search_index.title_field,
+            body_field: search_index.body_field,
+            seen_urls,
+            collisions,
+            uncommitted_hashes,
+        })
+    }
+
+    fn searcher(&self) -> Result<tantivy::Searcher> {
+        Ok(self.index.reader()?.searcher())
+    }
+
+    fn url_hash(&self, url: &str) -> u64 {
+        self.seen_urls.source_hash(url)
+    }
+
+    fn mark_seen(&mut self, url: &str) {
+        self.seen_urls.insert(url);
+    }
+
+    fn should_skip_url(&self, url: &str, searcher: &tantivy::Searcher) -> bool {
+        url_exists_in_index(
+            searcher,
+            self.url_hash_field,
+            self.url_field,
+            self.seen_urls.source_hash(url),
+            url,
+            &self.collisions,
+            &self.seen_urls,
+        )
+    }
+
+    fn index_page(&mut self, page: IndexedPage, url_hash: u64, searcher: &tantivy::Searcher) -> Result<()> {
+        // Check if this hash already exists (committed or uncommitted) - if so, mark as collision
+        if self.uncommitted_hashes.contains(&url_hash) 
+            || hash_exists_in_index(searcher, self.url_hash_field, url_hash) 
+        {
+            self.collisions.insert(&url_hash);
+        }
+        self.uncommitted_hashes.insert(url_hash);
+        
+        let doc = doc!(
+            self.url_field => page.page_url,
+            self.url_hash_field => url_hash,
+            self.title_field => page.page_title,
+            self.body_field => page.page_content
+        );
+        self.index_writer.add_document(doc)?;
+        Ok(())
+    }
+
+    fn commit(&mut self) -> Result<()> {
+        self.index_writer.commit()?;
+        self.uncommitted_hashes.clear();
+        Ok(())
+    }
+
+    fn num_docs(&self) -> Result<u64> {
+        Ok(self.index.reader()?.searcher().num_docs())
+    }
 }
 
 /// Checks if a URL exists in the index by querying by hash.
@@ -357,25 +444,11 @@ async fn main() -> Result<()> {
             .build()?
     });
 
-    let SearchIndex {
-        index,
-        url_field,
-        url_hash_field,
-        title_field,
-        body_field,
-    } = setup_search_index()?;
-    let mut index_writer = index.writer(50_000_000)?;
+    let search_index = setup_search_index()?;
+    let expected_url_count = 100_000_000;
+    let mut db = CrawlDb::new(search_index, expected_url_count)?;
 
     let (mut pages_crawled, mut pages_failed) = (0usize, 0usize);
-    let expected_url_count = 100_000_000;
-    // querying tantvy is relatively fast so we don't need a very low false positive rate here
-    let mut seen_urls = BloomFilter::with_num_bits(expected_url_count * 4)
-        .hasher(ahash::RandomState::new())
-        .expected_items(expected_url_count);
-    let mut collisions = BloomFilter::with_num_bits(expected_url_count * 2)
-        .hasher(ahash::RandomState::new())
-        .expected_items(expected_url_count);
-    let mut uncommitted_hashes: HashSet<u64, ahash::RandomState> = HashSet::with_hasher(ahash::RandomState::new());
     let mut domains_in_progress = HashSet::with_hasher(ahash::RandomState::new());
     let mut task_queue: BTreeSet<CrawlTask> = seed_urls
         .into_iter()
@@ -396,8 +469,8 @@ async fn main() -> Result<()> {
                 continue;
             };
             let url_str = task.target_url.to_string();
-            seen_urls.insert(&url_str);
-            let url_hash = seen_urls.source_hash(&url_str);
+            db.mark_seen(&url_str);
+            let url_hash = db.url_hash(&url_str);
             domains_in_progress.insert(domain.clone());
             let crawler = Arc::clone(&crawler);
             worker_pool.spawn(async move { (domain, url_hash, crawler.fetch_and_process_page(task).await) });
@@ -423,16 +496,13 @@ async fn main() -> Result<()> {
                 continue;
             }
         };
-        let searcher = index.reader()?.searcher();
+        let searcher = db.searcher()?;
         for task in discovered_links {
             if !task.should_skip(
                 cli_args.max_crawl_depth,
-                &seen_urls,
                 &cli_args.excluded_url_prefixes,
+                &db,
                 &searcher,
-                url_hash_field,
-                url_field,
-                &collisions,
             ) {
                 task_queue.insert(task);
             }
@@ -440,18 +510,7 @@ async fn main() -> Result<()> {
 
         // Index the page if we got content
         if let Some(page) = page_data {
-            // Check if this hash already exists (committed or uncommitted) - if so, mark as collision
-            if uncommitted_hashes.contains(&url_hash) || hash_exists_in_index(&searcher, url_hash_field, url_hash) {
-                collisions.insert(&url_hash);
-            }
-            uncommitted_hashes.insert(url_hash);
-            let doc = doc!(
-                url_field => page.page_url,
-                url_hash_field => url_hash,
-                title_field => page.page_title,
-                body_field => page.page_content
-            );
-            if let Err(e) = index_writer.add_document(doc) {
+            if let Err(e) = db.index_page(page, url_hash, &searcher) {
                 eprintln!("Indexing error: {e:?}");
             }
         }
@@ -466,13 +525,12 @@ async fn main() -> Result<()> {
                 domains_in_progress.len()
             );
             last_status_report = std::time::Instant::now();
-            index_writer.commit().expect("Failed to commit index");
-            uncommitted_hashes.clear();
+            db.commit().expect("Failed to commit index");
         }
     }
     println!(
         "Crawl finished. Docs in index: {}",
-        index.reader()?.searcher().num_docs()
+        db.num_docs()?
     );
 
     Ok(())
