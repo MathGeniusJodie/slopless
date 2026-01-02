@@ -136,8 +136,8 @@ impl CrawlDb {
 
     fn should_skip_url(&self, url: &str, searcher: &tantivy::Searcher) -> bool {
         let maybe_in_index = self.seen_urls.contains(url);
+        let url_hash = self.seen_urls.source_hash(url);
         if maybe_in_index {
-            let url_hash = self.seen_urls.source_hash(url);
             if !self.collisions.contains(&url_hash) {
                 return true;
             }
