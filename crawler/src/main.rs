@@ -64,6 +64,21 @@ impl PartialOrd for CrawlTask {
     }
 }
 
+impl CrawlTask {
+    fn should_skip(
+        &self,
+        max_depth: usize,
+        seen_urls: &BloomFilter<ahash::RandomState>,
+        excluded_prefixes: &[String],
+    ) -> bool {
+        self.crawl_depth > max_depth
+            || seen_urls.contains(&self.target_url.to_string())
+            || excluded_prefixes
+                .iter()
+                .any(|prefix| self.target_url.as_str().starts_with(prefix))
+    }
+}
+
 struct SearchIndex {
     index: Index,
     url_field: tantivy::schema::Field,
@@ -308,9 +323,9 @@ async fn main() -> Result<()> {
     let mut last_status_report = std::time::Instant::now();
 
     loop {
+        // Spawn new tasks up to concurrency limit
         let slots_available = max_concurrent_requests.saturating_sub(worker_pool.len());
-        let tasks = pop_available_tasks(&mut task_queue, &domains_in_progress, slots_available);
-        for task in tasks {
+        for task in pop_available_tasks(&mut task_queue, &domains_in_progress, slots_available) {
             let Some(domain) = task.target_url.host_str().map(String::from) else {
                 continue;
             };
@@ -324,59 +339,51 @@ async fn main() -> Result<()> {
             break;
         }
 
-        let Some(join_result) = worker_pool.join_next().await else {
+        // Process completed task
+        let Some(Ok((domain, crawl_result))) = worker_pool.join_next().await else {
             continue;
-        };
-        let (domain, crawl_result) = match join_result {
-            Ok(r) => r,
-            Err(e) => {
-                if verbose_logging {
-                    eprintln!("Worker task failed: {:?}", e);
-                }
-                continue;
-            }
         };
         domains_in_progress.remove(&domain);
 
         let (discovered_links, page_data) = match crawl_result {
-            Ok(r) => r,
+            Ok(result) => result,
             Err(e) => {
                 pages_failed += 1;
                 if verbose_logging {
-                    eprintln!("Error crawling {}: {:?}", domain, e);
+                    eprintln!("Error crawling {domain}: {e:?}");
                 }
                 continue;
             }
         };
+        let discovered_links = discovered_links.into_iter()
+                .filter(|t| !t.should_skip(max_crawl_depth, &seen_urls, &excluded_url_prefixes));
+        
+        // Queue newly discovered links
+        task_queue.extend(discovered_links);
 
-        if let Some(p) = page_data {
-            if let Err(e) = index_writer.add_document(doc!(url_field => p.page_url, body_field => p.page_content, title_field => p.page_title)) {
-                eprintln!("Indexing error: {:?}", e);
+        // Index the page if we got content
+        if let Some(page) = page_data {
+            let doc = doc!(
+                url_field => page.page_url,
+                title_field => page.page_title,
+                body_field => page.page_content
+            );
+            if let Err(e) = index_writer.add_document(doc) {
+                eprintln!("Indexing error: {e:?}");
             }
         }
-        for task in discovered_links {
-            let is_excluded = excluded_url_prefixes
-                .iter()
-                .any(|prefix| task.target_url.as_str().starts_with(prefix));
-            let dominated = task.crawl_depth > max_crawl_depth
-                || seen_urls.contains(&task.target_url.to_string())
-                || is_excluded;
-            if !dominated {
-                task_queue.insert(task);
-            }
-        }
+
         pages_crawled += 1;
 
+        // Periodic status report
         if last_status_report.elapsed().as_secs() >= 5 {
             println!(
-                "Crawled: {}, Failed: {}, Queue: {}, Active: {}",
-                pages_crawled,
-                pages_failed,
+                "Crawled: {pages_crawled}, Failed: {pages_failed}, Queue: {}, Active: {}",
                 task_queue.len(),
                 domains_in_progress.len()
             );
             last_status_report = std::time::Instant::now();
-            index_writer.commit().expect("Failed to commit index"); // very slow to do often
+            index_writer.commit().expect("Failed to commit index");
         }
     }
     println!(
