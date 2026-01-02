@@ -3,9 +3,6 @@ use clap::Parser;
 use fastbloom::BloomFilter;
 use lol_html::{element, text, HtmlRewriter, Settings};
 use reqwest::Client;
-use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
-use reqwest_retry::policies::ExponentialBackoff;
-use reqwest_retry::RetryTransientMiddleware;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet};
 use std::fs::read_to_string;
@@ -39,7 +36,7 @@ struct IndexedPage {
 }
 
 struct WebCrawler {
-    http_client: ClientWithMiddleware,
+    http_client: Client,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -274,10 +271,8 @@ async fn main() -> Result<()> {
         }
     }
 
-    let retry_policy = ExponentialBackoff::builder().build_with_max_retries(4);
     let crawler = Arc::new(WebCrawler {
-        http_client: ClientBuilder::new(
-            Client::builder()
+        http_client: Client::builder()
             // chrome
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3")
             // max concurrency for multiple hosts
@@ -286,9 +281,6 @@ async fn main() -> Result<()> {
             //.timeout(std::time::Duration::from_secs(5))
             .tcp_nodelay(true)
             .build()?
-        )
-        .with(RetryTransientMiddleware::new_with_policy(retry_policy))
-        .build(),
     });
 
     let SearchIndex {
