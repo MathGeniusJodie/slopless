@@ -40,10 +40,6 @@ struct IndexedPage {
 
 struct WebCrawler {
     http_client: ClientWithMiddleware,
-    excluded_url_prefixes: Vec<String>,
-    max_crawl_depth: usize,
-    max_concurrent_requests: usize,
-    verbose_logging: bool,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -163,110 +159,6 @@ fn extract_page_content(html_body: String) -> Result<(Vec<String>, String, Strin
 }
 
 impl WebCrawler {
-    pub async fn crawl_all_domains(self: Arc<Self>, seed_urls: Vec<Url>) -> Result<()> {
-        let SearchIndex {
-            index,
-            url_field,
-            title_field,
-            body_field,
-        } = setup_search_index()?;
-        let mut index_writer = index.writer(1_000_000_000)?;
-
-        let (mut pages_crawled, mut pages_failed) = (0usize, 0usize);
-        let expected_url_count = 100_000_000;
-        let mut seen_urls = BloomFilter::with_false_pos(1.0 / (expected_url_count as f64))
-            .hasher(ahash::RandomState::new())
-            .expected_items(expected_url_count);
-        let mut domains_in_progress = HashSet::with_hasher(ahash::RandomState::new());
-        let mut task_queue: BTreeSet<CrawlTask> = seed_urls
-            .into_iter()
-            .map(|url| CrawlTask {
-                target_url: url,
-                crawl_depth: 0,
-                retry_count: 0,
-            })
-            .collect();
-        let mut worker_pool = JoinSet::new();
-        let mut last_status_report = std::time::Instant::now();
-
-        loop {
-            while worker_pool.len() <= self.max_concurrent_requests {
-                let Some(task) = pop_available_task(&mut task_queue, &domains_in_progress) else {
-                    break;
-                };
-                let Some(domain) = task.target_url.host_str().map(String::from) else {
-                    continue;
-                };
-                seen_urls.insert(&task.target_url.to_string());
-                domains_in_progress.insert(domain.clone());
-                let crawler = Arc::clone(&self);
-                worker_pool
-                    .spawn(async move { (domain, crawler.fetch_and_process_page(task).await) });
-            }
-
-            if worker_pool.is_empty() && task_queue.is_empty() {
-                break;
-            }
-
-            let Some(join_result) = worker_pool.join_next().await else {
-                continue;
-            };
-            let (domain, crawl_result) = match join_result {
-                Ok(r) => r,
-                Err(e) => {
-                    if self.verbose_logging {
-                        eprintln!("Worker task failed: {:?}", e);
-                    }
-                    continue;
-                }
-            };
-            domains_in_progress.remove(&domain);
-
-            let (discovered_links, page_data) = match crawl_result {
-                Ok(r) => r,
-                Err(e) => {
-                    pages_failed += 1;
-                    if self.verbose_logging {
-                        eprintln!("Error crawling {}: {:?}", domain, e);
-                    }
-                    continue;
-                }
-            };
-
-            if let Some(p) = page_data {
-                if let Err(e) = index_writer.add_document(doc!(url_field => p.page_url, body_field => p.page_content, title_field => p.page_title)) {
-                    eprintln!("Indexing error: {:?}", e);
-                }
-                index_writer.commit().expect("Failed to commit index");
-            }
-            for task in discovered_links {
-                let dominated = task.crawl_depth > self.max_crawl_depth
-                    || seen_urls.contains(&task.target_url.to_string())
-                    || self.is_excluded_url(&task.target_url.to_string());
-                if !dominated {
-                    task_queue.insert(task);
-                }
-            }
-            pages_crawled += 1;
-
-            if last_status_report.elapsed().as_secs() >= 5 {
-                println!(
-                    "Crawled: {}, Failed: {}, Queue: {}, Active: {}",
-                    pages_crawled,
-                    pages_failed,
-                    task_queue.len(),
-                    domains_in_progress.len()
-                );
-                last_status_report = std::time::Instant::now();
-            }
-        }
-        println!(
-            "Crawl finished. Docs in index: {}",
-            index.reader()?.searcher().num_docs()
-        );
-        Ok(())
-    }
-
     async fn fetch_and_process_page(
         &self,
         task: CrawlTask,
@@ -325,12 +217,6 @@ impl WebCrawler {
             }),
         ))
     }
-
-    fn is_excluded_url(&self, url: &str) -> bool {
-        self.excluded_url_prefixes
-            .iter()
-            .any(|prefix| url.starts_with(prefix))
-    }
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 20)]
@@ -379,13 +265,116 @@ async fn main() -> Result<()> {
         )
         .with(RetryTransientMiddleware::new_with_policy(retry_policy))
         .build(),
-        excluded_url_prefixes: cli_args.exclude,
-        max_crawl_depth: cli_args.max_depth,
-        max_concurrent_requests: cli_args.concurrency,
-        verbose_logging: cli_args.verbose,
     });
 
-    crawler.crawl_all_domains(seed_urls).await?;
+    // Crawl orchestration
+    let max_crawl_depth = cli_args.max_depth;
+    let max_concurrent_requests = cli_args.concurrency;
+    let verbose_logging = cli_args.verbose;
+    let excluded_url_prefixes = cli_args.exclude;
+
+    let SearchIndex {
+        index,
+        url_field,
+        title_field,
+        body_field,
+    } = setup_search_index()?;
+    let mut index_writer = index.writer(1_000_000_000)?;
+
+    let (mut pages_crawled, mut pages_failed) = (0usize, 0usize);
+    let expected_url_count = 100_000_000;
+    let mut seen_urls = BloomFilter::with_false_pos(1.0 / (expected_url_count as f64))
+        .hasher(ahash::RandomState::new())
+        .expected_items(expected_url_count);
+    let mut domains_in_progress = HashSet::with_hasher(ahash::RandomState::new());
+    let mut task_queue: BTreeSet<CrawlTask> = seed_urls
+        .into_iter()
+        .map(|url| CrawlTask {
+            target_url: url,
+            crawl_depth: 0,
+            retry_count: 0,
+        })
+        .collect();
+    let mut worker_pool = JoinSet::new();
+    let mut last_status_report = std::time::Instant::now();
+
+    loop {
+        while worker_pool.len() <= max_concurrent_requests {
+            let Some(task) = pop_available_task(&mut task_queue, &domains_in_progress) else {
+                break;
+            };
+            let Some(domain) = task.target_url.host_str().map(String::from) else {
+                continue;
+            };
+            seen_urls.insert(&task.target_url.to_string());
+            domains_in_progress.insert(domain.clone());
+            let crawler = Arc::clone(&crawler);
+            worker_pool.spawn(async move { (domain, crawler.fetch_and_process_page(task).await) });
+        }
+
+        if worker_pool.is_empty() && task_queue.is_empty() {
+            break;
+        }
+
+        let Some(join_result) = worker_pool.join_next().await else {
+            continue;
+        };
+        let (domain, crawl_result) = match join_result {
+            Ok(r) => r,
+            Err(e) => {
+                if verbose_logging {
+                    eprintln!("Worker task failed: {:?}", e);
+                }
+                continue;
+            }
+        };
+        domains_in_progress.remove(&domain);
+
+        let (discovered_links, page_data) = match crawl_result {
+            Ok(r) => r,
+            Err(e) => {
+                pages_failed += 1;
+                if verbose_logging {
+                    eprintln!("Error crawling {}: {:?}", domain, e);
+                }
+                continue;
+            }
+        };
+
+        if let Some(p) = page_data {
+            if let Err(e) = index_writer.add_document(doc!(url_field => p.page_url, body_field => p.page_content, title_field => p.page_title)) {
+                eprintln!("Indexing error: {:?}", e);
+            }
+        }
+        for task in discovered_links {
+            let is_excluded = excluded_url_prefixes
+                .iter()
+                .any(|prefix| task.target_url.as_str().starts_with(prefix));
+            let dominated = task.crawl_depth > max_crawl_depth
+                || seen_urls.contains(&task.target_url.to_string())
+                || is_excluded;
+            if !dominated {
+                task_queue.insert(task);
+            }
+        }
+        pages_crawled += 1;
+
+        if last_status_report.elapsed().as_secs() >= 5 {
+            println!(
+                "Crawled: {}, Failed: {}, Queue: {}, Active: {}",
+                pages_crawled,
+                pages_failed,
+                task_queue.len(),
+                domains_in_progress.len()
+            );
+            last_status_report = std::time::Instant::now();
+            index_writer.commit().expect("Failed to commit index"); // very slow to do often
+        }
+    }
+    println!(
+        "Crawl finished. Docs in index: {}",
+        index.reader()?.searcher().num_docs()
+    );
 
     Ok(())
 }
