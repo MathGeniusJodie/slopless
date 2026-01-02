@@ -44,8 +44,6 @@ struct WebCrawler {
     excluded_url_prefixes: Vec<String>,
     max_crawl_depth: usize,
     max_concurrent_requests: usize,
-    pages_crawled: AtomicU64,
-    pages_failed: AtomicU64,
     verbose_logging: bool,
 }
 
@@ -65,6 +63,39 @@ impl Ord for CrawlTask {
 
 impl PartialOrd for CrawlTask {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
+}
+
+fn extract_page_content(html_body: String) -> Result<(Vec<String>, String, String)> {
+    let mut extracted_links = Vec::new();
+    let mut page_title = String::new();
+    let mut html_rewriter = HtmlRewriter::new(
+        Settings {
+            element_content_handlers: vec![
+                element!("a[href]", |anchor| {
+                    if let Some(href) = anchor.get_attribute("href") { extracted_links.push(href); }
+                    Ok(())
+                }),
+                text!("title", |title_text| {
+                    page_title = title_text.as_str().to_string();
+                    Ok(())
+                }),
+            ],
+            ..Settings::default()
+        },
+        |_: &[u8]| {},
+    );
+
+    html_rewriter.write(html_body.as_bytes())?;
+    html_rewriter.end()?;
+
+    use dom_smoothie::{Readability, Article, Config};
+    let readability_config = Config::default();
+    let mut readability_parser = Readability::new(html_body, None, Some(readability_config))?;
+    let parsed_article: Article = readability_parser.parse()?;
+    let readable_text = parsed_article.text_content;
+    use unicode_normalization::UnicodeNormalization;
+    let normalized_text = readable_text.nfkc().collect::<String>();
+    Ok((extracted_links, normalized_text, page_title))
 }
 
 impl WebCrawler {
@@ -102,6 +133,9 @@ impl WebCrawler {
         ////////////////////////////////////////////////////////////////////////////////////////////////////////////
         // End set up Tantivy index
         ////////////////////////////////////////////////////////////////////////////////////////////////////////////
+        
+        let mut pages_crawled: usize = 0;
+        let mut pages_failed: usize = 0;
         
         let expected_url_count = 100_000_000;
         let mut seen_urls = BloomFilter::with_false_pos(1.0/(expected_url_count as f64))
@@ -166,20 +200,30 @@ impl WebCrawler {
                 match join_result {
                     Ok((completed_domain, crawl_result)) => {
                         domains_in_progress.remove(&completed_domain);
-                        let (discovered_links, page_data) = crawl_result;
-                        if let Some(indexed_page) = page_data {
-                            match index_writer.add_document(doc!(url_field => indexed_page.page_url, body_field => indexed_page.page_content, title_field => indexed_page.page_title)) {
-                                Ok(_opstamp) => {},
-                                Err(err) => {
-                                    eprintln!("Indexing error: {:?}", err);
+                        match crawl_result {
+                            Ok((discovered_links, page_data)) => {
+                                if let Some(indexed_page) = page_data {
+                                    match index_writer.add_document(doc!(url_field => indexed_page.page_url, body_field => indexed_page.page_content, title_field => indexed_page.page_title)) {
+                                        Ok(_opstamp) => {},
+                                        Err(err) => {
+                                            eprintln!("Indexing error: {:?}", err);
+                                        }
+                                    }
+                                    index_writer.commit().expect("Failed to commit index");
                                 }
+                                for new_task in discovered_links {
+                                    let already_seen = seen_urls.contains(&new_task.target_url.to_string());
+                                    if new_task.crawl_depth <= self.max_crawl_depth && !already_seen && !self.is_excluded_url(&new_task.target_url.to_string()) {
+                                        task_queue.push(new_task);
+                                    }
+                                }
+                                pages_crawled += 1;
                             }
-                            index_writer.commit().expect("Failed to commit index");
-                        }
-                        for new_task in discovered_links {
-                            let already_seen = seen_urls.contains(&new_task.target_url.to_string());
-                            if new_task.crawl_depth <= self.max_crawl_depth && !already_seen && !self.is_excluded_url(&new_task.target_url.to_string()) {
-                                task_queue.push(new_task);
+                            Err(err) => {
+                                pages_failed += 1;
+                                if self.verbose_logging {
+                                    eprintln!("Error crawling {}: {:?}", completed_domain, err);
+                                }
                             }
                         }
                     },
@@ -193,8 +237,8 @@ impl WebCrawler {
             // Periodic debug output
             if last_status_report.elapsed().as_secs() >= 5 {
                 println!("Crawled: {}, Failed: {}, Queue size: {}, Active domains: {}",
-                    self.pages_crawled.load(std::sync::atomic::Ordering::Relaxed),
-                    self.pages_failed.load(std::sync::atomic::Ordering::Relaxed),
+                    pages_crawled,
+                    pages_failed,
                     task_queue.len(),
                     domains_in_progress.len(),
                 );
@@ -205,42 +249,21 @@ impl WebCrawler {
         Ok(())
     }
 
-    async fn fetch_and_process_page(&self, task: CrawlTask) -> (Vec<CrawlTask>, Option<IndexedPage>) {
+    async fn fetch_and_process_page(&self, task: CrawlTask) -> Result<(Vec<CrawlTask>, Option<IndexedPage>)> {
         let CrawlTask { target_url, crawl_depth, retry_count } = task;
-        
-        let response = match self.http_client.get(target_url.clone()).send().await {
-            Ok(resp) => resp,
-            Err(network_error) => {
-                if self.verbose_logging {
-                    eprintln!("Network error: {:?}", network_error);
-                }        
-                self.pages_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return (vec![], None);
-            }
-        };
-        if !response.status().is_success() { return (vec![], None); }
-        
+
+        let response = self.http_client.get(target_url.clone()).send().await?;
+        if !response.status().is_success() { return Ok((vec![], None)); }
+
         let content_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|header_value| header_value.to_str().ok())
             .unwrap_or("");
-            
-        if !content_type.starts_with("text/html") { return (vec![], None); }
-        
-        let (extracted_links, page_content, page_title) = match self.extract_page_content(response).await {
-            Ok(result) => result,
-            Err(parse_error) => {
-                if self.verbose_logging {
-                    eprintln!("Parse error for {}: {:?}", target_url, parse_error);
-                }        
-                self.pages_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return (vec![], None);
-            }
-        };
 
-        //println!("Depth {crawl_depth}: Crawling {url_str}");
-        self.pages_crawled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !content_type.starts_with("text/html") { return Ok((vec![], None)); }
+        let html_body = response.text().await?;
+        let (extracted_links, page_content, page_title) = extract_page_content(html_body)?;
 
         let next_depth = crawl_depth + 1;
         let child_tasks = extracted_links.into_iter()
@@ -252,41 +275,7 @@ impl WebCrawler {
             .map(|resolved_url| CrawlTask { target_url: resolved_url, crawl_depth: next_depth, retry_count })
             .collect();
 
-        (child_tasks, Some(IndexedPage { page_url: target_url.to_string(), page_content, page_title }))
-    }
-
-    async fn extract_page_content(&self, response: reqwest::Response) -> Result<(Vec<String>, String, String)> {
-        let html_body = response.text().await?;
-        let mut extracted_links = Vec::new();
-        let mut page_title = String::new();
-        let mut html_rewriter = HtmlRewriter::new(
-            Settings {
-                element_content_handlers: vec![
-                    element!("a[href]", |anchor| {
-                        if let Some(href) = anchor.get_attribute("href") { extracted_links.push(href); }
-                        Ok(())
-                    }),
-                    text!("title", |title_text| {
-                        page_title = title_text.as_str().to_string();
-                        Ok(())
-                    }),
-                ],
-                ..Settings::default()
-            },
-            |_: &[u8]| {},
-        );
-
-        html_rewriter.write(html_body.as_bytes())?;
-        html_rewriter.end()?;
-
-        use dom_smoothie::{Readability, Article, Config};
-        let readability_config = Config::default();
-        let mut readability_parser = Readability::new(html_body, None, Some(readability_config))?;
-        let parsed_article: Article = readability_parser.parse()?;
-        let readable_text = parsed_article.text_content;
-        use unicode_normalization::UnicodeNormalization;
-        let normalized_text = readable_text.nfkc().collect::<String>();
-        Ok((extracted_links, normalized_text, page_title))
+        Ok((child_tasks, Some(IndexedPage { page_url: target_url.to_string(), page_content, page_title })))
     }
 
     fn is_excluded_url(&self, url: &str) -> bool {
@@ -340,8 +329,6 @@ async fn main() -> Result<()> {
         excluded_url_prefixes: cli_args.exclude,
         max_crawl_depth: cli_args.max_depth,
         max_concurrent_requests: cli_args.concurrency,
-        pages_crawled: AtomicU64::new(0),
-        pages_failed: AtomicU64::new(0),
         verbose_logging: cli_args.verbose,
     });
 
