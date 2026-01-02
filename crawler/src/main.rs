@@ -22,14 +22,14 @@ struct Args {
     #[arg(help = "Path to text file containing domains (one per line)")]
     input_file: String,
     #[arg(short = 'x', long = "exclude")]
-    exclude: Vec<String>,
+    excluded_url_prefixes: Vec<String>,
     #[arg(short = 'd', long = "depth", default_value_t = 5)]
-    max_depth: usize,
+    max_crawl_depth: usize,
     #[arg(short = 'c', long = "concurrency", default_value_t = 500)]
-    concurrency: usize,
+    max_concurrent_requests: usize,
     // verbosity flag could be added here
     #[arg(short = 'v', long = "verbose", default_value_t = false)]
-    verbose: bool,
+    verbose_logging: bool,
 }
 
 struct IndexedPage {
@@ -291,12 +291,6 @@ async fn main() -> Result<()> {
         .build(),
     });
 
-    // Crawl orchestration
-    let max_crawl_depth = cli_args.max_depth;
-    let max_concurrent_requests = cli_args.concurrency;
-    let verbose_logging = cli_args.verbose;
-    let excluded_url_prefixes = cli_args.exclude;
-
     let SearchIndex {
         index,
         url_field,
@@ -324,7 +318,7 @@ async fn main() -> Result<()> {
 
     loop {
         // Spawn new tasks up to concurrency limit
-        let slots_available = max_concurrent_requests.saturating_sub(worker_pool.len());
+        let slots_available = cli_args.max_concurrent_requests.saturating_sub(worker_pool.len());
         for task in pop_available_tasks(&mut task_queue, &domains_in_progress, slots_available) {
             let Some(domain) = task.target_url.host_str().map(String::from) else {
                 continue;
@@ -349,7 +343,7 @@ async fn main() -> Result<()> {
             Ok(result) => result,
             Err(e) => {
                 pages_failed += 1;
-                if verbose_logging {
+                if cli_args.verbose_logging {
                     eprintln!("Error crawling {domain}: {e:?}");
                 }
                 continue;
@@ -357,7 +351,7 @@ async fn main() -> Result<()> {
         };
         let discovered_links = discovered_links
             .into_iter()
-            .filter(|t| !t.should_skip(max_crawl_depth, &seen_urls, &excluded_url_prefixes));
+            .filter(|t| !t.should_skip(cli_args.max_crawl_depth, &seen_urls, &cli_args.excluded_url_prefixes));
 
         // Queue newly discovered links
         task_queue.extend(discovered_links);
