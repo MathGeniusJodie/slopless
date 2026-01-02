@@ -3,16 +3,15 @@ use clap::Parser;
 use fastbloom::BloomFilter;
 use lol_html::{element, text, HtmlRewriter, Settings};
 use reqwest::Client;
-use reqwest_middleware::{ClientWithMiddleware, ClientBuilder};
-use reqwest_retry::RetryTransientMiddleware;
+use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::policies::ExponentialBackoff;
-use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
-use std::collections::{BinaryHeap, HashSet};
+use reqwest_retry::RetryTransientMiddleware;
 use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashSet};
 use std::fs::read_to_string;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
-use tantivy::schema::{IndexRecordOption, STORED, Schema, TEXT, TextFieldIndexing, TextOptions};
+use tantivy::schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions, STORED, TEXT};
+use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
 use tantivy::{doc, Index};
 use tokio::task::JoinSet;
 use url::Url;
@@ -62,7 +61,77 @@ impl Ord for CrawlTask {
 }
 
 impl PartialOrd for CrawlTask {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+struct SearchIndex {
+    index: Index,
+    url_field: tantivy::schema::Field,
+    title_field: tantivy::schema::Field,
+    body_field: tantivy::schema::Field,
+}
+
+fn setup_search_index() -> Result<SearchIndex> {
+    let search_tokenizer = TextAnalyzer::builder(SimpleTokenizer::default())
+        .filter(LowerCaser)
+        .filter(tantivy::tokenizer::Stemmer::new(
+            tantivy::tokenizer::Language::English,
+        ))
+        .build();
+    let body_field_indexing = TextFieldIndexing::default()
+        .set_tokenizer("norm_tokenizer")
+        .set_index_option(IndexRecordOption::WithFreqsAndPositions);
+    let body_field_options = TextOptions::default().set_indexing_options(body_field_indexing);
+    let mut schema_builder = Schema::builder();
+    let url_field = schema_builder.add_text_field("url", TEXT | STORED);
+    let title_field = schema_builder.add_text_field("title", TEXT | STORED);
+    let body_field = schema_builder.add_text_field("body", body_field_options);
+    let schema = schema_builder.build();
+    let index = if std::path::Path::new("search_db").exists() {
+        Index::open_in_dir("search_db")?
+    } else {
+        std::fs::create_dir_all("search_db")?;
+        Index::create(
+            tantivy::directory::MmapDirectory::open("search_db")?,
+            schema,
+            tantivy::IndexSettings::default(),
+        )?
+    };
+    index
+        .tokenizers()
+        .register("norm_tokenizer", search_tokenizer);
+    Ok(SearchIndex {
+        index,
+        url_field,
+        title_field,
+        body_field,
+    })
+}
+
+fn pop_available_task(
+    task_queue: &mut BinaryHeap<CrawlTask>,
+    domains_in_progress: &HashSet<String, ahash::RandomState>,
+    seen_urls: &BloomFilter<ahash::RandomState>,
+) -> Option<CrawlTask> {
+    let mut deferred_tasks = Vec::new();
+    let mut result = None;
+    while let Some(task) = task_queue.pop() {
+        let dominated = task
+            .target_url
+            .host_str()
+            .map_or(true, |d| domains_in_progress.contains(d));
+        if !dominated {
+            result = Some(task);
+            break;
+        }
+        if !seen_urls.contains(&task.target_url.to_string()) {
+            deferred_tasks.push(task);
+        }
+    }
+    task_queue.extend(deferred_tasks);
+    result
 }
 
 fn extract_page_content(html_body: String) -> Result<(Vec<String>, String, String)> {
@@ -72,7 +141,9 @@ fn extract_page_content(html_body: String) -> Result<(Vec<String>, String, Strin
         Settings {
             element_content_handlers: vec![
                 element!("a[href]", |anchor| {
-                    if let Some(href) = anchor.get_attribute("href") { extracted_links.push(href); }
+                    if let Some(href) = anchor.get_attribute("href") {
+                        extracted_links.push(href);
+                    }
                     Ok(())
                 }),
                 text!("title", |title_text| {
@@ -88,7 +159,7 @@ fn extract_page_content(html_body: String) -> Result<(Vec<String>, String, Strin
     html_rewriter.write(html_body.as_bytes())?;
     html_rewriter.end()?;
 
-    use dom_smoothie::{Readability, Article, Config};
+    use dom_smoothie::{Article, Config, Readability};
     let readability_config = Config::default();
     let mut readability_parser = Readability::new(html_body, None, Some(readability_config))?;
     let parsed_article: Article = readability_parser.parse()?;
@@ -100,160 +171,125 @@ fn extract_page_content(html_body: String) -> Result<(Vec<String>, String, Strin
 
 impl WebCrawler {
     pub async fn crawl_all_domains(self: Arc<Self>, seed_urls: Vec<Url>) -> Result<()> {
-        ////////////////////////////////////////////////////////////////////////////////////////////////////////////
-        // Set up Tantivy index
-        ////////////////////////////////////////////////////////////////////////////////////////////////////////////
-        let search_tokenizer = TextAnalyzer::builder(SimpleTokenizer::default())
-            .filter(LowerCaser)
-            .filter(tantivy::tokenizer::Stemmer::new(tantivy::tokenizer::Language::English))
-            //.filter(  tantivy::tokenizer::SplitCompoundWords::from_dictionary(dict))
-            .build();
-        let body_field_indexing = TextFieldIndexing::default()
-            .set_tokenizer("norm_tokenizer")
-            .set_index_option(IndexRecordOption::WithFreqsAndPositions);
+        let SearchIndex {
+            index,
+            url_field,
+            title_field,
+            body_field,
+        } = setup_search_index()?;
+        let mut index_writer = index.writer(1_000_000_000)?;
 
-        let body_field_options = TextOptions::default()
-            .set_indexing_options(body_field_indexing);
-        let mut schema_builder = Schema::builder();
-        let url_field = schema_builder.add_text_field("url", TEXT | STORED);
-        let title_field = schema_builder.add_text_field("title", TEXT | STORED);
-        let body_field = schema_builder.add_text_field("body", body_field_options);
-        let schema = schema_builder.build();
-        let search_index = if std::path::Path::new("search_db").exists() {
-            Index::open_in_dir("search_db")?
-        } else {
-            std::fs::create_dir_all("search_db")?;
-            let settings = tantivy::IndexSettings::default();
-            Index::create(tantivy::directory::MmapDirectory::open("search_db")?, schema, settings)?
-        };
-        search_index.tokenizers()
-            .register("norm_tokenizer", search_tokenizer);
-
-        let mut index_writer = search_index.writer(1_000_000_000)?;
-        ////////////////////////////////////////////////////////////////////////////////////////////////////////////
-        // End set up Tantivy index
-        ////////////////////////////////////////////////////////////////////////////////////////////////////////////
-        
-        let mut pages_crawled: usize = 0;
-        let mut pages_failed: usize = 0;
-        
+        let (mut pages_crawled, mut pages_failed) = (0usize, 0usize);
         let expected_url_count = 100_000_000;
-        let mut seen_urls = BloomFilter::with_false_pos(1.0/(expected_url_count as f64))
+        let mut seen_urls = BloomFilter::with_false_pos(1.0 / (expected_url_count as f64))
             .hasher(ahash::RandomState::new())
             .expected_items(expected_url_count);
         let mut domains_in_progress = HashSet::with_hasher(ahash::RandomState::new());
-        let mut task_queue: BinaryHeap<CrawlTask> = BinaryHeap::new();
-        for url in seed_urls {
-            task_queue.push(CrawlTask { target_url: url, crawl_depth: 0, retry_count: 0 });
-        }
-
+        let mut task_queue: BinaryHeap<CrawlTask> = seed_urls
+            .into_iter()
+            .map(|url| CrawlTask {
+                target_url: url,
+                crawl_depth: 0,
+                retry_count: 0,
+            })
+            .collect();
         let mut worker_pool = JoinSet::new();
-
         let mut last_status_report = std::time::Instant::now();
+
         loop {
             while worker_pool.len() <= self.max_concurrent_requests {
-                // Pop items until we find one whose domain is not active, buffering the others.
-                let mut deferred_tasks: Vec<CrawlTask> = Vec::new();
-                let mut available_task: Option<CrawlTask> = None;
-
-                while let Some(task) = task_queue.pop() {
-                    if let Some(domain) = task.target_url.host_str() {
-                        if !domains_in_progress.contains(domain) {
-                            available_task = Some(task);
-                            break;
-                        }
-                    }
-                    if seen_urls.contains(&task.target_url.to_string()) {
-                        // already visited, skip
-                        continue;
-                    }
-                    deferred_tasks.push(task);
-                }
-
-                // Push buffered items back onto the heap
-                for deferred in deferred_tasks.into_iter() { task_queue.push(deferred); }
-
-                let current_task = match available_task {
-                    Some(task) => task,
-                    None => break, // No available item for an idle domain
+                let Some(task) =
+                    pop_available_task(&mut task_queue, &domains_in_progress, &seen_urls)
+                else {
+                    break;
                 };
-
-                let domain = match current_task.target_url.host_str() {
-                    Some(host) => host.to_string(),
-                    None => continue,
+                let Some(domain) = task.target_url.host_str().map(String::from) else {
+                    continue;
                 };
-
-                let crawler = Arc::clone(&self);
-                let url_string = current_task.target_url.to_string();
-                seen_urls.insert(&url_string);
+                seen_urls.insert(&task.target_url.to_string());
                 domains_in_progress.insert(domain.clone());
-                worker_pool.spawn(async move {
-                    (domain, crawler.fetch_and_process_page(current_task).await)
-                });
+                let crawler = Arc::clone(&self);
+                worker_pool
+                    .spawn(async move { (domain, crawler.fetch_and_process_page(task).await) });
             }
 
             if worker_pool.is_empty() && task_queue.is_empty() {
                 break;
             }
 
-            if let Some(join_result) = worker_pool.join_next().await {
-                match join_result {
-                    Ok((completed_domain, crawl_result)) => {
-                        domains_in_progress.remove(&completed_domain);
-                        match crawl_result {
-                            Ok((discovered_links, page_data)) => {
-                                if let Some(indexed_page) = page_data {
-                                    match index_writer.add_document(doc!(url_field => indexed_page.page_url, body_field => indexed_page.page_content, title_field => indexed_page.page_title)) {
-                                        Ok(_opstamp) => {},
-                                        Err(err) => {
-                                            eprintln!("Indexing error: {:?}", err);
-                                        }
-                                    }
-                                    index_writer.commit().expect("Failed to commit index");
-                                }
-                                for new_task in discovered_links {
-                                    let already_seen = seen_urls.contains(&new_task.target_url.to_string());
-                                    if new_task.crawl_depth <= self.max_crawl_depth && !already_seen && !self.is_excluded_url(&new_task.target_url.to_string()) {
-                                        task_queue.push(new_task);
-                                    }
-                                }
-                                pages_crawled += 1;
-                            }
-                            Err(err) => {
-                                pages_failed += 1;
-                                if self.verbose_logging {
-                                    eprintln!("Error crawling {}: {:?}", completed_domain, err);
-                                }
-                            }
-                        }
-                    },
-                    Err(join_error) => {
-                        if self.verbose_logging {
-                            eprintln!("Worker task failed: {:?}", join_error);
-                        }
+            let Some(join_result) = worker_pool.join_next().await else {
+                continue;
+            };
+            let (domain, crawl_result) = match join_result {
+                Ok(r) => r,
+                Err(e) => {
+                    if self.verbose_logging {
+                        eprintln!("Worker task failed: {:?}", e);
                     }
+                    continue;
+                }
+            };
+            domains_in_progress.remove(&domain);
+
+            let (discovered_links, page_data) = match crawl_result {
+                Ok(r) => r,
+                Err(e) => {
+                    pages_failed += 1;
+                    if self.verbose_logging {
+                        eprintln!("Error crawling {}: {:?}", domain, e);
+                    }
+                    continue;
+                }
+            };
+
+            if let Some(p) = page_data {
+                if let Err(e) = index_writer.add_document(doc!(url_field => p.page_url, body_field => p.page_content, title_field => p.page_title)) {
+                    eprintln!("Indexing error: {:?}", e);
+                }
+                index_writer.commit().expect("Failed to commit index");
+            }
+            for task in discovered_links {
+                let dominated = task.crawl_depth > self.max_crawl_depth
+                    || seen_urls.contains(&task.target_url.to_string())
+                    || self.is_excluded_url(&task.target_url.to_string());
+                if !dominated {
+                    task_queue.push(task);
                 }
             }
-            // Periodic debug output
+            pages_crawled += 1;
+
             if last_status_report.elapsed().as_secs() >= 5 {
-                println!("Crawled: {}, Failed: {}, Queue size: {}, Active domains: {}",
+                println!(
+                    "Crawled: {}, Failed: {}, Queue: {}, Active: {}",
                     pages_crawled,
                     pages_failed,
                     task_queue.len(),
-                    domains_in_progress.len(),
+                    domains_in_progress.len()
                 );
                 last_status_report = std::time::Instant::now();
             }
         }
-        println!("Crawl finished. Docs in index: {}", search_index.reader()?.searcher().num_docs());
+        println!(
+            "Crawl finished. Docs in index: {}",
+            index.reader()?.searcher().num_docs()
+        );
         Ok(())
     }
 
-    async fn fetch_and_process_page(&self, task: CrawlTask) -> Result<(Vec<CrawlTask>, Option<IndexedPage>)> {
-        let CrawlTask { target_url, crawl_depth, retry_count } = task;
+    async fn fetch_and_process_page(
+        &self,
+        task: CrawlTask,
+    ) -> Result<(Vec<CrawlTask>, Option<IndexedPage>)> {
+        let CrawlTask {
+            target_url,
+            crawl_depth,
+            retry_count,
+        } = task;
 
         let response = self.http_client.get(target_url.clone()).send().await?;
-        if !response.status().is_success() { return Ok((vec![], None)); }
+        if !response.status().is_success() {
+            return Ok((vec![], None));
+        }
 
         let content_type = response
             .headers()
@@ -261,51 +297,77 @@ impl WebCrawler {
             .and_then(|header_value| header_value.to_str().ok())
             .unwrap_or("");
 
-        if !content_type.starts_with("text/html") { return Ok((vec![], None)); }
+        if !content_type.starts_with("text/html") {
+            return Ok((vec![], None));
+        }
         let html_body = response.text().await?;
         let (extracted_links, page_content, page_title) = extract_page_content(html_body)?;
 
         let next_depth = crawl_depth + 1;
-        let child_tasks = extracted_links.into_iter()
+        let child_tasks = extracted_links
+            .into_iter()
             .filter_map(|link| target_url.join(&link).ok())
-            .map(|mut resolved_url| { resolved_url.set_fragment(None); resolved_url })
-            .filter(|resolved_url| {
-                resolved_url.host_str().map_or(false, |link_host| target_url.host_str().map_or(false, |base_host| link_host == base_host))
+            .map(|mut resolved_url| {
+                resolved_url.set_fragment(None);
+                resolved_url
             })
-            .map(|resolved_url| CrawlTask { target_url: resolved_url, crawl_depth: next_depth, retry_count })
+            .filter(|resolved_url| {
+                resolved_url.host_str().map_or(false, |link_host| {
+                    target_url
+                        .host_str()
+                        .map_or(false, |base_host| link_host == base_host)
+                })
+            })
+            .map(|resolved_url| CrawlTask {
+                target_url: resolved_url,
+                crawl_depth: next_depth,
+                retry_count,
+            })
             .collect();
 
-        Ok((child_tasks, Some(IndexedPage { page_url: target_url.to_string(), page_content, page_title })))
+        Ok((
+            child_tasks,
+            Some(IndexedPage {
+                page_url: target_url.to_string(),
+                page_content,
+                page_title,
+            }),
+        ))
     }
 
     fn is_excluded_url(&self, url: &str) -> bool {
-        self.excluded_url_prefixes.iter().any(|prefix| url.starts_with(prefix))
+        self.excluded_url_prefixes
+            .iter()
+            .any(|prefix| url.starts_with(prefix))
     }
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 20)]
 async fn main() -> Result<()> {
-
     let cli_args = Args::parse();
 
     let file_content = read_to_string(&cli_args.input_file)
         .with_context(|| format!("Failed to read input file: {}", cli_args.input_file))?;
-    
+
     let mut seed_urls = Vec::new();
 
     for line in file_content.lines() {
         let domain = line.trim();
-        if domain.is_empty() { continue; }
-        let clean_domain = domain.trim_start_matches("http://").trim_start_matches("https://");
-        let parsed_url = match Url::parse(&format!("https://{clean_domain}"))
-            .context("Invalid domain") {
+        if domain.is_empty() {
+            continue;
+        }
+        let clean_domain = domain
+            .trim_start_matches("http://")
+            .trim_start_matches("https://");
+        let parsed_url =
+            match Url::parse(&format!("https://{clean_domain}")).context("Invalid domain") {
                 Ok(url) => url,
                 Err(parse_error) => {
                     eprintln!("Skipping invalid domain '{}': {:?}", domain, parse_error);
                     continue;
                 }
             };
-        
+
         if let Some(_host) = parsed_url.host_str() {
             seed_urls.push(parsed_url);
         }
