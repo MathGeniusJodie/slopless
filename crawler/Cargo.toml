@@ -13,7 +13,6 @@ anyhow = "1.0"
 futures = "0.3"
 bytes = "1.11.0"
 clap = { version = "4.0", features = ["derive"] }
-fastbloom = "0.14.0"
 ahash = "0.8.12"
 #dom_smoothie = "0.14.0"
 #use the git version of dom_smoothie to fix bug
