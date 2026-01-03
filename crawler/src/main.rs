@@ -105,7 +105,6 @@ struct CrawlDb {
     title_field: tantivy::schema::Field,
     body_field: tantivy::schema::Field,
     seen_urls: BloomFilter<ahash::RandomState>,
-    uncommitted_hashes: HashSet<u64, ahash::RandomState>,
     uncommitted_urls: HashSet<String, ahash::RandomState>,
     bloom_negative_count: usize,
     bloom_positive_count: usize,
@@ -119,9 +118,6 @@ impl CrawlDb {
             ahash::RandomState::new(),
             expected_url_count,
         );
-        // 15% need to double check and 0.1% false positive rate w 600 million bits
-        // 2% need to double check and no false positives w 1 billion bits
-        let uncommitted_hashes = HashSet::with_hasher(ahash::RandomState::new());
         let uncommitted_urls = HashSet::with_hasher(ahash::RandomState::new());
 
         Ok(Self {
@@ -132,7 +128,6 @@ impl CrawlDb {
             title_field: search_index.title_field,
             body_field: search_index.body_field,
             seen_urls,
-            uncommitted_hashes,
             uncommitted_urls,
             bloom_negative_count: 0,
             bloom_positive_count: 0,
@@ -172,6 +167,8 @@ impl CrawlDb {
         use tantivy::collector::DocSetCollector;
         use tantivy::query::TermQuery;
 
+        // todo: maybe don't use url hash field and just have url
+        // todo: bench to see if slow
         let term = tantivy::Term::from_field_u64(self.url_hash_field, bit_pos_hash);
         let query = TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
 
@@ -198,7 +195,6 @@ impl CrawlDb {
     }
 
     fn index_page(&mut self, page: IndexedPage, bit_pos_hash: u64) -> Result<()> {
-        self.uncommitted_hashes.insert(bit_pos_hash);
         self.uncommitted_urls.insert(page.page_url.clone());
 
         let doc = doc!(
@@ -213,7 +209,6 @@ impl CrawlDb {
 
     fn commit(&mut self) -> Result<()> {
         self.index_writer.commit()?;
-        self.uncommitted_hashes.clear();
         self.uncommitted_urls.clear();
         Ok(())
     }
@@ -521,9 +516,8 @@ async fn main() -> Result<()> {
                 domains_in_progress.len()
             );
             println!(
-                " Uncommitted: URLs {}, Hashes {}, Bloom positive ratio {:.2}%",
+                " Uncommitted: URLs {}, Bloom positive ratio {:.2}%",
                 db.uncommitted_urls.len(),
-                db.uncommitted_hashes.len(),
                 (db.bloom_positive_count as f64
                     / (db.bloom_positive_count + db.bloom_negative_count) as f64)
                     * 100.0
