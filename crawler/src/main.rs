@@ -154,13 +154,15 @@ mod bloom {
         pub fn bit_positions_hash(&self, source_hash: u64) -> u64 {
             let mut hasher = DoubleHasher::new(source_hash);
             let num_bits = self.bits.num_bits();
-            let mut positions: Vec<_> = (0..self.num_hashes)
-                .map(|_| index(num_bits, hasher.next()))
-                .collect();
-            positions.sort();
-            let mut state = self.hasher.build_hasher();
-            positions.hash(&mut state);
-            state.finish()
+            let mut all_positions = 0;
+            for _ in 0..self.num_hashes {
+                let h = hasher.next();
+                let position = index(num_bits, h);
+                let mut state = self.hasher.build_hasher();
+                position.hash(&mut state);
+                all_positions ^= state.finish();
+            }
+            all_positions
         }
 
         /// Check if a value is possibly in the filter.
@@ -217,6 +219,10 @@ mod bloom {
         #[inline]
         pub fn clear(&mut self) {
             self.bits.clear();
+        }
+        #[inline]
+        pub fn get_set_bits(&self) -> usize {
+            self.bits.bits.iter().map(|b| b.count_ones() as usize).sum()
         }
     }
 }
@@ -723,9 +729,10 @@ async fn main() -> Result<()> {
                 task_queue.len(),
                 domains_in_progress.len()
             );
-            println!(" Uncommitted: URLs {}, Hashes {}",
+            println!(" Uncommitted: URLs {}, Hashes {}, Collisions {}",
                 db.uncommitted_urls.len(),
                 db.uncommitted_hashes.len(),
+                db.collisions.get_set_bits(),
             );
             last_status_report = std::time::Instant::now();
             db.commit().expect("Failed to commit index");
