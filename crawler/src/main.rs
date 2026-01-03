@@ -155,7 +155,6 @@ impl CrawlDb {
     ) -> bool {
         // Check uncommitted URLs first (already added to tantivy but not committed)
         if self.uncommitted_urls.contains(url) || queued_urls.contains(url) {
-            self.bloom_negative_count += 1; // counts since no need to check bloom
             return true;
         }
 
