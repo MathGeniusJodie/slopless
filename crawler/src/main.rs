@@ -6,7 +6,9 @@ use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet};
 use std::fs::read_to_string;
 use std::sync::Arc;
-use tantivy::schema::{FAST, IndexRecordOption, STORED, STRING, Schema, TEXT, TextFieldIndexing, TextOptions, Value};
+use tantivy::schema::{
+    IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, FAST, STORED, STRING, TEXT,
+};
 use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
 use tantivy::{doc, Index};
 use tokio::task::JoinSet;
@@ -51,7 +53,8 @@ struct CrawlTask {
 impl Ord for CrawlTask {
     fn cmp(&self, other: &Self) -> Ordering {
         // Order by depth (DESCENDING - process deepest first), then by URL for uniqueness
-        other.crawl_depth  // Swap self/other to reverse order
+        other
+            .crawl_depth // Swap self/other to reverse order
             .cmp(&self.crawl_depth)
             .then_with(|| self.target_url.as_str().cmp(other.target_url.as_str()))
     }
@@ -68,7 +71,7 @@ impl CrawlTask {
         &self,
         max_depth: usize,
         excluded_prefixes: &[String],
-        db: &CrawlDb,
+        db: &mut CrawlDb,
         searcher: &tantivy::Searcher,
         queued_urls: &HashSet<String, ahash::RandomState>,
     ) -> bool {
@@ -77,11 +80,12 @@ impl CrawlTask {
         }
         if excluded_prefixes
             .iter()
-            .any(|prefix| self.target_url.as_str().starts_with(prefix)) {
+            .any(|prefix| self.target_url.as_str().starts_with(prefix))
+        {
             return true;
         }
         let url_str = self.target_url.to_string();
-        queued_urls.contains(&url_str) || db.should_skip_url(&url_str, searcher)   
+        db.should_skip_url(&url_str, searcher, &queued_urls)
     }
 }
 
@@ -101,9 +105,10 @@ struct CrawlDb {
     title_field: tantivy::schema::Field,
     body_field: tantivy::schema::Field,
     seen_urls: BloomFilter<ahash::RandomState>,
-    collisions: BloomFilter<ahash::RandomState>,
     uncommitted_hashes: HashSet<u64, ahash::RandomState>,
     uncommitted_urls: HashSet<String, ahash::RandomState>,
+    bloom_negative_count: usize,
+    bloom_positive_count: usize,
 }
 
 impl CrawlDb {
@@ -114,16 +119,11 @@ impl CrawlDb {
             ahash::RandomState::new(),
             expected_url_count,
         );
-        let collisions = BloomFilter::with_num_bits(
-            expected_url_count * 2,
-            ahash::RandomState::new(),
-            expected_url_count,
-        );
         // 15% need to double check and 0.1% false positive rate w 600 million bits
         // 2% need to double check and no false positives w 1 billion bits
         let uncommitted_hashes = HashSet::with_hasher(ahash::RandomState::new());
         let uncommitted_urls = HashSet::with_hasher(ahash::RandomState::new());
-        
+
         Ok(Self {
             index: search_index.index,
             index_writer,
@@ -132,9 +132,10 @@ impl CrawlDb {
             title_field: search_index.title_field,
             body_field: search_index.body_field,
             seen_urls,
-            collisions,
             uncommitted_hashes,
             uncommitted_urls,
+            bloom_negative_count: 0,
+            bloom_positive_count: 0,
         })
     }
 
@@ -142,39 +143,39 @@ impl CrawlDb {
         Ok(self.index.reader()?.searcher())
     }
 
-    fn mark_seen(&mut self, url: &str) {
-        let source_hash = self.seen_urls.source_hash(url);
-        let bit_pos_hash = self.seen_urls.bit_positions_hash(source_hash);
-        let collides = self.seen_urls.contains_hash(source_hash);
-        if collides {
-            self.collisions.insert(&bit_pos_hash);
-        } else {
-            self.seen_urls.insert_hash(source_hash);
-        }
+    fn mark_seen(&mut self, url: &str) -> bool {
+        self.seen_urls.insert(url)
     }
 
-    fn should_skip_url(&self, url: &str, searcher: &tantivy::Searcher) -> bool {
+    fn should_skip_url(
+        &mut self,
+        url: &str,
+        searcher: &tantivy::Searcher,
+        queued_urls: &HashSet<String, ahash::RandomState>,
+    ) -> bool {
         // Check uncommitted URLs first (already added to tantivy but not committed)
-        if self.uncommitted_urls.contains(url) {
+        if self.uncommitted_urls.contains(url) || queued_urls.contains(url) {
+            self.bloom_negative_count += 1; // counts since no need to check bloom
             return true;
         }
-        
-        let maybe_in_index = self.seen_urls.contains(url);
+
+        if !self.seen_urls.contains(url) {
+            self.bloom_negative_count += 1;
+            return false;
+        } else {
+            self.bloom_positive_count += 1;
+        }
+
         let source_hash = self.seen_urls.source_hash(url);
         let bit_pos_hash = self.seen_urls.bit_positions_hash(source_hash);
-        if maybe_in_index {
-            if !self.collisions.contains(&bit_pos_hash) {
-                return true;
-            }
-        }
-        
+
         // possible collision: must verify db
         use tantivy::collector::DocSetCollector;
         use tantivy::query::TermQuery;
-        
+
         let term = tantivy::Term::from_field_u64(self.url_hash_field, bit_pos_hash);
         let query = TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
-        
+
         let Ok(doc_addresses) = searcher.search(&query, &DocSetCollector) else {
             return false;
         };
@@ -183,7 +184,7 @@ impl CrawlDb {
         if doc_addresses.len() == 1 {
             return true;
         }
-        
+
         // multiple documents with this hash - check actual URLs
         for doc_address in doc_addresses {
             if let Ok(doc) = searcher.doc::<tantivy::TantivyDocument>(doc_address) {
@@ -200,7 +201,7 @@ impl CrawlDb {
     fn index_page(&mut self, page: IndexedPage, bit_pos_hash: u64) -> Result<()> {
         self.uncommitted_hashes.insert(bit_pos_hash);
         self.uncommitted_urls.insert(page.page_url.clone());
-        
+
         let doc = doc!(
             self.url_field => page.page_url,
             self.url_hash_field => bit_pos_hash,
@@ -431,7 +432,8 @@ async fn main() -> Result<()> {
 
     let (mut pages_crawled, mut pages_failed) = (0usize, 0usize);
     let mut domains_in_progress = HashSet::with_hasher(ahash::RandomState::new());
-    let mut queued_urls: HashSet<String, ahash::RandomState> = HashSet::with_hasher(ahash::RandomState::new());
+    let mut queued_urls: HashSet<String, ahash::RandomState> =
+        HashSet::with_hasher(ahash::RandomState::new());
     let mut task_queue: BTreeSet<CrawlTask> = seed_urls
         .into_iter()
         .map(|url| {
@@ -449,7 +451,9 @@ async fn main() -> Result<()> {
 
     loop {
         // Spawn new tasks up to concurrency limit
-        let slots_available = cli_args.max_concurrent_requests.saturating_sub(worker_pool.len());
+        let slots_available = cli_args
+            .max_concurrent_requests
+            .saturating_sub(worker_pool.len());
         for task in pop_available_tasks(&mut task_queue, &domains_in_progress, slots_available) {
             let Some(domain) = task.target_url.host_str().map(String::from) else {
                 continue;
@@ -460,7 +464,9 @@ async fn main() -> Result<()> {
             let url_hash = db.seen_urls.bit_positions_hash(source_hash);
             domains_in_progress.insert(domain.clone());
             let crawler = Arc::clone(&crawler);
-            worker_pool.spawn(async move { (domain, url_hash, crawler.fetch_and_process_page(task).await) });
+            worker_pool.spawn(async move {
+                (domain, url_hash, crawler.fetch_and_process_page(task).await)
+            });
         }
 
         if worker_pool.is_empty() && task_queue.is_empty() {
@@ -488,7 +494,7 @@ async fn main() -> Result<()> {
             if !task.should_skip(
                 cli_args.max_crawl_depth,
                 &cli_args.excluded_url_prefixes,
-                &db,
+                &mut db,
                 &searcher,
                 &queued_urls,
             ) {
@@ -515,19 +521,19 @@ async fn main() -> Result<()> {
                 task_queue.len(),
                 domains_in_progress.len()
             );
-            println!(" Uncommitted: URLs {}, Hashes {}, Collisions {}",
+            println!(
+                " Uncommitted: URLs {}, Hashes {}, Bloom positive ratio {:.2}%",
                 db.uncommitted_urls.len(),
                 db.uncommitted_hashes.len(),
-                db.collisions.get_set_bits(),
+                (db.bloom_positive_count as f64
+                    / (db.bloom_positive_count + db.bloom_negative_count) as f64)
+                    * 100.0
             );
             last_status_report = std::time::Instant::now();
             db.commit().expect("Failed to commit index");
         }
     }
-    println!(
-        "Crawl finished. Docs in index: {}",
-        db.num_docs()?
-    );
+    println!("Crawl finished. Docs in index: {}", db.num_docs()?);
 
     Ok(())
 }

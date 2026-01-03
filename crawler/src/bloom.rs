@@ -121,6 +121,12 @@ impl<S: BuildHasher> BloomFilter<S> {
         }
     }
 
+    /// Create a new bloom filter with the specified false positive rate and expected items.
+    pub fn with_fp_rate(fp_rate: f64, hasher: S, expected_items: usize) -> Self {
+        let num_bits = optimal_size(expected_items, fp_rate);
+        Self::with_num_bits(num_bits, hasher, expected_items)
+    }
+
     /// Compute the source hash for a value.
     #[inline]
     pub fn source_hash(&self, val: &(impl Hash + ?Sized)) -> u64 {
