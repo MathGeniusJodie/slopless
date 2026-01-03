@@ -5,7 +5,6 @@ use reqwest::Client;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet};
 use std::fs::read_to_string;
-use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::Arc;
 use tantivy::schema::{FAST, IndexRecordOption, STORED, STRING, Schema, TEXT, TextFieldIndexing, TextOptions, Value};
 use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
@@ -155,9 +154,10 @@ mod bloom {
         pub fn bit_positions_hash(&self, source_hash: u64) -> u64 {
             let mut hasher = DoubleHasher::new(source_hash);
             let num_bits = self.bits.num_bits();
-            let positions = (0..self.num_hashes)
+            let mut positions: Vec<_> = (0..self.num_hashes)
                 .map(|_| index(num_bits, hasher.next()))
-                .collect::<Vec<_>>().sort();
+                .collect();
+            positions.sort();
             let mut state = self.hasher.build_hasher();
             positions.hash(&mut state);
             state.finish()
@@ -350,17 +350,14 @@ impl CrawlDb {
         Ok(self.index.reader()?.searcher())
     }
 
-    fn url_hash(&self, url: &str) -> u64 {
-        self.seen_urls.source_hash(url)
-    }
-
     fn mark_seen(&mut self, url: &str) {
-        let hash = self.seen_urls.source_hash(url);
-        let collides = self.seen_urls.contains(&hash);
+        let source_hash = self.seen_urls.source_hash(url);
+        let bit_pos_hash = self.seen_urls.bit_positions_hash(source_hash);
+        let collides = self.seen_urls.contains_hash(source_hash);
         if collides {
-            self.collisions.insert(&hash);
-        }else{
-            self.seen_urls.insert_hash(hash);
+            self.collisions.insert(&bit_pos_hash);
+        } else {
+            self.seen_urls.insert_hash(source_hash);
         }
     }
 
@@ -371,9 +368,10 @@ impl CrawlDb {
         }
         
         let maybe_in_index = self.seen_urls.contains(url);
-        let url_hash = self.seen_urls.source_hash(url);
+        let source_hash = self.seen_urls.source_hash(url);
+        let bit_pos_hash = self.seen_urls.bit_positions_hash(source_hash);
         if maybe_in_index {
-            if !self.collisions.contains(&url_hash) {
+            if !self.collisions.contains(&bit_pos_hash) {
                 return true;
             }
         }
@@ -382,7 +380,7 @@ impl CrawlDb {
         use tantivy::collector::DocSetCollector;
         use tantivy::query::TermQuery;
         
-        let term = tantivy::Term::from_field_u64(self.url_hash_field, url_hash);
+        let term = tantivy::Term::from_field_u64(self.url_hash_field, bit_pos_hash);
         let query = TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
         
         let Ok(doc_addresses) = searcher.search(&query, &DocSetCollector) else {
@@ -407,29 +405,13 @@ impl CrawlDb {
         false
     }
 
-    fn index_page(&mut self, page: IndexedPage, url_hash: u64, searcher: &tantivy::Searcher) -> Result<()> {
-        // Check if this hash already exists (committed or uncommitted) - if so, mark as collision
-        // If URL not in seen_urls bloom filter, it's definitely not in the index (no false negatives)
-        let hash_in_index = if self.seen_urls.contains(&page.page_url) {
-            let term = tantivy::Term::from_field_u64(self.url_hash_field, url_hash);
-            searcher.segment_readers().iter().any(|segment_reader| {
-                segment_reader
-                    .inverted_index(self.url_hash_field)
-                    .is_ok_and(|idx| idx.terms().term_ord(term.serialized_value_bytes()).is_ok_and(|o| o.is_some()))
-            })
-        } else {
-            false
-        };
-        // todo: probably no need to check tantivy or uncommitted_hashes
-        if self.uncommitted_hashes.contains(&url_hash) || hash_in_index {
-            self.collisions.insert(&url_hash);
-        }
-        self.uncommitted_hashes.insert(url_hash);
+    fn index_page(&mut self, page: IndexedPage, bit_pos_hash: u64, searcher: &tantivy::Searcher) -> Result<()> {
+        self.uncommitted_hashes.insert(bit_pos_hash);
         self.uncommitted_urls.insert(page.page_url.clone());
         
         let doc = doc!(
             self.url_field => page.page_url,
-            self.url_hash_field => url_hash,
+            self.url_hash_field => bit_pos_hash,
             self.title_field => page.page_title,
             self.body_field => page.page_content
         );
@@ -682,7 +664,8 @@ async fn main() -> Result<()> {
             };
             let url_str = task.target_url.to_string();
             queued_urls.remove(&url_str);
-            let url_hash = db.url_hash(&url_str);
+            let source_hash = db.seen_urls.source_hash(&url_str);
+            let url_hash = db.seen_urls.bit_positions_hash(source_hash);
             domains_in_progress.insert(domain.clone());
             let crawler = Arc::clone(&crawler);
             worker_pool.spawn(async move { (domain, url_hash, crawler.fetch_and_process_page(task).await) });
