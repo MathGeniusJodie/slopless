@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use core::task;
 use lol_html::{element, text, HtmlRewriter, Settings};
 use reqwest::Client;
 use std::cmp::Ordering;
@@ -10,7 +11,7 @@ use tantivy::schema::{
     IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, FAST, STORED, STRING, TEXT,
 };
 use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
-use tantivy::{doc, Index};
+use tantivy::{doc, index, Index};
 use tokio::task::JoinSet;
 use url::Url;
 
@@ -43,7 +44,7 @@ struct IndexedPage {
 struct CrawlTask {
     crawl_depth: usize,
     target_url: Url,
-    retry_count: usize,
+    domain_range: std::ops::Range<u32>,
 }
 
 impl Ord for CrawlTask {
@@ -63,6 +64,22 @@ impl PartialOrd for CrawlTask {
 }
 
 impl CrawlTask {
+    fn new(target_url: Url, crawl_depth: usize) -> Option<Self> {
+        let host = match target_url.host_str() {
+            Some(h) => h,
+            None => return None,
+        };
+        let url_str = target_url.as_str();
+        let url_ptr = url_str.as_ptr() as u32;
+        let host_ptr = host.as_ptr() as u32;
+        let host_start = host_ptr.checked_sub(url_ptr)?;
+        let host_end = host_start + host.len() as u32;
+        Some(Self {
+            target_url,
+            domain_range: host_start..host_end,
+            crawl_depth,
+        })
+    }
     fn should_skip(
         &self,
         max_depth: usize,
@@ -81,6 +98,14 @@ impl CrawlTask {
         }
         let url_str = self.target_url.to_string();
         db.should_skip_url(&url_str, &queued_urls)
+    }
+    fn domain(&self) -> &str {
+        let url_str = self.target_url.as_str();
+        let bytes = url_str.as_bytes();
+        let start = self.domain_range.start as usize;
+        let end = self.domain_range.end as usize;
+        // SAFETY: The range is derived from valid UTF-8 boundaries of the original string
+        std::str::from_utf8(&bytes[start..end]).unwrap()
     }
 }
 
@@ -264,18 +289,21 @@ fn extract_page_content(html_body: String) -> Result<(Vec<String>, String, Strin
 
 async fn fetch_and_process_page(
     http_client: &Client,
-    task: CrawlTask,
-    domain: String,
-) -> Result<(String,Vec<CrawlTask>, Option<IndexedPage>)> {
+    task: &CrawlTask,
+) -> Result<(Vec<CrawlTask>, IndexedPage)> {
     let CrawlTask {
         target_url,
         crawl_depth,
-        retry_count,
+        ..
     } = task;
 
     let response = http_client.get(target_url.clone()).send().await?;
     if !response.status().is_success() {
-        return Ok((domain,vec![], None));
+        return Err(anyhow::anyhow!(
+            "Failed to fetch URL: {} with status: {}",
+            target_url,
+            response.status()
+        ));
     }
 
     let content_type = response
@@ -285,36 +313,33 @@ async fn fetch_and_process_page(
         .unwrap_or("");
 
     if !content_type.starts_with("text/html") {
-        return Ok((domain,vec![], None));
+        return Err(anyhow::anyhow!(
+            "Non-HTML content type: {} for URL: {}",
+            content_type,
+            target_url
+        ));
     }
     let html_body = response.text().await?;
     let (extracted_links, page_content, page_title) = extract_page_content(html_body)?;
 
     let next_depth = crawl_depth + 1;
-    let base_host = target_url.host_str();
     let child_tasks = extracted_links
         .into_iter()
         .filter_map(|link| {
             let mut url = target_url.join(&link).ok()?;
             url.set_fragment(None);
-            (url.host_str() == base_host).then_some(CrawlTask {
-                target_url: url,
-                crawl_depth: next_depth,
-                retry_count,
-            })
+            (url.host_str() == target_url.host_str()).then_some(CrawlTask::new(url, next_depth)?)
         })
         .collect();
     Ok((
-        domain,
         child_tasks,
-        Some(IndexedPage {
+        IndexedPage {
             page_url: target_url.to_string(),
             page_content,
             page_title,
-        }),
+        },
     ))
 }
-
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 20)]
 async fn main() -> Result<()> {
@@ -359,43 +384,39 @@ async fn main() -> Result<()> {
     let mut db = CrawlDb::new(search_index, expected_url_count)?;
 
     let (mut pages_crawled, mut pages_failed) = (0usize, 0usize);
-    let mut domains_in_progress: HashSet<String, ahash::RandomState> = HashSet::with_hasher(ahash::RandomState::new());
+    let mut domains_in_progress: HashSet<String, ahash::RandomState> =
+        HashSet::with_hasher(ahash::RandomState::new());
     let mut queued_urls: HashSet<String, ahash::RandomState> =
         HashSet::with_hasher(ahash::RandomState::new());
     let mut task_queue: BTreeSet<CrawlTask> = seed_urls
         .into_iter()
-        .map(|url| {
+        .filter_map(|url| {
             db.mark_seen(url.as_str());
             queued_urls.insert(url.to_string());
-            CrawlTask {
-                target_url: url,
-                crawl_depth: 0,
-                retry_count: 0,
-            }
+            CrawlTask::new(url, 0)
         })
         .collect();
     let mut worker_pool = JoinSet::new();
     let mut last_status_report = std::time::Instant::now();
 
     loop {
-        let to_spawn = cli_args.max_concurrent_requests.saturating_sub(worker_pool.len());
-        for task in task_queue.extract_if(..,|task| {
-            let Some(domain) = task.target_url.host_str() else {
-                return true; // extract invalid URLs to remove them
-            };
-            if !domains_in_progress.insert(domain.to_string()){
-                return false;
-            }
-            true
-        }).take(to_spawn){
-            let Some(domain) = task.target_url.host_str() else {
-                continue;
-            };
-            let domain = domain.to_string();
+        let to_spawn = cli_args
+            .max_concurrent_requests
+            .saturating_sub(worker_pool.len());
+        for task in task_queue
+            .extract_if(.., |task| {
+                if !domains_in_progress.insert(task.domain().to_string()) {
+                    return false;
+                }
+                true
+            })
+            .take(to_spawn)
+        {
             queued_urls.remove(task.target_url.as_str());
             let http_client = http_client.clone(); // http_client is Arc internally
             worker_pool.spawn(async move {
-                fetch_and_process_page(&http_client,task,domain).await
+                //let ret = fetch_and_process_page(&http_client,&task).await;
+                (fetch_and_process_page(&http_client, &task).await, task)
             });
         }
 
@@ -408,17 +429,18 @@ async fn main() -> Result<()> {
             continue;
         };
 
-        let (domain, discovered_links, page_data) = match crawl_result {
-            Ok(result) => result,
+        let (fetch_result, task) = crawl_result;
+        domains_in_progress.remove(task.domain());
+        let (discovered_links, page_data) = match fetch_result {
+            Ok(res) => res,
             Err(e) => {
-                pages_failed += 1;
                 if cli_args.verbose_logging {
-                    eprintln!("Error crawling :( {e:?}");
+                    eprintln!("Error fetching {}: {:?}", task.target_url, e);
                 }
+                pages_failed += 1;
                 continue;
             }
         };
-        domains_in_progress.remove(&domain);
 
         for task in discovered_links {
             if !task.should_skip(
@@ -435,11 +457,7 @@ async fn main() -> Result<()> {
         }
 
         // Index the page if we got content
-        if let Some(page) = page_data {
-            if let Err(e) = db.index_page(page) {
-                eprintln!("Indexing error: {e:?}");
-            }
-        }
+        let _ = db.index_page(page_data);
 
         pages_crawled += 1;
 
