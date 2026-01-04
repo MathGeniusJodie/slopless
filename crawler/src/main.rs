@@ -1,22 +1,24 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use core::task;
-use lol_html::{element, text, HtmlRewriter, Settings};
+
 use reqwest::Client;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet};
 use std::fs::read_to_string;
 use std::sync::Arc;
 use tantivy::schema::{
-    IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, FAST, STORED, STRING, TEXT,
+    IndexRecordOption, Schema, TextFieldIndexing, TextOptions, FAST, STORED, TEXT,
 };
 use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
-use tantivy::{doc, index, Index};
+use tantivy::{doc, Index};
 use tokio::task::JoinSet;
 use url::Url;
 
 mod bloom;
 use bloom::BloomFilter;
+
+mod lol_readability;
+use lol_readability::find_main_content;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -44,7 +46,7 @@ struct IndexedPage {
 struct CrawlTask {
     crawl_depth: usize,
     target_url: Url,
-    domain_range: std::ops::Range<u32>,
+    domain: Arc<str>,
 }
 
 impl Ord for CrawlTask {
@@ -69,14 +71,9 @@ impl CrawlTask {
             Some(h) => h,
             None => return None,
         };
-        let url_str = target_url.as_str();
-        let url_ptr = url_str.as_ptr() as u32;
-        let host_ptr = host.as_ptr() as u32;
-        let host_start = host_ptr.checked_sub(url_ptr)?;
-        let host_end = host_start + host.len() as u32;
         Some(Self {
+            domain: Arc::from(host),
             target_url,
-            domain_range: host_start..host_end,
             crawl_depth,
         })
     }
@@ -85,7 +82,7 @@ impl CrawlTask {
         max_depth: usize,
         excluded_prefixes: &[String],
         db: &mut CrawlDb,
-        queued_urls: &HashSet<String, ahash::RandomState>,
+        queued_urls: &HashSet<Arc<str>, ahash::RandomState>,
     ) -> bool {
         if self.crawl_depth > max_depth {
             return true;
@@ -97,14 +94,6 @@ impl CrawlTask {
             return true;
         }
         db.should_skip_url(self.target_url.as_str(), &queued_urls)
-    }
-    fn domain(&self) -> &str {
-        let url_str = self.target_url.as_str();
-        let bytes = url_str.as_bytes();
-        let start = self.domain_range.start as usize;
-        let end = self.domain_range.end as usize;
-        // SAFETY: The range is derived from valid UTF-8 boundaries of the original string
-        std::str::from_utf8(&bytes[start..end]).unwrap()
     }
 }
 
@@ -122,7 +111,7 @@ struct CrawlDb {
     title_field: tantivy::schema::Field,
     body_field: tantivy::schema::Field,
     seen_urls: BloomFilter<ahash::RandomState>,
-    uncommitted_urls: HashSet<String, ahash::RandomState>,
+    uncommitted_urls: HashSet<Box<str>, ahash::RandomState>,
     bloom_negative_count: usize,
     bloom_positive_count: usize,
 }
@@ -161,7 +150,7 @@ impl CrawlDb {
     fn should_skip_url(
         &mut self,
         url: &str,
-        queued_urls: &HashSet<String, ahash::RandomState>,
+        queued_urls: &HashSet<Arc<str>, ahash::RandomState>,
     ) -> bool {
         // Check uncommitted URLs first (already added to tantivy but not committed)
         if self.uncommitted_urls.contains(url) || queued_urls.contains(url) {
@@ -194,12 +183,12 @@ impl CrawlDb {
 
     fn index_page(&mut self, page: IndexedPage) -> Result<()> {
         let doc = doc!(
-            self.url_field => page.page_url,
-            self.title_field => page.page_title,
-            self.body_field => page.page_content
+            self.url_field => &*page.page_url,
+            self.title_field => &*page.page_title,
+            self.body_field => &*page.page_content
         );
         self.index_writer.add_document(doc)?;
-        self.uncommitted_urls.insert(page.page_url);
+        self.uncommitted_urls.insert(page.page_url.into());
         Ok(())
     }
 
@@ -252,37 +241,10 @@ fn setup_search_index() -> Result<SearchIndex> {
 }
 
 fn extract_page_content(html_body: String) -> Result<(Vec<String>, String, String)> {
-    let mut extracted_links = Vec::new();
-    let mut page_title = String::new();
-    let mut html_rewriter = HtmlRewriter::new(
-        Settings {
-            element_content_handlers: vec![
-                element!("a[href]", |anchor| {
-                    if let Some(href) = anchor.get_attribute("href") {
-                        extracted_links.push(href);
-                    }
-                    Ok(())
-                }),
-                text!("title", |title_text| {
-                    page_title = title_text.as_str().to_string();
-                    Ok(())
-                }),
-            ],
-            ..Settings::default()
-        },
-        |_: &[u8]| {},
-    );
-
-    html_rewriter.write(html_body.as_bytes())?;
-    html_rewriter.end()?;
-
-    use dom_smoothie::{Article, Config, Readability};
-    let readability_config = Config::default();
-    let mut readability_parser = Readability::new(html_body, None, Some(readability_config))?;
-    let parsed_article: Article = readability_parser.parse()?;
-    let readable_text = parsed_article.text_content;
+    let (readable_text, extracted_links, page_title) = find_main_content(html_body.as_bytes())?;
     use unicode_normalization::UnicodeNormalization;
     let normalized_text = readable_text.nfkc().collect::<String>();
+    println!("Extracted Text: {}", &normalized_text);
     Ok((extracted_links, normalized_text, page_title))
 }
 
@@ -326,7 +288,8 @@ async fn fetch_and_process_page(
         .filter_map(|link| {
             let mut url = target_url.join(&link).ok()?;
             url.set_fragment(None);
-            (url.host_str() == target_url.host_str()).then_some(CrawlTask::new(url, crawl_depth+1)?)
+            (url.host_str() == target_url.host_str())
+                .then_some(CrawlTask::new(url, crawl_depth + 1)?)
         })
         .collect();
     Ok((
@@ -382,15 +345,15 @@ async fn main() -> Result<()> {
     let mut db = CrawlDb::new(search_index, expected_url_count)?;
 
     let (mut pages_crawled, mut pages_failed) = (0usize, 0usize);
-    let mut domains_in_progress: HashSet<Box<str>, ahash::RandomState> =
+    let mut domains_in_progress: HashSet<Arc<str>, ahash::RandomState> =
         HashSet::with_hasher(ahash::RandomState::new());
-    let mut queued_urls: HashSet<String, ahash::RandomState> =
+    let mut queued_urls: HashSet<Arc<str>, ahash::RandomState> =
         HashSet::with_hasher(ahash::RandomState::new());
     let mut task_queue: BTreeSet<CrawlTask> = seed_urls
         .into_iter()
         .filter_map(|url| {
             db.mark_seen(url.as_str());
-            queued_urls.insert(url.to_string());
+            queued_urls.insert(url.as_str().into());
             CrawlTask::new(url, 0)
         })
         .collect();
@@ -403,7 +366,7 @@ async fn main() -> Result<()> {
             .saturating_sub(worker_pool.len());
         for task in task_queue
             .extract_if(.., |task| {
-                if !domains_in_progress.insert(task.domain().into()) {
+                if !domains_in_progress.insert(task.domain.clone()) {
                     return false;
                 }
                 true
@@ -411,7 +374,7 @@ async fn main() -> Result<()> {
             .take(to_spawn)
         {
             queued_urls.remove(task.target_url.as_str());
-            let http_client = http_client.clone(); // http_client is Arc internally
+            let http_client = http_client.clone(); // http_client is Rc internally
             worker_pool.spawn(async move {
                 //let ret = fetch_and_process_page(&http_client,&task).await;
                 (fetch_and_process_page(&http_client, &task).await, task)
@@ -428,7 +391,7 @@ async fn main() -> Result<()> {
         };
 
         let (fetch_result, task) = crawl_result;
-        domains_in_progress.remove(task.domain());
+        domains_in_progress.remove(&task.domain);
         let (discovered_links, page_data) = match fetch_result {
             Ok(res) => res,
             Err(e) => {
@@ -447,9 +410,9 @@ async fn main() -> Result<()> {
                 &mut db,
                 &queued_urls,
             ) {
-                let url_str = task.target_url.to_string();
-                db.mark_seen(&url_str);
-                queued_urls.insert(url_str);
+                let url_str = task.target_url.as_str();
+                db.mark_seen(url_str);
+                queued_urls.insert(url_str.into());
                 task_queue.insert(task);
             }
         }

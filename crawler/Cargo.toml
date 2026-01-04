@@ -10,13 +10,11 @@ lol_html = "2.7.0"
 tantivy = "0.25.0"
 url = "2.4"
 anyhow = "1.0"
+regex = "1"
 futures = "0.3"
 bytes = "1.11.0"
 clap = { version = "4.0", features = ["derive"] }
 ahash = "0.8.12"
-#dom_smoothie = "0.14.0"
-#use the git version of dom_smoothie to fix bug
-dom_smoothie = { git = "https://github.com/MathGeniusJodie/dom_smoothie.git", branch = "main" }
 unicode-normalization = "0.1.25"
 [profile.release]
 debug = true # Adds debug symbols to the optimized binary
