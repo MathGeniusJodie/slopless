@@ -39,10 +39,6 @@ struct IndexedPage {
     page_content: String,
 }
 
-struct WebCrawler {
-    http_client: Client,
-}
-
 #[derive(Clone, Eq, PartialEq)]
 struct CrawlTask {
     crawl_depth: usize,
@@ -266,60 +262,59 @@ fn extract_page_content(html_body: String) -> Result<(Vec<String>, String, Strin
     Ok((extracted_links, normalized_text, page_title))
 }
 
-impl <'a>WebCrawler {
-    async fn fetch_and_process_page(
-        &'a self,
-        task: CrawlTask,
-        domain: String,
-    ) -> Result<(String,Vec<CrawlTask>, Option<IndexedPage>)> {
-        let CrawlTask {
-            target_url,
-            crawl_depth,
-            retry_count,
-        } = task;
+async fn fetch_and_process_page(
+    http_client: &Client,
+    task: CrawlTask,
+    domain: String,
+) -> Result<(String,Vec<CrawlTask>, Option<IndexedPage>)> {
+    let CrawlTask {
+        target_url,
+        crawl_depth,
+        retry_count,
+    } = task;
 
-        let response = self.http_client.get(target_url.clone()).send().await?;
-        if !response.status().is_success() {
-            return Ok((domain,vec![], None));
-        }
-
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|header_value| header_value.to_str().ok())
-            .unwrap_or("");
-
-        if !content_type.starts_with("text/html") {
-            return Ok((domain,vec![], None));
-        }
-        let html_body = response.text().await?;
-        let (extracted_links, page_content, page_title) = extract_page_content(html_body)?;
-
-        let next_depth = crawl_depth + 1;
-        let base_host = target_url.host_str();
-        let child_tasks = extracted_links
-            .into_iter()
-            .filter_map(|link| {
-                let mut url = target_url.join(&link).ok()?;
-                url.set_fragment(None);
-                (url.host_str() == base_host).then_some(CrawlTask {
-                    target_url: url,
-                    crawl_depth: next_depth,
-                    retry_count,
-                })
-            })
-            .collect();
-        Ok((
-            domain,
-            child_tasks,
-            Some(IndexedPage {
-                page_url: target_url.to_string(),
-                page_content,
-                page_title,
-            }),
-        ))
+    let response = http_client.get(target_url.clone()).send().await?;
+    if !response.status().is_success() {
+        return Ok((domain,vec![], None));
     }
+
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|header_value| header_value.to_str().ok())
+        .unwrap_or("");
+
+    if !content_type.starts_with("text/html") {
+        return Ok((domain,vec![], None));
+    }
+    let html_body = response.text().await?;
+    let (extracted_links, page_content, page_title) = extract_page_content(html_body)?;
+
+    let next_depth = crawl_depth + 1;
+    let base_host = target_url.host_str();
+    let child_tasks = extracted_links
+        .into_iter()
+        .filter_map(|link| {
+            let mut url = target_url.join(&link).ok()?;
+            url.set_fragment(None);
+            (url.host_str() == base_host).then_some(CrawlTask {
+                target_url: url,
+                crawl_depth: next_depth,
+                retry_count,
+            })
+        })
+        .collect();
+    Ok((
+        domain,
+        child_tasks,
+        Some(IndexedPage {
+            page_url: target_url.to_string(),
+            page_content,
+            page_title,
+        }),
+    ))
 }
+
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 20)]
 async fn main() -> Result<()> {
@@ -352,14 +347,12 @@ async fn main() -> Result<()> {
         }
     }
 
-    let crawler = Arc::new(WebCrawler {
-        http_client: Client::builder()
-            // chrome
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3")
-            .pool_idle_timeout(None)
-            .tcp_nodelay(true)
-            .build()?
-    });
+    let http_client = Client::builder()
+        // chrome
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3")
+        .pool_idle_timeout(None)
+        .tcp_nodelay(true)
+        .build()?;
 
     let search_index = setup_search_index()?;
     let expected_url_count = 100_000_000;
@@ -400,9 +393,9 @@ async fn main() -> Result<()> {
             };
             let domain = domain.to_string();
             queued_urls.remove(task.target_url.as_str());
-            let crawler = Arc::clone(&crawler);
+            let http_client = http_client.clone(); // http_client is Arc internally
             worker_pool.spawn(async move {
-                crawler.fetch_and_process_page(task,domain).await
+                fetch_and_process_page(&http_client,task,domain).await
             });
         }
 
