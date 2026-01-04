@@ -72,7 +72,6 @@ impl CrawlTask {
         max_depth: usize,
         excluded_prefixes: &[String],
         db: &mut CrawlDb,
-        searcher: &tantivy::Searcher,
         queued_urls: &HashSet<String, ahash::RandomState>,
     ) -> bool {
         if self.crawl_depth > max_depth {
@@ -85,7 +84,7 @@ impl CrawlTask {
             return true;
         }
         let url_str = self.target_url.to_string();
-        db.should_skip_url(&url_str, searcher, &queued_urls)
+        db.should_skip_url(&url_str,&queued_urls)
     }
 }
 
@@ -142,7 +141,6 @@ impl CrawlDb {
     fn should_skip_url(
         &mut self,
         url: &str,
-        searcher: &tantivy::Searcher,
         queued_urls: &HashSet<String, ahash::RandomState>,
     ) -> bool {
         // Check uncommitted URLs first (already added to tantivy but not committed)
@@ -163,7 +161,10 @@ impl CrawlDb {
 
         let term = tantivy::Term::from_field_text(self.url_field, url);
         let query = TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
-
+        let searcher = match self.searcher() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
         let Ok(doc_addresses) = searcher.search(&query, &DocSetCollector) else {
             return false;
         };
@@ -172,14 +173,13 @@ impl CrawlDb {
     }
 
     fn index_page(&mut self, page: IndexedPage) -> Result<()> {
-        self.uncommitted_urls.insert(page.page_url.clone());
-
         let doc = doc!(
             self.url_field => page.page_url,
             self.title_field => page.page_title,
             self.body_field => page.page_content
         );
         self.index_writer.add_document(doc)?;
+        self.uncommitted_urls.insert(page.page_url);
         Ok(())
     }
 
@@ -386,10 +386,7 @@ async fn main() -> Result<()> {
         http_client: Client::builder()
             // chrome
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3")
-            // max concurrency for multiple hosts
-            .pool_max_idle_per_host(0)
             .pool_idle_timeout(None)
-            //.timeout(std::time::Duration::from_secs(5))
             .tcp_nodelay(true)
             .build()?
     });
@@ -426,8 +423,7 @@ async fn main() -> Result<()> {
             let Some(domain) = task.target_url.host_str().map(String::from) else {
                 continue;
             };
-            let url_str = task.target_url.to_string();
-            queued_urls.remove(&url_str);
+            queued_urls.remove(task.target_url.as_str());
             domains_in_progress.insert(domain.clone());
             let crawler = Arc::clone(&crawler);
             worker_pool.spawn(async move {
@@ -455,13 +451,12 @@ async fn main() -> Result<()> {
                 continue;
             }
         };
-        let searcher = db.searcher()?;
+        
         for task in discovered_links {
             if !task.should_skip(
                 cli_args.max_crawl_depth,
                 &cli_args.excluded_url_prefixes,
                 &mut db,
-                &searcher,
                 &queued_urls,
             ) {
                 let url_str = task.target_url.to_string();
