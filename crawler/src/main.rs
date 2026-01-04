@@ -104,14 +104,6 @@ impl CrawlTask {
     }
 }
 
-/// Tantivy search index with schema fields
-struct SearchIndex {
-    index: Index,
-    url_field: tantivy::schema::Field,
-    title_field: tantivy::schema::Field,
-    body_field: tantivy::schema::Field,
-}
-
 /// Database wrapping Tantivy index with URL deduplication via Bloom filter
 struct CrawlDb {
     index: Index,
@@ -133,35 +125,59 @@ struct CrawlDb {
 }
 
 impl CrawlDb {
-    fn new(search_index: SearchIndex, expected_url_count: usize) -> Result<Self> {
-        let index_writer = search_index.index.writer(50_000_000)?;
+    fn new(expected_url_count: usize) -> Result<Self> {
+        // Set up search tokenizer with lowercasing and stemming
+        let search_tokenizer = TextAnalyzer::builder(SimpleTokenizer::default())
+            .filter(LowerCaser)
+            .filter(tantivy::tokenizer::Stemmer::new(
+                tantivy::tokenizer::Language::English,
+            ))
+            .build();
+
+        // Build schema
+        let body_field_indexing = TextFieldIndexing::default()
+            .set_tokenizer("norm_tokenizer")
+            .set_index_option(IndexRecordOption::WithFreqsAndPositions);
+        let body_field_options = TextOptions::default().set_indexing_options(body_field_indexing);
+        let mut schema_builder = Schema::builder();
+        let url_field = schema_builder.add_text_field("url", TEXT | STORED | FAST);
+        let title_field = schema_builder.add_text_field("title", TEXT | STORED);
+        let body_field = schema_builder.add_text_field("body", body_field_options);
+        let schema = schema_builder.build();
+
+        // Open or create index
+        let index = if std::path::Path::new("search_db").exists() {
+            Index::open_in_dir("search_db")?
+        } else {
+            std::fs::create_dir_all("search_db")?;
+            Index::create(
+                tantivy::directory::MmapDirectory::open("search_db")?,
+                schema,
+                tantivy::IndexSettings::default(),
+            )?
+        };
+        index
+            .tokenizers()
+            .register("norm_tokenizer", search_tokenizer);
+
+        let index_writer = index.writer(50_000_000)?;
 
         // Initialize Bloom filter: 8 bits per URL gives ~0.1% false positive rate
         let seen_urls_bloom = BloomFilter::with_num_bits(expected_url_count * 8)
             .hasher(ahash::RandomState::new())
             .expected_items(expected_url_count);
-        let uncommitted_urls = HashSet::with_hasher(ahash::RandomState::new());
 
         Ok(Self {
-            index: search_index.index,
+            index,
             index_writer,
-            url_field: search_index.url_field,
-            title_field: search_index.title_field,
-            body_field: search_index.body_field,
+            url_field,
+            title_field,
+            body_field,
             seen_urls_bloom,
-            uncommitted_urls,
+            uncommitted_urls: HashSet::with_hasher(ahash::RandomState::new()),
             bloom_saved_lookups: 0,
             bloom_possible_collisions: 0,
         })
-    }
-
-    fn searcher(&self) -> Result<tantivy::Searcher> {
-        Ok(self.index.reader()?.searcher())
-    }
-
-    /// Mark a URL as seen in the Bloom filter
-    fn mark_url_as_seen(&mut self, url: &str) -> bool {
-        self.seen_urls_bloom.insert(url)
     }
 
     /// Check if URL has already been processed (three-layer check)
@@ -202,7 +218,7 @@ impl CrawlDb {
         let term = tantivy::Term::from_field_text(self.url_field, url);
         let query = TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
 
-        let Ok(searcher) = self.searcher() else {
+        let Ok(searcher) = self.index.reader().map(|r| r.searcher()) else {
             return false;
         };
 
@@ -230,58 +246,6 @@ impl CrawlDb {
         Ok(())
     }
 
-    fn num_docs(&self) -> Result<u64> {
-        Ok(self.index.reader()?.searcher().num_docs())
-    }
-}
-
-fn setup_search_index() -> Result<SearchIndex> {
-    let search_tokenizer = TextAnalyzer::builder(SimpleTokenizer::default())
-        .filter(LowerCaser)
-        .filter(tantivy::tokenizer::Stemmer::new(
-            tantivy::tokenizer::Language::English,
-        ))
-        .build();
-    let body_field_indexing = TextFieldIndexing::default()
-        .set_tokenizer("norm_tokenizer")
-        .set_index_option(IndexRecordOption::WithFreqsAndPositions);
-    let body_field_options = TextOptions::default().set_indexing_options(body_field_indexing);
-    let mut schema_builder = Schema::builder();
-    let url_field = schema_builder.add_text_field("url", TEXT | STORED | FAST);
-    let title_field = schema_builder.add_text_field("title", TEXT | STORED);
-    let body_field = schema_builder.add_text_field("body", body_field_options);
-    let schema = schema_builder.build();
-    let index = if std::path::Path::new("search_db").exists() {
-        Index::open_in_dir("search_db")?
-    } else {
-        std::fs::create_dir_all("search_db")?;
-        Index::create(
-            tantivy::directory::MmapDirectory::open("search_db")?,
-            schema,
-            tantivy::IndexSettings::default(),
-        )?
-    };
-    index
-        .tokenizers()
-        .register("norm_tokenizer", search_tokenizer);
-    Ok(SearchIndex {
-        index,
-        url_field,
-        title_field,
-        body_field,
-    })
-}
-
-/// Extract readable content and links from HTML
-fn extract_page_content(html_body: String) -> Result<(Vec<String>, String, String)> {
-    let (readable_text, extracted_links, page_title) = find_main_content(html_body.as_bytes())?;
-
-    // Normalize Unicode to canonical form (handles different representations of same character)
-    use unicode_normalization::UnicodeNormalization;
-    let normalized_text = readable_text.nfkc().collect::<String>();
-
-    //println!("Extracted Text: {}", &normalized_text);
-    Ok((extracted_links, normalized_text, page_title))
 }
 
 /// Fetch a URL and extract content + links
@@ -322,7 +286,9 @@ async fn fetch_and_process_page(
 
     // Extract content and links
     let html_body = response.text().await?;
-    let (extracted_links, page_content, page_title) = extract_page_content(html_body)?;
+    let (readable_text, extracted_links, page_title) = find_main_content(html_body.as_bytes())?;
+    use unicode_normalization::UnicodeNormalization;
+    let page_content = readable_text.nfkc().collect::<String>();
 
     // Convert extracted links to crawl tasks (same-domain only, one level deeper)
     let child_tasks = extracted_links
@@ -426,9 +392,8 @@ async fn main() -> Result<()> {
         .tcp_nodelay(true)        // Send small packets immediately (lower latency)
         .build()?;
 
-    let search_index = setup_search_index()?;
     let expected_url_count = 100_000_000;
-    let mut db = CrawlDb::new(search_index, expected_url_count)?;
+    let mut db = CrawlDb::new(expected_url_count)?;
 
     // Initialize crawl state
     let (mut pages_crawled, mut pages_failed) = (0usize, 0usize);
@@ -445,7 +410,7 @@ async fn main() -> Result<()> {
     let mut task_queue: BTreeSet<CrawlTask> = seed_urls
         .into_iter()
         .filter_map(|url| {
-            db.mark_url_as_seen(url.as_str());
+            db.seen_urls_bloom.insert(url.as_str());
             pending_task_urls.insert(url.as_str().into());
             CrawlTask::new(url, 0)
         })
@@ -517,7 +482,7 @@ async fn main() -> Result<()> {
                 &pending_task_urls,
             ) {
                 let url_str = child_task.target_url.as_str();
-                db.mark_url_as_seen(url_str);
+                db.seen_urls_bloom.insert(url_str);
                 pending_task_urls.insert(url_str.into());
                 task_queue.insert(child_task);
             }
@@ -540,7 +505,10 @@ async fn main() -> Result<()> {
             last_status_report = std::time::Instant::now();
         }
     }
-    println!("Crawl finished. Docs in index: {}", db.num_docs()?);
+    println!(
+        "Crawl finished. Docs in index: {}",
+        db.index.reader()?.searcher().num_docs()
+    );
 
     Ok(())
 }
