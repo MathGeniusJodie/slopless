@@ -36,24 +36,27 @@ struct Args {
     verbose_logging: bool,
 }
 
+/// A page that has been fetched and is ready to be indexed
 struct IndexedPage {
     page_url: String,
     page_title: String,
     page_content: String,
 }
 
+/// A single URL to crawl, with associated metadata
 #[derive(Clone, Eq, PartialEq)]
 struct CrawlTask {
     crawl_depth: usize,
     target_url: Url,
-    domain: Arc<str>,
+    domain: Arc<str>, // Cached domain string for efficient grouping
 }
 
 impl Ord for CrawlTask {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Order by depth (DESCENDING - process deepest first), then by URL for uniqueness
+        // Process deeper pages first (they're less likely to spawn more work)
+        // This helps drain the queue faster and reduces memory usage
         other
-            .crawl_depth // Swap self/other to reverse order
+            .crawl_depth
             .cmp(&self.crawl_depth)
             .then_with(|| self.target_url.as_str().cmp(other.target_url.as_str()))
     }
@@ -77,26 +80,33 @@ impl CrawlTask {
             crawl_depth,
         })
     }
+    /// Check if this task should be skipped based on depth, exclusions, and deduplication
     fn should_skip(
         &self,
         max_depth: usize,
         excluded_prefixes: &[String],
         db: &mut CrawlDb,
-        queued_urls: &HashSet<Arc<str>, ahash::RandomState>,
+        pending_task_urls: &HashSet<Arc<str>, ahash::RandomState>,
     ) -> bool {
+        // Too deep?
         if self.crawl_depth > max_depth {
             return true;
         }
+
+        // Explicitly excluded?
         if excluded_prefixes
             .iter()
             .any(|prefix| self.target_url.as_str().starts_with(prefix))
         {
             return true;
         }
-        db.should_skip_url(self.target_url.as_str(), &queued_urls)
+
+        // Already crawled or queued?
+        db.is_url_already_processed(self.target_url.as_str(), pending_task_urls)
     }
 }
 
+/// Tantivy search index with schema fields
 struct SearchIndex {
     index: Index,
     url_field: tantivy::schema::Field,
@@ -104,22 +114,32 @@ struct SearchIndex {
     body_field: tantivy::schema::Field,
 }
 
+/// Database wrapping Tantivy index with URL deduplication via Bloom filter
 struct CrawlDb {
     index: Index,
     index_writer: tantivy::IndexWriter,
     url_field: tantivy::schema::Field,
     title_field: tantivy::schema::Field,
     body_field: tantivy::schema::Field,
-    seen_urls: BloomFilter<ahash::RandomState>,
+
+    // Three-layer deduplication system:
+    // 1. Bloom filter (fast, probabilistic)
+    seen_urls_bloom: BloomFilter<ahash::RandomState>,
+    // 2. Uncommitted URLs (not yet in Tantivy index)
     uncommitted_urls: HashSet<Box<str>, ahash::RandomState>,
-    bloom_negative_count: usize,
-    bloom_positive_count: usize,
+    // 3. Tantivy index query (fallback for Bloom collisions)
+
+    // Metrics for Bloom filter effectiveness
+    bloom_saved_lookups: usize,
+    bloom_possible_collisions: usize,
 }
 
 impl CrawlDb {
     fn new(search_index: SearchIndex, expected_url_count: usize) -> Result<Self> {
         let index_writer = search_index.index.writer(50_000_000)?;
-        let seen_urls = BloomFilter::with_num_bits(
+
+        // Initialize Bloom filter: 8 bits per URL gives ~0.1% false positive rate
+        let seen_urls_bloom = BloomFilter::with_num_bits(
             expected_url_count * 8,
             ahash::RandomState::new(),
             expected_url_count,
@@ -132,10 +152,10 @@ impl CrawlDb {
             url_field: search_index.url_field,
             title_field: search_index.title_field,
             body_field: search_index.body_field,
-            seen_urls,
+            seen_urls_bloom,
             uncommitted_urls,
-            bloom_negative_count: 0,
-            bloom_positive_count: 0,
+            bloom_saved_lookups: 0,
+            bloom_possible_collisions: 0,
         })
     }
 
@@ -143,37 +163,53 @@ impl CrawlDb {
         Ok(self.index.reader()?.searcher())
     }
 
-    fn mark_seen(&mut self, url: &str) -> bool {
-        self.seen_urls.insert(url)
+    /// Mark a URL as seen in the Bloom filter
+    fn mark_url_as_seen(&mut self, url: &str) -> bool {
+        self.seen_urls_bloom.insert(url)
     }
 
-    fn should_skip_url(
+    /// Check if URL has already been processed (three-layer check)
+    fn is_url_already_processed(
         &mut self,
         url: &str,
-        queued_urls: &HashSet<Arc<str>, ahash::RandomState>,
+        pending_task_urls: &HashSet<Arc<str>, ahash::RandomState>,
     ) -> bool {
-        // Check uncommitted URLs first (already added to tantivy but not committed)
-        if self.uncommitted_urls.contains(url) || queued_urls.contains(url) {
+        // Layer 1: Check if URL is already in the task queue (not yet crawled)
+        if pending_task_urls.contains(url) {
             return true;
         }
 
-        if !self.seen_urls.contains(url) {
-            self.bloom_negative_count += 1;
-            return false;
-        } else {
-            self.bloom_positive_count += 1;
+        // Layer 2: Check if URL was recently indexed but not yet committed
+        if self.uncommitted_urls.contains(url) {
+            return true;
         }
 
-        // possible collision: must verify db
+        // Layer 3: Check Bloom filter (probabilistic, may have false positives)
+        if !self.seen_urls_bloom.contains(url) {
+            // Bloom filter says we haven't seen it - trust this (no false negatives)
+            self.bloom_saved_lookups += 1;
+            return false;
+        }
+
+        // Bloom filter says we might have seen it
+        self.bloom_possible_collisions += 1;
+
+        // Layer 4: Query Tantivy index to confirm (handles Bloom false positives)
+        self.is_url_in_index(url)
+    }
+
+    /// Query Tantivy index to check if URL exists (expensive, used only for Bloom collisions)
+    fn is_url_in_index(&self, url: &str) -> bool {
         use tantivy::collector::DocSetCollector;
         use tantivy::query::TermQuery;
 
         let term = tantivy::Term::from_field_text(self.url_field, url);
         let query = TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
-        let searcher = match self.searcher() {
-            Ok(s) => s,
-            Err(_) => return false,
+
+        let Ok(searcher) = self.searcher() else {
+            return false;
         };
+
         let Ok(doc_addresses) = searcher.search(&query, &DocSetCollector) else {
             return false;
         };
@@ -240,14 +276,19 @@ fn setup_search_index() -> Result<SearchIndex> {
     })
 }
 
+/// Extract readable content and links from HTML
 fn extract_page_content(html_body: String) -> Result<(Vec<String>, String, String)> {
     let (readable_text, extracted_links, page_title) = find_main_content(html_body.as_bytes())?;
+
+    // Normalize Unicode to canonical form (handles different representations of same character)
     use unicode_normalization::UnicodeNormalization;
     let normalized_text = readable_text.nfkc().collect::<String>();
-    println!("Extracted Text: {}", &normalized_text);
+
+    //println!("Extracted Text: {}", &normalized_text);
     Ok((extracted_links, normalized_text, page_title))
 }
 
+/// Fetch a URL and extract content + links
 async fn fetch_and_process_page(
     http_client: &Client,
     task: &CrawlTask,
@@ -258,6 +299,7 @@ async fn fetch_and_process_page(
         ..
     } = task;
 
+    // Fetch the page
     let response = http_client.get(target_url.clone()).send().await?;
     if !response.status().is_success() {
         return Err(anyhow::anyhow!(
@@ -267,6 +309,7 @@ async fn fetch_and_process_page(
         ));
     }
 
+    // Check content type (skip non-HTML)
     let content_type = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -280,18 +323,24 @@ async fn fetch_and_process_page(
             target_url
         ));
     }
+
+    // Extract content and links
     let html_body = response.text().await?;
     let (extracted_links, page_content, page_title) = extract_page_content(html_body)?;
 
+    // Convert extracted links to crawl tasks (same-domain only, one level deeper)
     let child_tasks = extracted_links
         .into_iter()
         .filter_map(|link| {
             let mut url = target_url.join(&link).ok()?;
-            url.set_fragment(None);
+            url.set_fragment(None); // Remove #anchors
+
+            // Only crawl links on the same domain
             (url.host_str() == target_url.host_str())
                 .then_some(CrawlTask::new(url, crawl_depth + 1)?)
         })
         .collect();
+
     Ok((
         child_tasks,
         IndexedPage {
@@ -302,12 +351,10 @@ async fn fetch_and_process_page(
     ))
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 20)]
-async fn main() -> Result<()> {
-    let cli_args = Args::parse();
-
-    let file_content = read_to_string(&cli_args.input_file)
-        .with_context(|| format!("Failed to read input file: {}", cli_args.input_file))?;
+/// Load domain list from file and convert to seed URLs
+fn load_seed_urls(file_path: &str) -> Result<Vec<Url>> {
+    let file_content = read_to_string(file_path)
+        .with_context(|| format!("Failed to read input file: {}", file_path))?;
 
     let mut seed_urls = Vec::new();
 
@@ -316,9 +363,13 @@ async fn main() -> Result<()> {
         if domain.is_empty() {
             continue;
         }
+
+        // Clean domain (remove http:// or https:// prefix if present)
         let clean_domain = domain
             .trim_start_matches("http://")
             .trim_start_matches("https://");
+
+        // Parse as HTTPS URL
         let parsed_url =
             match Url::parse(&format!("https://{clean_domain}")).context("Invalid domain") {
                 Ok(url) => url,
@@ -333,111 +384,164 @@ async fn main() -> Result<()> {
         }
     }
 
+    Ok(seed_urls)
+}
+
+/// Print crawl status and commit index
+fn report_status_and_commit(
+    pages_crawled: usize,
+    pages_failed: usize,
+    task_queue_size: usize,
+    active_domains_count: usize,
+    db: &mut CrawlDb,
+) -> Result<()> {
+    println!(
+        "Crawled: {pages_crawled}, Failed: {pages_failed}, Queue: {task_queue_size}, Active: {active_domains_count}"
+    );
+
+    let bloom_total = db.bloom_saved_lookups + db.bloom_possible_collisions;
+    let bloom_efficiency = if bloom_total > 0 {
+        (db.bloom_saved_lookups as f64 / bloom_total as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    println!(
+        "  Uncommitted: {} URLs, Bloom filter efficiency: {:.2}% saved lookups",
+        db.uncommitted_urls.len(),
+        bloom_efficiency
+    );
+
+    db.commit()?;
+    Ok(())
+}
+
+#[tokio::main(flavor = "multi_thread", worker_threads = 20)]
+async fn main() -> Result<()> {
+    let cli_args = Args::parse();
+
+    // Load seed URLs from input file
+    let seed_urls = load_seed_urls(&cli_args.input_file)?;
+
+    // Configure HTTP client with Chrome user agent and performance optimizations
     let http_client = Client::builder()
-        // chrome
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3")
-        .pool_idle_timeout(None)
-        .tcp_nodelay(true)
+        .pool_idle_timeout(None) // Keep connections alive indefinitely
+        .tcp_nodelay(true)        // Send small packets immediately (lower latency)
         .build()?;
 
     let search_index = setup_search_index()?;
     let expected_url_count = 100_000_000;
     let mut db = CrawlDb::new(search_index, expected_url_count)?;
 
+    // Initialize crawl state
     let (mut pages_crawled, mut pages_failed) = (0usize, 0usize);
-    let mut domains_in_progress: HashSet<Arc<str>, ahash::RandomState> =
+
+    // Track which domains currently have active requests (one request per domain at a time)
+    let mut active_request_domains: HashSet<Arc<str>, ahash::RandomState> =
         HashSet::with_hasher(ahash::RandomState::new());
-    let mut queued_urls: HashSet<Arc<str>, ahash::RandomState> =
+
+    // Track URLs that are in the task queue but not yet crawled
+    let mut pending_task_urls: HashSet<Arc<str>, ahash::RandomState> =
         HashSet::with_hasher(ahash::RandomState::new());
+
+    // Priority queue: deeper tasks first (BTreeSet with custom Ord)
     let mut task_queue: BTreeSet<CrawlTask> = seed_urls
         .into_iter()
         .filter_map(|url| {
-            db.mark_seen(url.as_str());
-            queued_urls.insert(url.as_str().into());
+            db.mark_url_as_seen(url.as_str());
+            pending_task_urls.insert(url.as_str().into());
             CrawlTask::new(url, 0)
         })
         .collect();
+
+    // Pool of async worker tasks
     let mut worker_pool = JoinSet::new();
     let mut last_status_report = std::time::Instant::now();
 
     loop {
-        let to_spawn = cli_args
+        // Spawn new tasks up to concurrency limit
+        let available_worker_slots = cli_args
             .max_concurrent_requests
             .saturating_sub(worker_pool.len());
+
+        // Extract tasks from queue, ensuring only one request per domain at a time
         for task in task_queue
             .extract_if(.., |task| {
-                if !domains_in_progress.insert(task.domain.clone()) {
-                    return false;
-                }
-                true
+                // Try to mark this domain as in-progress
+                // If it's already in progress, leave task in queue
+                active_request_domains.insert(task.domain.clone())
             })
-            .take(to_spawn)
+            .take(available_worker_slots)
         {
-            queued_urls.remove(task.target_url.as_str());
-            let http_client = http_client.clone(); // http_client is Rc internally
+            // Remove from pending set since we're about to crawl it
+            pending_task_urls.remove(task.target_url.as_str());
+
+            let http_client = http_client.clone();
             worker_pool.spawn(async move {
-                //let ret = fetch_and_process_page(&http_client,&task).await;
-                (fetch_and_process_page(&http_client, &task).await, task)
+                let result = fetch_and_process_page(&http_client, &task).await;
+                (result, task)
             });
         }
 
+        // Exit when all work is done
         if worker_pool.is_empty() && task_queue.is_empty() {
             break;
         }
 
-        // Process completed task
+        // Wait for next task to complete
         let Some(Ok(crawl_result)) = worker_pool.join_next().await else {
             continue;
         };
 
-        let (fetch_result, task) = crawl_result;
-        domains_in_progress.remove(&task.domain);
-        let (discovered_links, page_data) = match fetch_result {
-            Ok(res) => res,
+        // Process completed task
+        let (fetch_result, completed_task) = crawl_result;
+
+        // Mark domain as no longer in progress
+        active_request_domains.remove(&completed_task.domain);
+
+        // Handle fetch result
+        let (discovered_child_tasks, page_data) = match fetch_result {
+            Ok(result) => result,
             Err(e) => {
                 if cli_args.verbose_logging {
-                    eprintln!("Error fetching {}: {:?}", task.target_url, e);
+                    eprintln!("Error fetching {}: {:?}", completed_task.target_url, e);
                 }
                 pages_failed += 1;
                 continue;
             }
         };
 
-        for task in discovered_links {
-            if !task.should_skip(
+        // Add discovered links to queue (after filtering)
+        for child_task in discovered_child_tasks {
+            if !child_task.should_skip(
                 cli_args.max_crawl_depth,
                 &cli_args.excluded_url_prefixes,
                 &mut db,
-                &queued_urls,
+                &pending_task_urls,
             ) {
-                let url_str = task.target_url.as_str();
-                db.mark_seen(url_str);
-                queued_urls.insert(url_str.into());
-                task_queue.insert(task);
+                let url_str = child_task.target_url.as_str();
+                db.mark_url_as_seen(url_str);
+                pending_task_urls.insert(url_str.into());
+                task_queue.insert(child_task);
             }
         }
 
-        // Index the page if we got content
+        // Index the page
         let _ = db.index_page(page_data);
-
         pages_crawled += 1;
 
-        // Periodic status report
+        // Periodic status reporting and commit
         if last_status_report.elapsed().as_secs() >= 5 {
-            println!(
-                "Crawled: {pages_crawled}, Failed: {pages_failed}, Queue: {}, Active: {}",
+            report_status_and_commit(
+                pages_crawled,
+                pages_failed,
                 task_queue.len(),
-                domains_in_progress.len()
-            );
-            println!(
-                " Uncommitted: URLs {}, Bloom positive ratio {:.2}%",
-                db.uncommitted_urls.len(),
-                (db.bloom_positive_count as f64
-                    / (db.bloom_positive_count + db.bloom_negative_count) as f64)
-                    * 100.0
-            );
+                active_request_domains.len(),
+                &mut db,
+            )
+            .expect("Failed to commit index");
             last_status_report = std::time::Instant::now();
-            db.commit().expect("Failed to commit index");
         }
     }
     println!("Crawl finished. Docs in index: {}", db.num_docs()?);

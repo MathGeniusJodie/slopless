@@ -7,17 +7,27 @@ use std::sync::LazyLock;
 // -----------------------------------------------------------------------------
 // Static Configuration (Compiled Once)
 // -----------------------------------------------------------------------------
+
+// Regex patterns for scoring element class/id attributes
+
+/// Patterns that are very unlikely to be main content (heavily penalize)
 static RE_UNLIKELY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?i)banner|combx|comment|community|disqus|extra|foot|header|menu|related|remark|rss|share|shoutbox|sidebar|skyscraper|sponsor|ad-break|agegate|pagination|popup"
     ).unwrap()
 });
+
+/// Ambiguous patterns that could go either way
 static RE_MAYBE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)and|article|body|column|main|shadow").unwrap());
+
+/// Positive signals that suggest main content
 static RE_POSITIVE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)article|body|content|entry|hentry|main|page|pagination|post|text|blog|story")
         .unwrap()
 });
+
+/// Negative signals that suggest non-content elements
 static RE_NEGATIVE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?i)hidden|banner|combx|comment|com-|contact|foot|footer|footnote|masthead|media|meta|outbrain|promo|related|scroll|shoutbox|sidebar|sponsor|shopping|tags|tool|widget|nav|namespace|action|catlinks|toc|printfooter|jump-to|siteSub|contentSub"
@@ -39,20 +49,36 @@ enum TagType {
     Other,
 }
 
-/// A stack frame representing an open element.
+/// A stack frame representing an open HTML element being scored
 #[derive(Debug, Default)]
-struct Frame {
-    tag: Option<TagType>,
-    score: f32,
-    text_len: u32,
-    link_text_len: u32,
-    commas: u32,
-    text: String, // Accumulated text content
+struct ElementFrame {
+    tag_type: Option<TagType>,
+    base_score: f32,          // Initial score from tag type + class/id
+    text_len: u32,            // Total character count
+    link_text_len: u32,       // Character count inside <a> tags
+    comma_count: u32,         // Number of commas (heuristic for real sentences)
+    accumulated_text: String, // Actual text content for this element
 }
 
-impl Frame {
-    fn new(name: &str, id: Option<&str>, class: Option<&str>) -> Self {
-        let tag = match name {
+impl ElementFrame {
+    /// Create a new frame for an HTML element with initial scoring based on tag type and attributes
+    fn new(tag_name: &str, id: Option<&str>, class: Option<&str>) -> Self {
+        let tag_type = Self::classify_tag(tag_name);
+        let base_score = Self::calculate_base_score(tag_type, id, class);
+
+        Self {
+            tag_type: Some(tag_type),
+            base_score,
+            text_len: 0,
+            link_text_len: 0,
+            comma_count: 0,
+            accumulated_text: String::new(),
+        }
+    }
+
+    /// Map HTML tag name to internal tag type
+    fn classify_tag(tag_name: &str) -> TagType {
+        match tag_name {
             "div" => TagType::Div,
             "p" => TagType::P,
             "a" => TagType::A,
@@ -60,63 +86,122 @@ impl Frame {
             "ul" | "ol" | "dl" => TagType::List,
             "article" | "main" | "section" => TagType::Article,
             _ => TagType::Other,
-        };
-
-        // Base Score Heuristics
-        let mut score = match tag {
-            TagType::Article => 30.0, // Semantic content tags get high base score
-            TagType::Div => 5.0,
-            TagType::P => 10.0,
-            TagType::Header => -5.0,
-            TagType::List => -3.0,
-            _ => 0.0,
-        };
-
-        let check_weight = |val: &str| -> f32 {
-            if RE_UNLIKELY.is_match(val) && !RE_MAYBE.is_match(val) {
-                return -50.0;
-            }
-            if RE_POSITIVE.is_match(val) {
-                return 25.0;
-            }
-            if RE_NEGATIVE.is_match(val) {
-                return -25.0;
-            }
-            0.0
-        };
-
-        if let Some(s) = id {
-            score += check_weight(s);
-        }
-        if let Some(s) = class {
-            score += check_weight(s);
-        }
-
-        Self {
-            tag: Some(tag),
-            score,
-            text_len: 0,
-            link_text_len: 0,
-            commas: 0,
-            text: String::new(),
         }
     }
 
-    fn append_text(&mut self, s: &str) {
-        let mut iter = s.split_whitespace().peekable();
-        if iter.peek().is_none() {
-            return;
+    /// Calculate initial score based on tag type and class/id attributes
+    fn calculate_base_score(tag_type: TagType, id: Option<&str>, class: Option<&str>) -> f32 {
+        // Start with tag-based score
+        let mut score = match tag_type {
+            TagType::Article => 30.0, // Semantic HTML5 content tags
+            TagType::Div => 5.0,
+            TagType::P => 10.0,
+            TagType::Header => -5.0, // Headers aren't main content
+            TagType::List => -3.0,   // Lists often navigation
+            _ => 0.0,
+        };
+
+        // Adjust based on class/id attributes
+        if let Some(id_value) = id {
+            score += Self::score_attribute(id_value);
         }
-        if !self.text.is_empty() && !self.text.ends_with(' ') {
-            self.text.push(' ');
+        if let Some(class_value) = class {
+            score += Self::score_attribute(class_value);
         }
-        if let Some(first) = iter.next() {
-            self.text.push_str(first);
-            for word in iter {
-                self.text.push(' ');
-                self.text.push_str(word);
+
+        score
+    }
+
+    /// Score a class or id attribute value based on regex patterns
+    fn score_attribute(attr_value: &str) -> f32 {
+        // Heavily penalize obvious non-content patterns
+        if RE_UNLIKELY.is_match(attr_value) && !RE_MAYBE.is_match(attr_value) {
+            return -50.0;
+        }
+
+        // Reward positive content signals
+        if RE_POSITIVE.is_match(attr_value) {
+            return 25.0;
+        }
+
+        // Penalize negative signals
+        if RE_NEGATIVE.is_match(attr_value) {
+            return -25.0;
+        }
+
+        0.0
+    }
+
+    /// Append text content, normalizing whitespace
+    fn append_text(&mut self, text: &str) {
+        let mut words = text.split_whitespace().peekable();
+        if words.peek().is_none() {
+            return; // Empty after whitespace normalization
+        }
+
+        // Add space separator if needed
+        if !self.accumulated_text.is_empty() && !self.accumulated_text.ends_with(' ') {
+            self.accumulated_text.push(' ');
+        }
+
+        // Join words with single spaces
+        if let Some(first_word) = words.next() {
+            self.accumulated_text.push_str(first_word);
+            for word in words {
+                self.accumulated_text.push(' ');
+                self.accumulated_text.push_str(word);
             }
         }
+    }
+
+    /// Calculate final score including text-based heuristics
+    fn calculate_final_score(&self) -> f32 {
+        // Start with base score from tag/attributes
+        let mut final_score = self.base_score;
+
+        // Reward text length (use sqrt to avoid over-weighting very long elements)
+        let text_score = (self.text_len as f32).sqrt();
+        final_score += text_score;
+
+        // Reward comma count (real sentences have punctuation)
+        final_score += self.comma_count as f32;
+
+        // Penalize high link density (navigation vs content)
+        if self.text_len > 0 {
+            let link_density = self.link_text_len as f32 / self.text_len as f32;
+            if link_density > 0.5 {
+                final_score *= 1.0 - link_density;
+            }
+        }
+
+        final_score
+    }
+
+    /// Check if this element is a viable candidate for main content
+    fn is_viable_candidate(&self) -> bool {
+        // Must be a content-bearing tag type
+        let is_content_tag = matches!(
+            self.tag_type,
+            Some(TagType::Article | TagType::Div | TagType::P | TagType::Other)
+        );
+
+        // Must have enough text (filter out tiny snippets)
+        const MIN_TEXT_LENGTH: u32 = 100;
+        let has_enough_text = self.text_len >= MIN_TEXT_LENGTH;
+
+        // Must have real words (filter out "a a a b b b" garbage)
+        let word_count = self.accumulated_text.split_whitespace().count();
+        let avg_word_length = if word_count > 0 {
+            self.accumulated_text.len() / word_count
+        } else {
+            0
+        };
+        let has_real_words = avg_word_length > 2;
+
+        // Must have actual content
+        let has_content = !self.accumulated_text.is_empty();
+
+        is_content_tag && has_enough_text && has_real_words && has_content
     }
 }
 
@@ -198,29 +283,30 @@ fn is_non_content_leaf(tag: &str) -> bool {
 /// Returns: (content_text, urls, title)
 /// Returns an error if no suitable content element was found.
 pub fn find_main_content(html: &[u8]) -> anyhow::Result<(String, Vec<String>, String)> {
-    struct Context {
-        stack: Vec<Frame>,
-        best_text: Option<String>,
-        best_score: f32,
+    /// Parsing context shared across HTML rewriter callbacks
+    struct ParsingContext {
+        element_stack: Vec<ElementFrame>,
+        best_content: Option<String>,
+        best_content_score: f32,
         skip_depth: u32,
-        urls: Vec<String>,
-        title: String,
-        in_title: bool,
+        extracted_urls: Vec<String>,
+        page_title: String,
+        currently_in_title: bool,
     }
 
-    let ctx = Rc::new(RefCell::new(Context {
-        stack: Vec::with_capacity(64),
-        best_text: None,
-        best_score: 0.0,
+    let parsing_context = Rc::new(RefCell::new(ParsingContext {
+        element_stack: Vec::with_capacity(64),
+        best_content: None,
+        best_content_score: 0.0,
         skip_depth: 0,
-        urls: Vec::new(),
-        title: String::new(),
-        in_title: false,
+        extracted_urls: Vec::new(),
+        page_title: String::new(),
+        currently_in_title: false,
     }));
 
-    let ctx_open = ctx.clone();
-    let ctx_text = ctx.clone();
-    let ctx_close = ctx.clone();
+    let context_for_open = parsing_context.clone();
+    let context_for_text = parsing_context.clone();
+    let context_for_close = parsing_context.clone();
 
     let mut rewriter = HtmlRewriter::new(
         Settings {
@@ -231,124 +317,98 @@ pub fn find_main_content(html: &[u8]) -> anyhow::Result<(String, Vec<String>, St
                     let is_leaf_skip = is_non_content_leaf(&tag_name);
                     let is_void = is_void_element(&tag_name);
 
-                    // Collect URLs from anchor tags
+                    // Extract URLs from all <a> tags (for link discovery)
                     if tag_name == "a" {
                         if let Some(href) = el.get_attribute("href") {
                             if !href.is_empty() {
-                                ctx_open.borrow_mut().urls.push(href);
+                                context_for_open.borrow_mut().extracted_urls.push(href);
                             }
                         }
                     }
 
-                    // Track title element (don't push a frame, just track state)
+                    // Track <title> element (special case: in <head>, but we want its text)
                     let is_title = tag_name == "title";
                     if is_title {
-                        ctx_open.borrow_mut().in_title = true;
+                        context_for_open.borrow_mut().currently_in_title = true;
                     }
 
-                    let (pushed_frame, incremented_skip) = {
-                        let mut c = ctx_open.borrow_mut();
+                    // Determine what to do with this element
+                    let (pushed_element_frame, incremented_skip_depth) = {
+                        let mut context = context_for_open.borrow_mut();
+
                         if is_title {
-                            // Title element: don't skip, don't push frame, just track
-                            // This needs to come before skip_depth check since title is in <head>
+                            // Title is in <head> which we skip, but we want title text
+                            // Don't push frame, don't increment skip depth, just track state
                             (false, false)
-                        } else if c.skip_depth > 0 && !is_void {
-                            c.skip_depth += 1;
+                        } else if context.skip_depth > 0 && !is_void {
+                            // Inside a skipped container: increment depth counter
+                            context.skip_depth += 1;
                             (false, true)
-                        } else if c.skip_depth > 0 && is_void {
+                        } else if context.skip_depth > 0 && is_void {
+                            // Void element inside skipped container: ignore
                             (false, false)
                         } else if is_container_skip {
-                            c.skip_depth += 1;
+                            // Start skipping a non-content container (<script>, <style>, etc.)
+                            context.skip_depth += 1;
                             (false, true)
                         } else if is_leaf_skip || is_void {
+                            // Non-content leaf/void element: ignore
                             (false, false)
                         } else {
+                            // Normal content element: create frame and push to stack
                             let id = el.get_attribute("id");
                             let class = el.get_attribute("class");
-                            let frame = Frame::new(&tag_name, id.as_deref(), class.as_deref());
-                            c.stack.push(frame);
+                            let frame =
+                                ElementFrame::new(&tag_name, id.as_deref(), class.as_deref());
+                            context.element_stack.push(frame);
                             (true, false)
                         }
                     };
 
+                    // Register end tag handler to process the element when it closes
                     if let Some(handlers) = el.end_tag_handlers() {
-                        let ctx_close = ctx_close.clone();
+                        let context_for_close_handler = context_for_close.clone();
                         let handler: EndTagHandler<'static> = Box::new(move |_| {
-                            let mut c = ctx_close.borrow_mut();
+                            let mut context = context_for_close_handler.borrow_mut();
 
-                            // Handle title closing
+                            // Handle </title> closing
                             if is_title {
-                                c.in_title = false;
+                                context.currently_in_title = false;
                                 return Ok(());
                             }
 
-                            if incremented_skip {
-                                c.skip_depth -= 1;
+                            // Handle closing skipped container
+                            if incremented_skip_depth {
+                                context.skip_depth -= 1;
                                 return Ok(());
                             }
 
-                            if !pushed_frame {
+                            // If we didn't push a frame, nothing to do
+                            if !pushed_element_frame {
                                 return Ok(());
                             }
 
-                            if let Some(mut frame) = c.stack.pop() {
-                                // Weight text length more heavily - this is the key signal
-                                let text_score = (frame.text_len as f32).sqrt();
-                                let mut final_score =
-                                    frame.score + text_score + frame.commas as f32;
+                            // Pop the frame for this element and evaluate it
+                            if let Some(element_frame) = context.element_stack.pop() {
+                                // Calculate final score for this element
+                                let final_score = element_frame.calculate_final_score();
 
-                                if frame.text_len > 0 {
-                                    let density =
-                                        frame.link_text_len as f32 / frame.text_len as f32;
-                                    if density > 0.5 {
-                                        final_score *= 1.0 - density;
-                                    }
+                                // Check if this is a viable candidate for main content
+                                let is_candidate = element_frame.is_viable_candidate()
+                                    && final_score > context.best_content_score;
+
+                                // Always bubble stats to parent (so parent elements can compete)
+                                if let Some(parent_frame) = context.element_stack.last_mut() {
+                                    parent_frame.text_len += element_frame.text_len;
+                                    parent_frame.link_text_len += element_frame.link_text_len;
+                                    parent_frame.comma_count += element_frame.comma_count;
+                                    parent_frame.append_text(&element_frame.accumulated_text);
                                 }
 
-                                // Check if this is the best candidate
-                                // Any element with enough quality text can compete
-                                let tag_is_candidate = matches!(
-                                    frame.tag,
-                                    Some(
-                                        TagType::Article
-                                            | TagType::Div
-                                            | TagType::P
-                                            | TagType::Other
-                                    )
-                                );
-
-                                // Minimum text length to filter out tiny navigation snippets
-                                let min_text_len = 100;
-                                let has_enough_text = frame.text_len >= min_text_len;
-
-                                // Check for garbage content like "a a a b b b c c c"
-                                // Real content has average word length > 2
-                                let word_count = frame.text.split_whitespace().count();
-                                let avg_word_len = if word_count > 0 {
-                                    frame.text.len() / word_count
-                                } else {
-                                    0
-                                };
-                                let has_real_words = avg_word_len > 2;
-
-                                let is_candidate = tag_is_candidate
-                                    && has_enough_text
-                                    && has_real_words
-                                    && final_score > c.best_score
-                                    && !frame.text.is_empty();
-
-                                // Always bubble stats and text to parent so parents can compete
-                                if let Some(parent) = c.stack.last_mut() {
-                                    // Bubble raw stats - parent calculates its own score
-                                    parent.text_len += frame.text_len;
-                                    parent.link_text_len += frame.link_text_len;
-                                    parent.commas += frame.commas;
-                                    parent.append_text(&frame.text);
-                                }
-
+                                // Update best candidate if this is better
                                 if is_candidate {
-                                    c.best_score = final_score;
-                                    c.best_text = Some(frame.text);
+                                    context.best_content_score = final_score;
+                                    context.best_content = Some(element_frame.accumulated_text);
                                 }
                             }
                             Ok(())
@@ -358,37 +418,40 @@ pub fn find_main_content(html: &[u8]) -> anyhow::Result<(String, Vec<String>, St
 
                     Ok(())
                 }),
-                text!("*", move |chunk| {
-                    let text = chunk.as_str();
+                text!("*", move |text_chunk| {
+                    let text = text_chunk.as_str();
                     if text.trim().is_empty() {
-                        return Ok(());
+                        return Ok(()); // Skip whitespace-only text
                     }
 
-                    let mut c = ctx_text.borrow_mut();
+                    let mut context = context_for_text.borrow_mut();
 
-                    // Capture title text
-                    if c.in_title {
-                        if !c.title.is_empty() {
-                            c.title.push(' ');
+                    // Special case: capture <title> text
+                    if context.currently_in_title {
+                        if !context.page_title.is_empty() {
+                            context.page_title.push(' ');
                         }
-                        c.title.push_str(text.trim());
+                        context.page_title.push_str(text.trim());
                         return Ok(());
                     }
 
-                    if c.skip_depth > 0 {
+                    // Skip text inside non-content containers
+                    if context.skip_depth > 0 {
                         return Ok(());
                     }
 
-                    if let Some(frame) = c.stack.last_mut() {
-                        let len = text.len() as u32;
-                        let commas = text.bytes().filter(|&b| b == b',').count() as u32;
+                    // Add text to current element frame
+                    if let Some(current_frame) = context.element_stack.last_mut() {
+                        let text_length = text.len() as u32;
+                        let comma_count = text.bytes().filter(|&b| b == b',').count() as u32;
 
-                        frame.text_len += len;
-                        frame.commas += commas;
-                        frame.append_text(text);
+                        current_frame.text_len += text_length;
+                        current_frame.comma_count += comma_count;
+                        current_frame.append_text(text);
 
-                        if let Some(TagType::A) = frame.tag {
-                            frame.link_text_len += len;
+                        // Track link text separately (for link density calculation)
+                        if matches!(current_frame.tag_type, Some(TagType::A)) {
+                            current_frame.link_text_len += text_length;
                         }
                     }
                     Ok(())
@@ -399,15 +462,21 @@ pub fn find_main_content(html: &[u8]) -> anyhow::Result<(String, Vec<String>, St
         |_: &[u8]| {},
     );
 
+    // Process the HTML
     rewriter.write(html)?;
     rewriter.end()?;
 
-    let final_ctx = Rc::into_inner(ctx)
+    // Extract final results
+    let final_context = Rc::into_inner(parsing_context)
         .expect("Rc should have single owner")
         .into_inner();
 
-    match final_ctx.best_text {
-        Some(text) => Ok((text, final_ctx.urls, final_ctx.title)),
+    match final_context.best_content {
+        Some(content_text) => Ok((
+            content_text,
+            final_context.extracted_urls,
+            final_context.page_title,
+        )),
         None => anyhow::bail!("No main content found"),
     }
 }
