@@ -96,8 +96,7 @@ impl CrawlTask {
         {
             return true;
         }
-        let url_str = self.target_url.to_string();
-        db.should_skip_url(&url_str, &queued_urls)
+        db.should_skip_url(self.target_url.as_str(), &queued_urls)
     }
     fn domain(&self) -> &str {
         let url_str = self.target_url.as_str();
@@ -322,13 +321,12 @@ async fn fetch_and_process_page(
     let html_body = response.text().await?;
     let (extracted_links, page_content, page_title) = extract_page_content(html_body)?;
 
-    let next_depth = crawl_depth + 1;
     let child_tasks = extracted_links
         .into_iter()
         .filter_map(|link| {
             let mut url = target_url.join(&link).ok()?;
             url.set_fragment(None);
-            (url.host_str() == target_url.host_str()).then_some(CrawlTask::new(url, next_depth)?)
+            (url.host_str() == target_url.host_str()).then_some(CrawlTask::new(url, crawl_depth+1)?)
         })
         .collect();
     Ok((
@@ -384,7 +382,7 @@ async fn main() -> Result<()> {
     let mut db = CrawlDb::new(search_index, expected_url_count)?;
 
     let (mut pages_crawled, mut pages_failed) = (0usize, 0usize);
-    let mut domains_in_progress: HashSet<String, ahash::RandomState> =
+    let mut domains_in_progress: HashSet<Box<str>, ahash::RandomState> =
         HashSet::with_hasher(ahash::RandomState::new());
     let mut queued_urls: HashSet<String, ahash::RandomState> =
         HashSet::with_hasher(ahash::RandomState::new());
@@ -405,7 +403,7 @@ async fn main() -> Result<()> {
             .saturating_sub(worker_pool.len());
         for task in task_queue
             .extract_if(.., |task| {
-                if !domains_in_progress.insert(task.domain().to_string()) {
+                if !domains_in_progress.insert(task.domain().into()) {
                     return false;
                 }
                 true
