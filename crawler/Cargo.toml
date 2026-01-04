@@ -16,5 +16,6 @@ bytes = "1.11.0"
 clap = { version = "4.0", features = ["derive"] }
 ahash = "0.8.12"
 unicode-normalization = "0.1.25"
+fastbloom = "0.14.0"
 [profile.release]
 debug = true # Adds debug symbols to the optimized binary

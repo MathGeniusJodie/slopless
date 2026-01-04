@@ -13,9 +13,7 @@ use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
 use tantivy::{doc, Index};
 use tokio::task::JoinSet;
 use url::Url;
-
-mod bloom;
-use bloom::BloomFilter;
+use fastbloom::BloomFilter;
 
 mod lol_readability;
 use lol_readability::find_main_content;
@@ -139,11 +137,9 @@ impl CrawlDb {
         let index_writer = search_index.index.writer(50_000_000)?;
 
         // Initialize Bloom filter: 8 bits per URL gives ~0.1% false positive rate
-        let seen_urls_bloom = BloomFilter::with_num_bits(
-            expected_url_count * 8,
-            ahash::RandomState::new(),
-            expected_url_count,
-        );
+        let seen_urls_bloom = BloomFilter::with_num_bits(expected_url_count * 8)
+            .hasher(ahash::RandomState::new())
+            .expected_items(expected_url_count);
         let uncommitted_urls = HashSet::with_hasher(ahash::RandomState::new());
 
         Ok(Self {
