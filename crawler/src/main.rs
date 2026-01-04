@@ -92,7 +92,6 @@ impl CrawlTask {
 struct SearchIndex {
     index: Index,
     url_field: tantivy::schema::Field,
-    url_hash_field: tantivy::schema::Field,
     title_field: tantivy::schema::Field,
     body_field: tantivy::schema::Field,
 }
@@ -101,7 +100,6 @@ struct CrawlDb {
     index: Index,
     index_writer: tantivy::IndexWriter,
     url_field: tantivy::schema::Field,
-    url_hash_field: tantivy::schema::Field,
     title_field: tantivy::schema::Field,
     body_field: tantivy::schema::Field,
     seen_urls: BloomFilter<ahash::RandomState>,
@@ -124,7 +122,6 @@ impl CrawlDb {
             index: search_index.index,
             index_writer,
             url_field: search_index.url_field,
-            url_hash_field: search_index.url_hash_field,
             title_field: search_index.title_field,
             body_field: search_index.body_field,
             seen_urls,
@@ -160,46 +157,25 @@ impl CrawlDb {
             self.bloom_positive_count += 1;
         }
 
-        let source_hash = self.seen_urls.source_hash(url);
-        let bit_pos_hash = self.seen_urls.bit_positions_hash(source_hash);
-
         // possible collision: must verify db
         use tantivy::collector::DocSetCollector;
         use tantivy::query::TermQuery;
 
-        // todo: maybe don't use url hash field and just have url
-        // todo: bench to see if slow
-        let term = tantivy::Term::from_field_u64(self.url_hash_field, bit_pos_hash);
+        let term = tantivy::Term::from_field_text(self.url_field, url);
         let query = TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
 
         let Ok(doc_addresses) = searcher.search(&query, &DocSetCollector) else {
             return false;
         };
 
-        // cannot be a false positive if there's only one document with this hash
-        if doc_addresses.len() == 1 {
-            return true;
-        }
-
-        // multiple documents with this hash - check actual URLs
-        for doc_address in doc_addresses {
-            if let Ok(doc) = searcher.doc::<tantivy::TantivyDocument>(doc_address) {
-                if let Some(stored_url) = doc.get_first(self.url_field).and_then(|v| v.as_str()) {
-                    if stored_url == url {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
+        !doc_addresses.is_empty()
     }
 
-    fn index_page(&mut self, page: IndexedPage, bit_pos_hash: u64) -> Result<()> {
+    fn index_page(&mut self, page: IndexedPage) -> Result<()> {
         self.uncommitted_urls.insert(page.page_url.clone());
 
         let doc = doc!(
             self.url_field => page.page_url,
-            self.url_hash_field => bit_pos_hash,
             self.title_field => page.page_title,
             self.body_field => page.page_content
         );
@@ -230,8 +206,7 @@ fn setup_search_index() -> Result<SearchIndex> {
         .set_index_option(IndexRecordOption::WithFreqsAndPositions);
     let body_field_options = TextOptions::default().set_indexing_options(body_field_indexing);
     let mut schema_builder = Schema::builder();
-    let url_field = schema_builder.add_text_field("url", STRING | STORED | FAST);
-    let url_hash_field = schema_builder.add_u64_field("url_hash", tantivy::schema::INDEXED | FAST);
+    let url_field = schema_builder.add_text_field("url", TEXT | STORED | FAST);
     let title_field = schema_builder.add_text_field("title", TEXT | STORED);
     let body_field = schema_builder.add_text_field("body", body_field_options);
     let schema = schema_builder.build();
@@ -251,7 +226,6 @@ fn setup_search_index() -> Result<SearchIndex> {
     Ok(SearchIndex {
         index,
         url_field,
-        url_hash_field,
         title_field,
         body_field,
     })
@@ -454,12 +428,10 @@ async fn main() -> Result<()> {
             };
             let url_str = task.target_url.to_string();
             queued_urls.remove(&url_str);
-            let source_hash = db.seen_urls.source_hash(&url_str);
-            let url_hash = db.seen_urls.bit_positions_hash(source_hash);
             domains_in_progress.insert(domain.clone());
             let crawler = Arc::clone(&crawler);
             worker_pool.spawn(async move {
-                (domain, url_hash, crawler.fetch_and_process_page(task).await)
+                (domain, crawler.fetch_and_process_page(task).await)
             });
         }
 
@@ -468,7 +440,7 @@ async fn main() -> Result<()> {
         }
 
         // Process completed task
-        let Some(Ok((domain, url_hash, crawl_result))) = worker_pool.join_next().await else {
+        let Some(Ok((domain, crawl_result))) = worker_pool.join_next().await else {
             continue;
         };
         domains_in_progress.remove(&domain);
@@ -501,7 +473,7 @@ async fn main() -> Result<()> {
 
         // Index the page if we got content
         if let Some(page) = page_data {
-            if let Err(e) = db.index_page(page, url_hash) {
+            if let Err(e) = db.index_page(page) {
                 eprintln!("Indexing error: {e:?}");
             }
         }
