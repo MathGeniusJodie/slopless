@@ -84,7 +84,7 @@ impl CrawlTask {
             return true;
         }
         let url_str = self.target_url.to_string();
-        db.should_skip_url(&url_str,&queued_urls)
+        db.should_skip_url(&url_str, &queued_urls)
     }
 }
 
@@ -233,33 +233,28 @@ fn setup_search_index() -> Result<SearchIndex> {
 
 fn pop_available_tasks(
     task_queue: &mut BTreeSet<CrawlTask>,
-    domains_in_progress: &HashSet<String, ahash::RandomState>,
+    domains_in_progress: &mut HashSet<String, ahash::RandomState>,
     max_tasks: usize,
 ) -> Vec<CrawlTask> {
     let mut result = Vec::with_capacity(max_tasks);
-    let mut domains_claimed: HashSet<&str, ahash::RandomState> =
-        HashSet::with_hasher(ahash::RandomState::new());
 
-    // Single scan: collect tasks for domains not in progress and not yet claimed this batch
-    let tasks_to_take: Vec<CrawlTask> = task_queue
-        .iter()
-        .filter_map(|task| {
-            let domain = task.target_url.host_str()?;
-            if !domains_in_progress.contains(domain) && !domains_claimed.contains(domain) {
-                domains_claimed.insert(domain);
-                Some(task.clone())
-            } else {
-                None
-            }
-        })
-        .take(max_tasks)
-        .collect();
-
-    for task in tasks_to_take {
-        if let Some(t) = task_queue.take(&task) {
-            result.push(t);
+    for task in task_queue.iter() {
+        if result.len() >= max_tasks {
+            break;
         }
+        let Some(domain) = task.target_url.host_str() else {
+            continue;
+        };
+        if !domains_in_progress.insert(domain.to_string()) {
+            continue;
+        }
+        result.push(task.clone());
     }
+
+    for task in &result {
+        task_queue.remove(task);
+    }
+
     result
 }
 
@@ -419,16 +414,15 @@ async fn main() -> Result<()> {
         let slots_available = cli_args
             .max_concurrent_requests
             .saturating_sub(worker_pool.len());
-        for task in pop_available_tasks(&mut task_queue, &domains_in_progress, slots_available) {
+        for task in pop_available_tasks(&mut task_queue, &mut domains_in_progress, slots_available)
+        {
             let Some(domain) = task.target_url.host_str().map(String::from) else {
                 continue;
             };
             queued_urls.remove(task.target_url.as_str());
             domains_in_progress.insert(domain.clone());
             let crawler = Arc::clone(&crawler);
-            worker_pool.spawn(async move {
-                (domain, crawler.fetch_and_process_page(task).await)
-            });
+            worker_pool.spawn(async move { (domain, crawler.fetch_and_process_page(task).await) });
         }
 
         if worker_pool.is_empty() && task_queue.is_empty() {
@@ -451,7 +445,7 @@ async fn main() -> Result<()> {
                 continue;
             }
         };
-        
+
         for task in discovered_links {
             if !task.should_skip(
                 cli_args.max_crawl_depth,
