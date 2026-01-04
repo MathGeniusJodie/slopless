@@ -231,33 +231,6 @@ fn setup_search_index() -> Result<SearchIndex> {
     })
 }
 
-fn pop_available_tasks(
-    task_queue: &mut BTreeSet<CrawlTask>,
-    domains_in_progress: &mut HashSet<String, ahash::RandomState>,
-    max_tasks: usize,
-) -> Vec<CrawlTask> {
-    let mut result = Vec::with_capacity(max_tasks);
-
-    for task in task_queue.iter() {
-        if result.len() >= max_tasks {
-            break;
-        }
-        let Some(domain) = task.target_url.host_str() else {
-            continue;
-        };
-        if !domains_in_progress.insert(domain.to_string()) {
-            continue;
-        }
-        result.push(task.clone());
-    }
-
-    for task in &result {
-        task_queue.remove(task);
-    }
-
-    result
-}
-
 fn extract_page_content(html_body: String) -> Result<(Vec<String>, String, String)> {
     let mut extracted_links = Vec::new();
     let mut page_title = String::new();
@@ -293,11 +266,12 @@ fn extract_page_content(html_body: String) -> Result<(Vec<String>, String, Strin
     Ok((extracted_links, normalized_text, page_title))
 }
 
-impl WebCrawler {
+impl <'a>WebCrawler {
     async fn fetch_and_process_page(
-        &self,
+        &'a self,
         task: CrawlTask,
-    ) -> Result<(Vec<CrawlTask>, Option<IndexedPage>)> {
+        domain: String,
+    ) -> Result<(String,Vec<CrawlTask>, Option<IndexedPage>)> {
         let CrawlTask {
             target_url,
             crawl_depth,
@@ -306,7 +280,7 @@ impl WebCrawler {
 
         let response = self.http_client.get(target_url.clone()).send().await?;
         if !response.status().is_success() {
-            return Ok((vec![], None));
+            return Ok((domain,vec![], None));
         }
 
         let content_type = response
@@ -316,7 +290,7 @@ impl WebCrawler {
             .unwrap_or("");
 
         if !content_type.starts_with("text/html") {
-            return Ok((vec![], None));
+            return Ok((domain,vec![], None));
         }
         let html_body = response.text().await?;
         let (extracted_links, page_content, page_title) = extract_page_content(html_body)?;
@@ -336,6 +310,7 @@ impl WebCrawler {
             })
             .collect();
         Ok((
+            domain,
             child_tasks,
             Some(IndexedPage {
                 page_url: target_url.to_string(),
@@ -391,7 +366,7 @@ async fn main() -> Result<()> {
     let mut db = CrawlDb::new(search_index, expected_url_count)?;
 
     let (mut pages_crawled, mut pages_failed) = (0usize, 0usize);
-    let mut domains_in_progress = HashSet::with_hasher(ahash::RandomState::new());
+    let mut domains_in_progress: HashSet<String, ahash::RandomState> = HashSet::with_hasher(ahash::RandomState::new());
     let mut queued_urls: HashSet<String, ahash::RandomState> =
         HashSet::with_hasher(ahash::RandomState::new());
     let mut task_queue: BTreeSet<CrawlTask> = seed_urls
@@ -410,19 +385,25 @@ async fn main() -> Result<()> {
     let mut last_status_report = std::time::Instant::now();
 
     loop {
-        // Spawn new tasks up to concurrency limit
-        let slots_available = cli_args
-            .max_concurrent_requests
-            .saturating_sub(worker_pool.len());
-        for task in pop_available_tasks(&mut task_queue, &mut domains_in_progress, slots_available)
-        {
-            let Some(domain) = task.target_url.host_str().map(String::from) else {
+        let to_spawn = cli_args.max_concurrent_requests.saturating_sub(worker_pool.len());
+        for task in task_queue.extract_if(..,|task| {
+            let Some(domain) = task.target_url.host_str() else {
+                return true; // extract invalid URLs to remove them
+            };
+            if !domains_in_progress.insert(domain.to_string()){
+                return false;
+            }
+            true
+        }).take(to_spawn){
+            let Some(domain) = task.target_url.host_str() else {
                 continue;
             };
+            let domain = domain.to_string();
             queued_urls.remove(task.target_url.as_str());
-            domains_in_progress.insert(domain.clone());
             let crawler = Arc::clone(&crawler);
-            worker_pool.spawn(async move { (domain, crawler.fetch_and_process_page(task).await) });
+            worker_pool.spawn(async move {
+                crawler.fetch_and_process_page(task,domain).await
+            });
         }
 
         if worker_pool.is_empty() && task_queue.is_empty() {
@@ -430,21 +411,21 @@ async fn main() -> Result<()> {
         }
 
         // Process completed task
-        let Some(Ok((domain, crawl_result))) = worker_pool.join_next().await else {
+        let Some(Ok(crawl_result)) = worker_pool.join_next().await else {
             continue;
         };
-        domains_in_progress.remove(&domain);
 
-        let (discovered_links, page_data) = match crawl_result {
+        let (domain, discovered_links, page_data) = match crawl_result {
             Ok(result) => result,
             Err(e) => {
                 pages_failed += 1;
                 if cli_args.verbose_logging {
-                    eprintln!("Error crawling {domain}: {e:?}");
+                    eprintln!("Error crawling :( {e:?}");
                 }
                 continue;
             }
         };
+        domains_in_progress.remove(&domain);
 
         for task in discovered_links {
             if !task.should_skip(
