@@ -698,13 +698,13 @@ impl CrawlTaskBuckets {
         let key = Self::hash_url(&url);
         if let Some(existing) = self.url_map.get(&key) {
             if existing != &url {
-                // Collision: store in collisions
+                // Hash collision with different URL: store in collisions list
                 self.collisions.push(CrawlTask::new(url, depth));
-                return;
             }
-        } else {
-            self.url_map.insert(key, url);
+            // Same URL already exists - skip (no duplicates)
+            return;
         }
+        self.url_map.insert(key, url);
         self.buckets[depth].push(key);
     }
 
@@ -728,28 +728,30 @@ impl CrawlTaskBuckets {
             let removed = self.collisions.swap_remove(i);
             result.push(removed);
         }
-        // Then buckets in order
-        for depth in 0..self.buckets.len() {
+        // Then buckets from deepest to shallowest (deeper pages spawn less work)
+        for depth in (0..self.buckets.len()).rev() {
             let mut j = 0;
             while j < self.buckets[depth].len() && result.len() < max_count {
                 let key = self.buckets[depth][j];
-                if let Some(url) = self.url_map.get(&key) {
-                    // End immutable borrow before mutable borrow
-                    if !filter(url, depth) {
+                let Some(url) = self.url_map.get(&key) else {
+                    // Orphan key (no URL in map) - remove stale bucket entry
+                    self.buckets[depth].swap_remove(j);
+                    continue;
+                };
+                if !filter(url, depth) {
+                    j += 1;
+                    continue;
+                }
+                let owned_url = match self.url_map.remove(&key) {
+                    Some(u) => u,
+                    None => {
                         j += 1;
                         continue;
                     }
-                    let owned_url = match self.url_map.remove(&key) {
-                        Some(u) => u,
-                        None => {
-                            j += 1;
-                            continue;
-                        }
-                    };
-                    let task = CrawlTask::new(owned_url, depth);
-                    self.buckets[depth].swap_remove(j);
-                    result.push(task);
-                }
+                };
+                let task = CrawlTask::new(owned_url, depth);
+                self.buckets[depth].swap_remove(j);
+                result.push(task);
             }
             if result.len() >= max_count {
                 break;
@@ -776,5 +778,60 @@ impl CrawlTaskBuckets {
         let mut hasher = ahash::AHasher::default();
         url.as_str().hash(&mut hasher);
         hasher.finish() as usize
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_crawl_buckets_no_duplicate_on_reinsert() {
+        let mut buckets = CrawlTaskBuckets::new(5);
+        let url = Url::parse("https://example.com/page").unwrap();
+
+        buckets.insert(url.clone(), 0);
+        buckets.insert(url.clone(), 0); // Insert same URL again
+
+        // Extract all tasks - should only get 1
+        let tasks = buckets.extract_if(|_, _| true, 10);
+        assert_eq!(
+            tasks.len(),
+            1,
+            "Duplicate URL should not be extracted twice"
+        );
+    }
+
+    #[test]
+    fn test_crawl_buckets_contains() {
+        let mut buckets = CrawlTaskBuckets::new(5);
+        let url = Url::parse("https://example.com/page").unwrap();
+
+        assert!(!buckets.contains(&url));
+        buckets.insert(url.clone(), 2);
+        assert!(buckets.contains(&url));
+    }
+
+    #[test]
+    fn test_crawl_buckets_extract_respects_depth_order() {
+        let mut buckets = CrawlTaskBuckets::new(5);
+
+        // Insert URLs at different depths
+        let shallow = Url::parse("https://example.com/shallow").unwrap();
+        let deep = Url::parse("https://example.com/deep").unwrap();
+
+        buckets.insert(shallow.clone(), 1);
+        buckets.insert(deep.clone(), 4);
+
+        // Extract all - should get deeper pages first (per comment at line 55)
+        let tasks = buckets.extract_if(|_, _| true, 10);
+
+        assert_eq!(tasks.len(), 2);
+        // First task should be from deeper depth (4)
+        assert_eq!(
+            tasks[0].crawl_depth, 4,
+            "Deeper pages should be extracted first"
+        );
+        assert_eq!(tasks[1].crawl_depth, 1);
     }
 }
