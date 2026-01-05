@@ -55,7 +55,8 @@ impl CrawlTask {
             crawl_depth,
         }
     }
-    /// Check if this task should be skipped based on depth, exclusions, robots.txt, and deduplication
+    /// Check if this task should be skipped based on depth, exclusions, robots.txt, and deduplication.
+    /// Note: Updates bloom filter statistics as a side effect.
     fn should_skip(
         &self,
         max_depth: usize,
@@ -108,7 +109,7 @@ struct CrawlDb {
 
     // Metrics for Bloom filter effectiveness
     bloom_saved_lookups: usize,
-    bloom_possible_collisions: usize,
+    bloom_positive_checks: usize,
 }
 
 impl CrawlDb {
@@ -163,7 +164,7 @@ impl CrawlDb {
             seen_urls_bloom,
             uncommitted_urls: HashSet::with_hasher(ahash::RandomState::new()),
             bloom_saved_lookups: 0,
-            bloom_possible_collisions: 0,
+            bloom_positive_checks: 0,
         };
 
         let reader = db.index.reader()?;
@@ -174,20 +175,21 @@ impl CrawlDb {
             let max_doc = segment_reader.max_doc();
 
             println!("  Segment with {} docs", segment_reader.num_docs());
+            let store_reader = segment_reader.get_store_reader(1_000)?;
             for doc_id in 0..max_doc {
                 // Skip deleted docs
                 if segment_reader.is_deleted(doc_id) {
                     continue;
                 }
 
-                let doc: TantivyDocument = segment_reader.get_store_reader(1_000)?.get(doc_id)?;
+                let doc: TantivyDocument = store_reader.get(doc_id)?;
                 if let Some(url) = doc.get_first(url_field).and_then(|v| v.as_str()) {
                     db.seen_urls_bloom.insert(url);
                 }
             }
         }
         println!(
-            "Bloom filter items: {}",
+            "Bloom filter bits set: {}",
             db.seen_urls_bloom
                 .as_slice()
                 .iter()
@@ -218,7 +220,7 @@ impl CrawlDb {
         }
 
         // Bloom filter says we might have seen it
-        self.bloom_possible_collisions += 1;
+        self.bloom_positive_checks += 1;
 
         // Layer 4: Query Tantivy index to confirm (handles Bloom false positives)
         self.is_url_in_index(url.as_str())
@@ -417,7 +419,7 @@ fn load_seed_urls(file_path: &str) -> Result<Vec<Url>> {
                 }
             };
 
-        if let Some(_host) = parsed_url.host_str() {
+        if parsed_url.host_str().is_some() {
             seed_urls.push(parsed_url);
         }
     }
@@ -438,7 +440,7 @@ fn print_crawl_status(
         "Pages: {pages_crawled}, Sitemaps: {sitemaps_processed}, Failed: {pages_failed}, Queue: {task_queue_size}, Active: {active_domains_count}"
     );
 
-    let bloom_total = db.bloom_saved_lookups + db.bloom_possible_collisions;
+    let bloom_total = db.bloom_saved_lookups + db.bloom_positive_checks;
     let bloom_efficiency = if bloom_total > 0 {
         (db.bloom_saved_lookups as f64 / bloom_total as f64) * 100.0
     } else {
@@ -639,7 +641,7 @@ async fn main() -> Result<()> {
 struct CrawlTaskBuckets {
     buckets: Vec<Vec<usize>>, // buckets by depth, each holds hash keys
     url_map: HashMap<usize, Url, ahash::RandomState>, // map from hash key to Url
-    collisions: Vec<CrawlTask>, // (Url, depth) for hash collisions
+    collisions: Vec<CrawlTask>, // Tasks with hash collisions in url_map
 }
 
 impl CrawlTaskBuckets {

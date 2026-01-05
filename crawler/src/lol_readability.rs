@@ -201,10 +201,7 @@ impl ElementFrame {
         };
         let has_real_words = avg_word_length > 2;
 
-        // Must have actual content
-        let has_content = !self.accumulated_text.is_empty();
-
-        is_content_tag && has_enough_text && has_real_words && has_content
+        is_content_tag && has_enough_text && has_real_words
     }
 }
 

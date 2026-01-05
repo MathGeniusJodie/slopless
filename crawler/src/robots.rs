@@ -47,18 +47,13 @@ pub fn parse_robots(content: &str) -> (Option<Robot>, Vec<String>) {
     (robot, sitemaps)
 }
 
-/// Check if a URL looks like a sitemap
+/// Check if a URL looks like a sitemap (any .xml or .xml.gz file)
 pub fn is_sitemap_url(url: &Url) -> bool {
-    let path = url.path().to_lowercase();
-    // Check for sitemap file extensions
-    if path.ends_with(".xml") || path.ends_with(".xml.gz") {
-        return true;
-    }
-    // Check for "sitemap" in filename (after last slash), not just anywhere in path
-    if let Some(filename) = path.rsplit('/').next() {
-        return filename.contains("sitemap");
-    }
-    false
+    let path = url.path();
+    let len = path.len();
+    // Case-insensitive check without allocation
+    (len >= 4 && path[len - 4..].eq_ignore_ascii_case(".xml"))
+        || (len >= 7 && path[len - 7..].eq_ignore_ascii_case(".xml.gz"))
 }
 
 /// Parse sitemap content and return (page_urls, nested_sitemap_urls)
