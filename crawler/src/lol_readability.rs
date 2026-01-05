@@ -8,6 +8,9 @@ use std::sync::LazyLock;
 // Static Configuration (Compiled Once)
 // -----------------------------------------------------------------------------
 
+/// Maximum nesting depth for element tracking (prevents stack exhaustion from malformed HTML)
+const MAX_ELEMENT_STACK_DEPTH: usize = 256;
+
 // Regex patterns for scoring element class/id attributes
 
 /// Patterns that are very unlikely to be main content (heavily penalize)
@@ -353,6 +356,9 @@ pub fn find_main_content(html: &[u8]) -> anyhow::Result<(String, Vec<String>, St
                             (false, true)
                         } else if is_leaf_skip || is_void {
                             // Non-content leaf/void element: ignore
+                            (false, false)
+                        } else if context.element_stack.len() >= MAX_ELEMENT_STACK_DEPTH {
+                            // Stack depth limit reached: skip deeply nested elements
                             (false, false)
                         } else {
                             // Normal content element: create frame and push to stack

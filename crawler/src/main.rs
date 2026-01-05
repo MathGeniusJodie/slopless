@@ -16,7 +16,9 @@ use url::Url;
 use fastbloom::BloomFilter;
 
 mod lol_readability;
+mod robots;
 use lol_readability::find_main_content;
+use robots::{is_robots_url, is_sitemap_url, parse_robots, parse_sitemap, RobotsCache};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -78,13 +80,14 @@ impl CrawlTask {
             crawl_depth,
         })
     }
-    /// Check if this task should be skipped based on depth, exclusions, and deduplication
+    /// Check if this task should be skipped based on depth, exclusions, robots.txt, and deduplication
     fn should_skip(
         &self,
         max_depth: usize,
         excluded_prefixes: &[String],
         db: &mut CrawlDb,
         pending_task_urls: &HashSet<Arc<str>, ahash::RandomState>,
+        robots_cache: &RobotsCache,
     ) -> bool {
         // Too deep?
         if self.crawl_depth > max_depth {
@@ -96,6 +99,11 @@ impl CrawlTask {
             .iter()
             .any(|prefix| self.target_url.as_str().starts_with(prefix))
         {
+            return true;
+        }
+
+        // Blocked by robots.txt?
+        if !robots_cache.is_url_allowed(&self.target_url, &self.domain) {
             return true;
         }
 
@@ -248,69 +256,113 @@ impl CrawlDb {
 
 }
 
-/// Fetch a URL and extract content + links
-async fn fetch_and_process_page(
-    http_client: &Client,
-    task: &CrawlTask,
-) -> Result<(Vec<CrawlTask>, IndexedPage)> {
-    let CrawlTask {
-        target_url,
-        crawl_depth,
-        ..
-    } = task;
+/// Result of fetching a URL (without child tasks, which are returned separately)
+enum FetchResult {
+    /// HTML page to index
+    Page(IndexedPage),
+    /// Sitemap (no content to index)
+    Sitemap,
+    /// robots.txt with parsed rules
+    Robots(Option<texting_robots::Robot>),
+}
 
-    // Fetch the page
+/// Fetch a URL and return (child_tasks, result)
+async fn fetch_and_process_url(http_client: &Client, task: &CrawlTask) -> Result<(Vec<CrawlTask>, FetchResult)> {
+    let CrawlTask { target_url, crawl_depth, domain, .. } = task;
+
     let response = http_client.get(target_url.clone()).send().await?;
-    if !response.status().is_success() {
-        return Err(anyhow::anyhow!(
-            "Failed to fetch URL: {} with status: {}",
-            target_url,
-            response.status()
-        ));
+
+    // Handle robots.txt (even if 404, we return empty rules + homepage)
+    if is_robots_url(target_url) {
+        let content = if response.status().is_success() {
+            response.text().await.unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let (robot, sitemap_urls) = parse_robots(&content);
+
+        let mut child_tasks = Vec::new();
+
+        // Add sitemap URLs
+        for url_str in sitemap_urls {
+            let Ok(url) = Url::parse(&url_str) else { continue };
+            if url.host_str() != Some(&**domain) { continue }
+            let Some(t) = CrawlTask::new(url, 0) else { continue };
+            child_tasks.push(t);
+        }
+
+        // Always add homepage
+        if let Ok(homepage) = Url::parse(&format!("https://{}/", domain)) {
+            if let Some(t) = CrawlTask::new(homepage, 0) {
+                child_tasks.push(t);
+            }
+        }
+
+        return Ok((child_tasks, FetchResult::Robots(robot)));
     }
 
-    // Check content type (skip non-HTML)
-    let content_type = response
-        .headers()
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!("HTTP {}", response.status()));
+    }
+
+    let content_type = response.headers()
         .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|header_value| header_value.to_str().ok())
+        .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    if !content_type.starts_with("text/html") {
-        return Err(anyhow::anyhow!(
-            "Non-HTML content type: {} for URL: {}",
-            content_type,
-            target_url
-        ));
+    // Handle sitemaps
+    if is_sitemap_url(target_url) || content_type.contains("xml") {
+        let bytes = response.bytes().await?;
+        let (page_urls, sitemap_urls) = parse_sitemap(&bytes);
+
+        let mut child_tasks = Vec::with_capacity(page_urls.len() + sitemap_urls.len());
+
+        // Add page URLs at current depth
+        for url_str in page_urls {
+            let Ok(url) = Url::parse(&url_str) else { continue };
+            if url.host_str() != target_url.host_str() { continue }
+            let Some(t) = CrawlTask::new(url, *crawl_depth) else { continue };
+            child_tasks.push(t);
+        }
+
+        // Add nested sitemaps at depth + 1
+        for url_str in sitemap_urls {
+            let Ok(url) = Url::parse(&url_str) else { continue };
+            if url.host_str() != target_url.host_str() { continue }
+            let Some(t) = CrawlTask::new(url, crawl_depth + 1) else { continue };
+            child_tasks.push(t);
+        }
+
+        return Ok((child_tasks, FetchResult::Sitemap));
     }
 
-    // Extract content and links
+    // Handle HTML pages
+    if !content_type.starts_with("text/html") {
+        return Err(anyhow::anyhow!("Non-HTML content type: {}", content_type));
+    }
+
     let html_body = response.text().await?;
     let (readable_text, extracted_links, page_title) = find_main_content(html_body.as_bytes())?;
     use unicode_normalization::UnicodeNormalization;
     let page_content = readable_text.nfkc().collect::<String>();
 
-    // Convert extracted links to crawl tasks (same-domain only, one level deeper)
     let child_tasks = extracted_links
         .into_iter()
         .filter_map(|link| {
             let mut url = target_url.join(&link).ok()?;
-            url.set_fragment(None); // Remove #anchors
-
-            // Only crawl links on the same domain
+            url.set_fragment(None);
             (url.host_str() == target_url.host_str())
                 .then_some(CrawlTask::new(url, crawl_depth + 1)?)
         })
         .collect();
 
-    Ok((
-        child_tasks,
-        IndexedPage {
-            page_url: target_url.to_string(),
-            page_content,
-            page_title,
-        },
-    ))
+    let page = IndexedPage {
+        page_url: target_url.to_string(),
+        page_content,
+        page_title,
+    };
+
+    Ok((child_tasks, FetchResult::Page(page)))
 }
 
 /// Load domain list from file and convert to seed URLs
@@ -352,13 +404,14 @@ fn load_seed_urls(file_path: &str) -> Result<Vec<Url>> {
 /// Print crawl status and commit index
 fn report_status_and_commit(
     pages_crawled: usize,
+    sitemaps_processed: usize,
     pages_failed: usize,
     task_queue_size: usize,
     active_domains_count: usize,
     db: &mut CrawlDb,
 ) -> Result<()> {
     println!(
-        "Crawled: {pages_crawled}, Failed: {pages_failed}, Queue: {task_queue_size}, Active: {active_domains_count}"
+        "Pages: {pages_crawled}, Sitemaps: {sitemaps_processed}, Failed: {pages_failed}, Queue: {task_queue_size}, Active: {active_domains_count}"
     );
 
     let bloom_total = db.bloom_saved_lookups + db.bloom_possible_collisions;
@@ -396,7 +449,7 @@ async fn main() -> Result<()> {
     let mut db = CrawlDb::new(expected_url_count)?;
 
     // Initialize crawl state
-    let (mut pages_crawled, mut pages_failed) = (0usize, 0usize);
+    let (mut pages_crawled, mut sitemaps_processed, mut pages_failed) = (0usize, 0usize, 0usize);
 
     // Track which domains currently have active requests (one request per domain at a time)
     let mut active_request_domains: HashSet<Arc<str>, ahash::RandomState> =
@@ -404,6 +457,11 @@ async fn main() -> Result<()> {
 
     // Track URLs that are in the task queue but not yet crawled
     let mut pending_task_urls: HashSet<Arc<str>, ahash::RandomState> =
+        HashSet::with_hasher(ahash::RandomState::new());
+
+    // Robots.txt cache and tracking for initialized domains
+    let mut robots_cache = RobotsCache::new();
+    let mut initialized_domains: HashSet<Arc<str>, ahash::RandomState> =
         HashSet::with_hasher(ahash::RandomState::new());
 
     // Priority queue: deeper tasks first (BTreeSet with custom Ord)
@@ -427,20 +485,35 @@ async fn main() -> Result<()> {
             .saturating_sub(worker_pool.len());
 
         // Extract tasks from queue, ensuring only one request per domain at a time
-        for task in task_queue
+        let tasks_to_spawn: Vec<_> = task_queue
             .extract_if(.., |task| {
                 // Try to mark this domain as in-progress
                 // If it's already in progress, leave task in queue
                 active_request_domains.insert(task.domain.clone())
             })
             .take(available_worker_slots)
-        {
+            .collect();
+
+        for task in tasks_to_spawn {
+            // Initialize domain: add robots.txt as a task (will be fetched first due to domain lock)
+            if !initialized_domains.contains(&task.domain) {
+                initialized_domains.insert(task.domain.clone());
+
+                // Add robots.txt task for this domain
+                let robots_url = Url::parse(&format!("https://{}/robots.txt", task.domain)).unwrap();
+                if let Some(robots_task) = CrawlTask::new(robots_url, 0) {
+                    db.seen_urls_bloom.insert(robots_task.target_url.as_str());
+                    pending_task_urls.insert(robots_task.target_url.as_str().into());
+                    task_queue.insert(robots_task);
+                }
+            }
+
             // Remove from pending set since we're about to crawl it
             pending_task_urls.remove(task.target_url.as_str());
 
             let http_client = http_client.clone();
             worker_pool.spawn(async move {
-                let result = fetch_and_process_page(&http_client, &task).await;
+                let result = fetch_and_process_url(&http_client, &task).await;
                 (result, task)
             });
         }
@@ -462,8 +535,8 @@ async fn main() -> Result<()> {
         active_request_domains.remove(&completed_task.domain);
 
         // Handle fetch result
-        let (discovered_child_tasks, page_data) = match fetch_result {
-            Ok(result) => result,
+        let (child_tasks, result) = match fetch_result {
+            Ok(r) => r,
             Err(e) => {
                 if cli_args.verbose_logging {
                     eprintln!("Error fetching {}: {:?}", completed_task.target_url, e);
@@ -473,35 +546,57 @@ async fn main() -> Result<()> {
             }
         };
 
-        // Add discovered links to queue (after filtering)
-        for child_task in discovered_child_tasks {
+        // Add child tasks to queue (unified for all result types)
+        for child_task in child_tasks {
             if !child_task.should_skip(
                 cli_args.max_crawl_depth,
                 &cli_args.excluded_url_prefixes,
                 &mut db,
                 &pending_task_urls,
+                &robots_cache,
             ) {
-                let url_str = child_task.target_url.as_str();
-                db.seen_urls_bloom.insert(url_str);
-                pending_task_urls.insert(url_str.into());
+                db.seen_urls_bloom.insert(child_task.target_url.as_str());
+                pending_task_urls.insert(child_task.target_url.as_str().into());
                 task_queue.insert(child_task);
             }
         }
 
-        // Index the page
-        let _ = db.index_page(page_data);
-        pages_crawled += 1;
+        // Handle result-specific logic
+        match result {
+            FetchResult::Robots(robot) => {
+                if let Some(r) = robot {
+                    robots_cache.insert(completed_task.domain.clone(), r);
+                }
+            }
+            FetchResult::Sitemap => {
+                sitemaps_processed += 1;
+            }
+            FetchResult::Page(page) => {
+                match db.index_page(page) {
+                    Ok(()) => pages_crawled += 1,
+                    Err(e) => {
+                        if cli_args.verbose_logging {
+                            eprintln!("Error indexing {}: {:?}", completed_task.target_url, e);
+                        }
+                        pages_failed += 1;
+                    }
+                }
+            }
+        }
 
         // Periodic status reporting and commit
         if last_status_report.elapsed().as_secs() >= 5 {
-            report_status_and_commit(
+            if let Err(e) = report_status_and_commit(
                 pages_crawled,
+                sitemaps_processed,
                 pages_failed,
                 task_queue.len(),
                 active_request_domains.len(),
                 &mut db,
-            )
-            .expect("Failed to commit index");
+            ) {
+                eprintln!("Warning: Failed to commit index: {:?}", e);
+                // Continue crawling - uncommitted data will be retried on next commit
+            }
             last_status_report = std::time::Instant::now();
         }
     }
