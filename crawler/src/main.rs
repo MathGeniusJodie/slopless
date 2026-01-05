@@ -11,7 +11,7 @@ use tantivy::schema::{
     IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, FAST, STORED, TEXT,
 };
 use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
-use tantivy::{doc, Document, Index, TantivyDocument};
+use tantivy::{doc, Index, TantivyDocument};
 use tokio::task::JoinSet;
 use url::Url;
 
@@ -38,7 +38,6 @@ struct Args {
 
 /// A page that has been fetched and is ready to be indexed
 struct IndexedPage {
-    //page_url: Url,
     page_title: String,
     page_content: String,
 }
@@ -110,7 +109,7 @@ impl CrawlTask {
     }
 }
 
-/// Database wrapping Tantivy index with URL deduplication via Bloom filter
+/// Manages Tantivy search index and URL deduplication via Bloom filter
 struct CrawlDb {
     index: Index,
     index_writer: tantivy::IndexWriter,
@@ -402,7 +401,6 @@ async fn fetch_and_process_url(
         .collect();
 
     let page = IndexedPage {
-        //page_url: target_url.clone(),
         page_content,
         page_title,
     };
@@ -446,15 +444,15 @@ fn load_seed_urls(file_path: &str) -> Result<Vec<Url>> {
     Ok(seed_urls)
 }
 
-/// Print crawl status and commit index
-fn report_status_and_commit(
+/// Print crawl progress statistics
+fn print_crawl_status(
     pages_crawled: usize,
     sitemaps_processed: usize,
     pages_failed: usize,
     task_queue_size: usize,
     active_domains_count: usize,
-    db: &mut CrawlDb,
-) -> Result<()> {
+    db: &CrawlDb,
+) {
     println!(
         "Pages: {pages_crawled}, Sitemaps: {sitemaps_processed}, Failed: {pages_failed}, Queue: {task_queue_size}, Active: {active_domains_count}"
     );
@@ -471,14 +469,6 @@ fn report_status_and_commit(
         db.uncommitted_urls.len(),
         bloom_efficiency
     );
-
-    db.commit()?;
-
-    // get number of docs in index
-    let num_docs = db.index.reader()?.searcher().num_docs();
-    println!("  Total indexed documents: {}", num_docs);
-
-    Ok(())
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 20)]
@@ -636,16 +626,22 @@ async fn main() -> Result<()> {
 
         // Periodic status reporting and commit
         if last_status_report.elapsed().as_secs() >= 5 {
-            if let Err(e) = report_status_and_commit(
+            print_crawl_status(
                 pages_crawled,
                 sitemaps_processed,
                 pages_failed,
                 crawl_buckets.len(),
                 active_request_domains.len(),
-                &mut db,
-            ) {
+                &db,
+            );
+            if let Err(e) = db.commit() {
                 eprintln!("Warning: Failed to commit index: {:?}", e);
                 // Continue crawling - uncommitted data will be retried on next commit
+            } else if let Ok(reader) = db.index.reader() {
+                println!(
+                    "  Total indexed documents: {}",
+                    reader.searcher().num_docs()
+                );
             }
             last_status_report = std::time::Instant::now();
         }
