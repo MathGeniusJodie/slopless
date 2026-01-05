@@ -11,7 +11,9 @@ pub struct RobotsCache {
 
 impl RobotsCache {
     pub fn new() -> Self {
-        Self { cache: HashMap::with_hasher(ahash::RandomState::new()) }
+        Self {
+            cache: HashMap::with_hasher(ahash::RandomState::new()),
+        }
     }
 
     /// Insert parsed robots.txt rules for a domain
@@ -20,8 +22,10 @@ impl RobotsCache {
     }
 
     /// Check if a URL is allowed (returns true if no rules cached yet)
-    pub fn is_url_allowed(&self, url: &Url, domain: &Arc<str>) -> bool {
-        self.cache.get(domain).map_or(true, |r| r.allowed(url.path()))
+    pub fn is_url_allowed(&self, url: &Url, domain: &str) -> bool {
+        self.cache
+            .get(domain)
+            .map_or(true, |r| r.allowed(url.path()))
     }
 }
 
@@ -33,7 +37,8 @@ pub fn is_robots_url(url: &Url) -> bool {
 /// Parse robots.txt content, returns (Robot, sitemap_urls)
 pub fn parse_robots(content: &str) -> (Option<Robot>, Vec<String>) {
     let robot = Robot::new("Mozilla", content.as_bytes()).ok();
-    let sitemaps: Vec<String> = robot.as_ref()
+    let sitemaps: Vec<String> = robot
+        .as_ref()
         .map(|r| r.sitemaps.iter().map(|s| s.to_string()).collect())
         .unwrap_or_default();
     (robot, sitemaps)
@@ -96,7 +101,8 @@ mod tests {
 
     #[test]
     fn test_parse_robots_extracts_sitemaps() {
-        let content = "User-agent: *\nDisallow: /private/\nSitemap: https://example.com/sitemap.xml\n";
+        let content =
+            "User-agent: *\nDisallow: /private/\nSitemap: https://example.com/sitemap.xml\n";
         let (robot, sitemaps) = parse_robots(content);
         assert!(robot.is_some());
         assert_eq!(sitemaps, vec!["https://example.com/sitemap.xml"]);

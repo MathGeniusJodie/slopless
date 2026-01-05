@@ -1,19 +1,19 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 
+use fastbloom::BloomFilter;
 use reqwest::Client;
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fs::read_to_string;
 use std::sync::Arc;
 use tantivy::schema::{
-    IndexRecordOption, Schema, TextFieldIndexing, TextOptions, FAST, STORED, TEXT,
+    FAST, IndexRecordOption, STORED, Schema, TEXT, TextFieldIndexing, TextOptions, Value
 };
 use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
-use tantivy::{doc, Index};
+use tantivy::{Document, Index, TantivyDocument, doc};
 use tokio::task::JoinSet;
 use url::Url;
-use fastbloom::BloomFilter;
 
 mod lol_readability;
 mod robots;
@@ -38,7 +38,7 @@ struct Args {
 
 /// A page that has been fetched and is ready to be indexed
 struct IndexedPage {
-    page_url: String,
+    //page_url: Url,
     page_title: String,
     page_content: String,
 }
@@ -48,7 +48,6 @@ struct IndexedPage {
 struct CrawlTask {
     crawl_depth: usize,
     target_url: Url,
-    domain: Arc<str>, // Cached domain string for efficient grouping
 }
 
 impl Ord for CrawlTask {
@@ -69,16 +68,11 @@ impl PartialOrd for CrawlTask {
 }
 
 impl CrawlTask {
-    fn new(target_url: Url, crawl_depth: usize) -> Option<Self> {
-        let host = match target_url.host_str() {
-            Some(h) => h,
-            None => return None,
-        };
-        Some(Self {
-            domain: Arc::from(host),
+    fn new(target_url: Url, crawl_depth: usize) -> Self {
+        Self {
             target_url,
             crawl_depth,
-        })
+        }
     }
     /// Check if this task should be skipped based on depth, exclusions, robots.txt, and deduplication
     fn should_skip(
@@ -86,7 +80,7 @@ impl CrawlTask {
         max_depth: usize,
         excluded_prefixes: &[String],
         db: &mut CrawlDb,
-        pending_task_urls: &HashSet<Arc<str>, ahash::RandomState>,
+        crawl_buckets: &CrawlTaskBuckets,
         robots_cache: &RobotsCache,
     ) -> bool {
         // Too deep?
@@ -103,12 +97,16 @@ impl CrawlTask {
         }
 
         // Blocked by robots.txt?
-        if !robots_cache.is_url_allowed(&self.target_url, &self.domain) {
+        let domain = match self.target_url.host_str() {
+            Some(d) => d,
+            None => return true,
+        };
+        if !robots_cache.is_url_allowed(&self.target_url, domain) {
             return true;
         }
 
         // Already crawled or queued?
-        db.is_url_already_processed(self.target_url.as_str(), pending_task_urls)
+        db.is_url_already_processed(&self.target_url, crawl_buckets)
     }
 }
 
@@ -124,7 +122,7 @@ struct CrawlDb {
     // 1. Bloom filter (fast, probabilistic)
     seen_urls_bloom: BloomFilter<ahash::RandomState>,
     // 2. Uncommitted URLs (not yet in Tantivy index)
-    uncommitted_urls: HashSet<Box<str>, ahash::RandomState>,
+    uncommitted_urls: HashSet<Url, ahash::RandomState>,
     // 3. Tantivy index query (fallback for Bloom collisions)
 
     // Metrics for Bloom filter effectiveness
@@ -175,7 +173,7 @@ impl CrawlDb {
             .hasher(ahash::RandomState::new())
             .expected_items(expected_url_count);
 
-        Ok(Self {
+        let mut db = Self {
             index,
             index_writer,
             url_field,
@@ -185,17 +183,46 @@ impl CrawlDb {
             uncommitted_urls: HashSet::with_hasher(ahash::RandomState::new()),
             bloom_saved_lookups: 0,
             bloom_possible_collisions: 0,
-        })
+        };
+
+        let reader = db.index.reader()?;
+        let searcher = reader.searcher();
+
+        println!("Loading existing indexed URLs into Bloom filter...");
+        for segment_reader in searcher.segment_readers() {
+            let max_doc = segment_reader.max_doc();
+
+            println!(
+                "  Segment with {} docs",
+                segment_reader.num_docs()
+            );
+            for doc_id in 0..max_doc {
+                // Skip deleted docs
+                if segment_reader.is_deleted(doc_id) {
+                    continue;
+                }
+
+                let doc: TantivyDocument = segment_reader
+                    .get_store_reader(1_000)?
+                    .get(doc_id)?;
+                if let Some(url) = doc.get_first(url_field).and_then(|v| v.as_str()) {
+                    db.seen_urls_bloom.insert(url);
+                }
+            }
+        }
+        println!("Bloom filter items: {}", db.seen_urls_bloom.as_slice().iter().map(|b| b.count_ones() as usize).sum::<usize>());
+
+        Ok(db)
     }
 
     /// Check if URL has already been processed (three-layer check)
     fn is_url_already_processed(
         &mut self,
-        url: &str,
-        pending_task_urls: &HashSet<Arc<str>, ahash::RandomState>,
+        url: &Url,
+        crawl_buckets: &CrawlTaskBuckets,
     ) -> bool {
         // Layer 1: Check if URL is already in the task queue (not yet crawled)
-        if pending_task_urls.contains(url) {
+        if crawl_buckets.contains(url) {
             return true;
         }
 
@@ -215,7 +242,7 @@ impl CrawlDb {
         self.bloom_possible_collisions += 1;
 
         // Layer 4: Query Tantivy index to confirm (handles Bloom false positives)
-        self.is_url_in_index(url)
+        self.is_url_in_index(url.as_str())
     }
 
     /// Query Tantivy index to check if URL exists (expensive, used only for Bloom collisions)
@@ -237,14 +264,14 @@ impl CrawlDb {
         !doc_addresses.is_empty()
     }
 
-    fn index_page(&mut self, page: IndexedPage) -> Result<()> {
+    fn index_page(&mut self, page: IndexedPage, url: &Url) -> Result<()> {
         let doc = doc!(
-            self.url_field => &*page.page_url,
+            self.url_field => url.as_str(),
             self.title_field => &*page.page_title,
             self.body_field => &*page.page_content
         );
         self.index_writer.add_document(doc)?;
-        self.uncommitted_urls.insert(page.page_url.into());
+        self.uncommitted_urls.insert(url.clone());
         Ok(())
     }
 
@@ -253,7 +280,6 @@ impl CrawlDb {
         self.uncommitted_urls.clear();
         Ok(())
     }
-
 }
 
 /// Result of fetching a URL (without child tasks, which are returned separately)
@@ -267,8 +293,19 @@ enum FetchResult {
 }
 
 /// Fetch a URL and return (child_tasks, result)
-async fn fetch_and_process_url(http_client: &Client, task: &CrawlTask) -> Result<(Vec<CrawlTask>, FetchResult)> {
-    let CrawlTask { target_url, crawl_depth, domain, .. } = task;
+async fn fetch_and_process_url(
+    http_client: &Client,
+    task: &CrawlTask,
+) -> Result<(Vec<CrawlTask>, FetchResult)> {
+    let CrawlTask {
+        target_url,
+        crawl_depth,
+    } = task;
+
+    let domain = match target_url.host_str() {
+        Some(d) => d,
+        None => return Err(anyhow::anyhow!("URL has no host: {}", target_url)),
+    };
 
     let response = http_client.get(target_url.clone()).send().await?;
 
@@ -285,17 +322,20 @@ async fn fetch_and_process_url(http_client: &Client, task: &CrawlTask) -> Result
 
         // Add sitemap URLs
         for url_str in sitemap_urls {
-            let Ok(url) = Url::parse(&url_str) else { continue };
-            if url.host_str() != Some(&**domain) { continue }
-            let Some(t) = CrawlTask::new(url, 0) else { continue };
+            let Ok(url) = Url::parse(&url_str) else {
+                continue;
+            };
+            if url.host_str() != target_url.host_str() {
+                continue;
+            }
+            let t = CrawlTask::new(url, 0);
             child_tasks.push(t);
         }
 
         // Always add homepage
         if let Ok(homepage) = Url::parse(&format!("https://{}/", domain)) {
-            if let Some(t) = CrawlTask::new(homepage, 0) {
-                child_tasks.push(t);
-            }
+            let t = CrawlTask::new(homepage, 0);
+            child_tasks.push(t);
         }
 
         return Ok((child_tasks, FetchResult::Robots(robot)));
@@ -305,7 +345,8 @@ async fn fetch_and_process_url(http_client: &Client, task: &CrawlTask) -> Result
         return Err(anyhow::anyhow!("HTTP {}", response.status()));
     }
 
-    let content_type = response.headers()
+    let content_type = response
+        .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
@@ -319,18 +360,24 @@ async fn fetch_and_process_url(http_client: &Client, task: &CrawlTask) -> Result
 
         // Add page URLs at current depth
         for url_str in page_urls {
-            let Ok(url) = Url::parse(&url_str) else { continue };
-            if url.host_str() != target_url.host_str() { continue }
-            let Some(t) = CrawlTask::new(url, *crawl_depth) else { continue };
-            child_tasks.push(t);
+            let Ok(url) = Url::parse(&url_str) else {
+                continue;
+            };
+            if url.host_str() != target_url.host_str() {
+                continue;
+            }
+            child_tasks.push(CrawlTask::new(url, *crawl_depth));
         }
 
         // Add nested sitemaps at depth + 1
         for url_str in sitemap_urls {
-            let Ok(url) = Url::parse(&url_str) else { continue };
-            if url.host_str() != target_url.host_str() { continue }
-            let Some(t) = CrawlTask::new(url, crawl_depth + 1) else { continue };
-            child_tasks.push(t);
+            let Ok(url) = Url::parse(&url_str) else {
+                continue;
+            };
+            if url.host_str() != target_url.host_str() {
+                continue;
+            }
+            child_tasks.push(CrawlTask::new(url, crawl_depth + 1));
         }
 
         return Ok((child_tasks, FetchResult::Sitemap));
@@ -352,12 +399,12 @@ async fn fetch_and_process_url(http_client: &Client, task: &CrawlTask) -> Result
             let mut url = target_url.join(&link).ok()?;
             url.set_fragment(None);
             (url.host_str() == target_url.host_str())
-                .then_some(CrawlTask::new(url, crawl_depth + 1)?)
+                .then_some(CrawlTask::new(url, crawl_depth + 1))
         })
         .collect();
 
     let page = IndexedPage {
-        page_url: target_url.to_string(),
+        //page_url: target_url.clone(),
         page_content,
         page_title,
     };
@@ -428,15 +475,18 @@ fn report_status_and_commit(
     );
 
     db.commit()?;
+
+
+    // get number of docs in index
+    let num_docs = db.index.reader()?.searcher().num_docs();
+    println!("  Total indexed documents: {}", num_docs);
+
     Ok(())
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 20)]
 async fn main() -> Result<()> {
     let cli_args = Args::parse();
-
-    // Load seed URLs from input file
-    let seed_urls = load_seed_urls(&cli_args.input_file)?;
 
     // Configure HTTP client with Chrome user agent and performance optimizations
     let http_client = Client::builder()
@@ -448,6 +498,8 @@ async fn main() -> Result<()> {
     let expected_url_count = 100_000_000;
     let mut db = CrawlDb::new(expected_url_count)?;
 
+    let seed_urls = load_seed_urls(&cli_args.input_file)?;
+
     // Initialize crawl state
     let (mut pages_crawled, mut sitemaps_processed, mut pages_failed) = (0usize, 0usize, 0usize);
 
@@ -455,24 +507,20 @@ async fn main() -> Result<()> {
     let mut active_request_domains: HashSet<Arc<str>, ahash::RandomState> =
         HashSet::with_hasher(ahash::RandomState::new());
 
-    // Track URLs that are in the task queue but not yet crawled
-    let mut pending_task_urls: HashSet<Arc<str>, ahash::RandomState> =
-        HashSet::with_hasher(ahash::RandomState::new());
-
     // Robots.txt cache and tracking for initialized domains
     let mut robots_cache = RobotsCache::new();
     let mut initialized_domains: HashSet<Arc<str>, ahash::RandomState> =
         HashSet::with_hasher(ahash::RandomState::new());
 
-    // Priority queue: deeper tasks first (BTreeSet with custom Ord)
-    let mut task_queue: BTreeSet<CrawlTask> = seed_urls
-        .into_iter()
-        .filter_map(|url| {
-            db.seen_urls_bloom.insert(url.as_str());
-            pending_task_urls.insert(url.as_str().into());
-            CrawlTask::new(url, 0)
-        })
-        .collect();
+    // New bucketed task manager
+    let mut crawl_buckets = CrawlTaskBuckets::new(cli_args.max_crawl_depth + 1);
+    for url in seed_urls {
+        db.seen_urls_bloom.insert(url.as_str());
+        if db.is_url_already_processed(&url, &crawl_buckets){
+            continue;
+        }
+        crawl_buckets.insert(url, 0);
+    }
 
     // Pool of async worker tasks
     let mut worker_pool = JoinSet::new();
@@ -484,32 +532,34 @@ async fn main() -> Result<()> {
             .max_concurrent_requests
             .saturating_sub(worker_pool.len());
 
-        // Extract tasks from queue, ensuring only one request per domain at a time
-        let tasks_to_spawn: Vec<_> = task_queue
-            .extract_if(.., |task| {
-                // Try to mark this domain as in-progress
-                // If it's already in progress, leave task in queue
-                active_request_domains.insert(task.domain.clone())
-            })
-            .take(available_worker_slots)
-            .collect();
+        // Extract tasks from buckets, handling collisions first
+        let tasks_to_spawn: Vec<_> = crawl_buckets.extract_if(
+            |url, _depth| {
+                if let Some(domain) = url.host_str() {
+                    active_request_domains.insert(Arc::from(domain))
+                } else {
+                    false
+                }
+            },
+            available_worker_slots,
+        );
 
         for task in tasks_to_spawn {
             // Initialize domain: add robots.txt as a task (will be fetched first due to domain lock)
-            if !initialized_domains.contains(&task.domain) {
-                initialized_domains.insert(task.domain.clone());
+            let domain = match task.target_url.host_str() {
+                Some(d) => d,
+                None => continue,
+            };
+            if !initialized_domains.contains(domain) {
+                initialized_domains.insert(Arc::from(domain));
 
                 // Add robots.txt task for this domain
-                let robots_url = Url::parse(&format!("https://{}/robots.txt", task.domain)).unwrap();
-                if let Some(robots_task) = CrawlTask::new(robots_url, 0) {
-                    db.seen_urls_bloom.insert(robots_task.target_url.as_str());
-                    pending_task_urls.insert(robots_task.target_url.as_str().into());
-                    task_queue.insert(robots_task);
-                }
+                let robots_url =
+                    Url::parse(&format!("https://{}/robots.txt", domain)).unwrap();
+                let robots_task = CrawlTask::new(robots_url, 0);
+                db.seen_urls_bloom.insert(robots_task.target_url.as_str());
+                crawl_buckets.insert(robots_task.target_url.clone(), 0);
             }
-
-            // Remove from pending set since we're about to crawl it
-            pending_task_urls.remove(task.target_url.as_str());
 
             let http_client = http_client.clone();
             worker_pool.spawn(async move {
@@ -519,7 +569,7 @@ async fn main() -> Result<()> {
         }
 
         // Exit when all work is done
-        if worker_pool.is_empty() && task_queue.is_empty() {
+        if worker_pool.is_empty() && crawl_buckets.is_empty() {
             break;
         }
 
@@ -532,7 +582,10 @@ async fn main() -> Result<()> {
         let (fetch_result, completed_task) = crawl_result;
 
         // Mark domain as no longer in progress
-        active_request_domains.remove(&completed_task.domain);
+        let Some(completed_domain) = completed_task.target_url.host_str() else {
+            continue;
+        };
+        active_request_domains.remove(completed_domain);
 
         // Handle fetch result
         let (child_tasks, result) = match fetch_result {
@@ -546,18 +599,17 @@ async fn main() -> Result<()> {
             }
         };
 
-        // Add child tasks to queue (unified for all result types)
+        // Add child tasks to buckets (unified for all result types)
         for child_task in child_tasks {
             if !child_task.should_skip(
                 cli_args.max_crawl_depth,
                 &cli_args.excluded_url_prefixes,
                 &mut db,
-                &pending_task_urls,
+                &crawl_buckets,
                 &robots_cache,
             ) {
                 db.seen_urls_bloom.insert(child_task.target_url.as_str());
-                pending_task_urls.insert(child_task.target_url.as_str().into());
-                task_queue.insert(child_task);
+                crawl_buckets.insert(child_task.target_url.clone(), child_task.crawl_depth);
             }
         }
 
@@ -565,23 +617,25 @@ async fn main() -> Result<()> {
         match result {
             FetchResult::Robots(robot) => {
                 if let Some(r) = robot {
-                    robots_cache.insert(completed_task.domain.clone(), r);
+                    let domain = match completed_task.target_url.host_str() {
+                        Some(d) => d,
+                        None => continue,
+                    };
+                    robots_cache.insert(Arc::from(domain), r);
                 }
             }
             FetchResult::Sitemap => {
                 sitemaps_processed += 1;
             }
-            FetchResult::Page(page) => {
-                match db.index_page(page) {
-                    Ok(()) => pages_crawled += 1,
-                    Err(e) => {
-                        if cli_args.verbose_logging {
-                            eprintln!("Error indexing {}: {:?}", completed_task.target_url, e);
-                        }
-                        pages_failed += 1;
+            FetchResult::Page(page) => match db.index_page(page,&completed_task.target_url) {
+                Ok(()) => pages_crawled += 1,
+                Err(e) => {
+                    if cli_args.verbose_logging {
+                        eprintln!("Error indexing {}: {:?}", &completed_task.target_url, e);
                     }
+                    pages_failed += 1;
                 }
-            }
+            },
         }
 
         // Periodic status reporting and commit
@@ -590,7 +644,7 @@ async fn main() -> Result<()> {
                 pages_crawled,
                 sitemaps_processed,
                 pages_failed,
-                task_queue.len(),
+                crawl_buckets.len(),
                 active_request_domains.len(),
                 &mut db,
             ) {
@@ -606,4 +660,122 @@ async fn main() -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Bucketed crawl task manager with collision handling
+struct CrawlTaskBuckets {
+    buckets: Vec<Vec<usize>>,      // buckets by depth, each holds hash keys
+    url_map: HashMap<usize, Url, ahash::RandomState>, // map from hash key to Url
+    collisions: Vec<CrawlTask>, // (Url, depth) for hash collisions
+}
+
+impl CrawlTaskBuckets {
+
+    fn new(max_depth: usize) -> Self {
+        Self {
+            buckets: vec![Vec::new(); max_depth],
+            url_map: HashMap::with_hasher(ahash::RandomState::new()),
+            collisions: Vec::new(),
+        }
+    }
+
+    /// Check if a URL string is present in any bucket or collision
+    pub fn contains(&self, url: &Url) -> bool {
+        // Check url_map using hash key for O(1) lookup
+        let key = Self::hash_url(url);
+        if let Some(u) = self.url_map.get(&key) {
+            if u == url {
+                return true;
+            }
+        }
+        // Check collisions
+        if self.collisions.iter().any(|t| &t.target_url == url) {
+            return true;
+        }
+        false
+    }
+
+    /// Insert a Url into a bucket by depth
+    fn insert(&mut self, url: Url, depth: usize) {
+        if depth >= self.buckets.len() {
+            return;
+        }
+        let key = Self::hash_url(&url);
+        if let Some(existing) = self.url_map.get(&key) {
+            if existing != &url {
+                // Collision: store in collisions
+                self.collisions.push(CrawlTask::new(url, depth));
+                return;
+            }
+        } else {
+            self.url_map.insert(key, url);
+        }
+        self.buckets[depth].push(key);
+    }
+
+    /// Extract up to n tasks, handling collisions first, then buckets in order
+    fn extract_if<F>(&mut self, mut filter: F, max_count: usize) -> Vec<CrawlTask>
+    where
+        F: FnMut(&Url, usize) -> bool,
+    {
+        let mut result = Vec::new();
+        // Handle collisions first
+        let mut i = 0;
+        while result.len() < max_count && i < self.collisions.len(){
+            let CrawlTask { target_url: url, crawl_depth: depth } = &self.collisions[i];
+            if !filter(url, *depth) {
+                i += 1;
+                continue;
+            }
+            let removed = self.collisions.swap_remove(i);
+            result.push(removed);
+        }
+        // Then buckets in order
+        for depth in 0..self.buckets.len() {
+            let mut j = 0;
+            while j < self.buckets[depth].len() && result.len() < max_count {
+                let key = self.buckets[depth][j];
+                if let Some(url) = self.url_map.get(&key) { // End immutable borrow before mutable borrow
+                    if !filter(url, depth) {
+                        j += 1;
+                        continue;
+                    }
+                    let owned_url = match self.url_map.remove(&key) {
+                        Some(u) => u,
+                        None => {
+                            j += 1;
+                            continue;
+                        }
+                    };
+                    let task = CrawlTask::new(owned_url, depth);
+                    self.buckets[depth].swap_remove(j);
+                    result.push(task);
+                }
+            }
+            if result.len() >= max_count {
+                break;
+            }
+        }
+        result
+    }
+
+    /// Check if buckets are empty
+    fn is_empty(&self) -> bool {
+        self.url_map.is_empty() && self.collisions.is_empty()
+    }
+
+    /// Total number of tasks
+    fn len(&self) -> usize {
+        let mut count = self.url_map.len();
+        count += self.collisions.len();
+        count
+    }
+
+    /// Hash a Url to usize
+    fn hash_url(url: &Url) -> usize {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = ahash::AHasher::default();
+        url.as_str().hash(&mut hasher);
+        hasher.finish() as usize
+    }
 }
