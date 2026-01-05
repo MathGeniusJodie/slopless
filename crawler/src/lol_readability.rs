@@ -53,9 +53,9 @@ enum TagType {
 }
 
 /// A stack frame representing an open HTML element being scored
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ElementFrame {
-    tag_type: Option<TagType>,
+    tag_type: TagType,
     base_score: f32,          // Initial score from tag type + class/id
     text_len: u32,            // Total character count
     link_text_len: u32,       // Character count inside <a> tags
@@ -70,7 +70,7 @@ impl ElementFrame {
         let base_score = Self::calculate_base_score(tag_type, id, class);
 
         Self {
-            tag_type: Some(tag_type),
+            tag_type,
             base_score,
             text_len: 0,
             link_text_len: 0,
@@ -185,7 +185,7 @@ impl ElementFrame {
         // Must be a content-bearing tag type
         let is_content_tag = matches!(
             self.tag_type,
-            Some(TagType::Article | TagType::Div | TagType::P | TagType::Other)
+            TagType::Article | TagType::Div | TagType::P | TagType::Other
         );
 
         // Must have enough text (filter out tiny snippets)

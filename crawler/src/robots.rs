@@ -34,9 +34,12 @@ pub fn is_robots_url(url: &Url) -> bool {
     url.path() == "/robots.txt"
 }
 
+/// User agent string for robots.txt parsing (matches the Chrome UA used by the crawler)
+const ROBOTS_USER_AGENT: &str = "Mozilla/5.0 (compatible; Crawler)";
+
 /// Parse robots.txt content, returns (Robot, sitemap_urls)
 pub fn parse_robots(content: &str) -> (Option<Robot>, Vec<String>) {
-    let robot = Robot::new("Mozilla", content.as_bytes()).ok();
+    let robot = Robot::new(ROBOTS_USER_AGENT, content.as_bytes()).ok();
     let sitemaps: Vec<String> = robot
         .as_ref()
         .map(|r| r.sitemaps.iter().map(|s| s.to_string()).collect())
@@ -47,7 +50,15 @@ pub fn parse_robots(content: &str) -> (Option<Robot>, Vec<String>) {
 /// Check if a URL looks like a sitemap
 pub fn is_sitemap_url(url: &Url) -> bool {
     let path = url.path().to_lowercase();
-    path.ends_with(".xml") || path.ends_with(".xml.gz") || path.contains("sitemap")
+    // Check for sitemap file extensions
+    if path.ends_with(".xml") || path.ends_with(".xml.gz") {
+        return true;
+    }
+    // Check for "sitemap" in filename (after last slash), not just anywhere in path
+    if let Some(filename) = path.rsplit('/').next() {
+        return filename.contains("sitemap");
+    }
+    false
 }
 
 /// Parse sitemap content and return (page_urls, nested_sitemap_urls)
@@ -89,7 +100,8 @@ mod tests {
     fn test_robots_cache_with_rules() {
         let mut cache = RobotsCache::new();
         let domain: Arc<str> = "example.com".into();
-        let robot = Robot::new("Mozilla", b"User-agent: *\nDisallow: /admin/\n").unwrap();
+        let robot =
+            Robot::new(super::ROBOTS_USER_AGENT, b"User-agent: *\nDisallow: /admin/\n").unwrap();
         cache.insert(domain.clone(), robot);
 
         let allowed = Url::parse("https://example.com/public").unwrap();

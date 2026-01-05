@@ -3,7 +3,6 @@ use clap::Parser;
 
 use fastbloom::BloomFilter;
 use reqwest::Client;
-use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fs::read_to_string;
 use std::sync::Arc;
@@ -13,6 +12,7 @@ use tantivy::schema::{
 use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
 use tantivy::{doc, Index, TantivyDocument};
 use tokio::task::JoinSet;
+use unicode_normalization::UnicodeNormalization;
 use url::Url;
 
 mod lol_readability;
@@ -31,7 +31,6 @@ struct Args {
     max_crawl_depth: usize,
     #[arg(short = 'c', long = "concurrency", default_value_t = 500)]
     max_concurrent_requests: usize,
-    // verbosity flag could be added here
     #[arg(short = 'v', long = "verbose", default_value_t = false)]
     verbose_logging: bool,
 }
@@ -43,27 +42,10 @@ struct IndexedPage {
 }
 
 /// A single URL to crawl, with associated metadata
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone)]
 struct CrawlTask {
     crawl_depth: usize,
     target_url: Url,
-}
-
-impl Ord for CrawlTask {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // Process deeper pages first (they're less likely to spawn more work)
-        // This helps drain the queue faster and reduces memory usage
-        other
-            .crawl_depth
-            .cmp(&self.crawl_depth)
-            .then_with(|| self.target_url.as_str().cmp(other.target_url.as_str()))
-    }
-}
-
-impl PartialOrd for CrawlTask {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
 }
 
 impl CrawlTask {
@@ -348,8 +330,8 @@ async fn fetch_and_process_url(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    // Handle sitemaps
-    if is_sitemap_url(target_url) || content_type.contains("xml") {
+    // Handle sitemaps (only trust URL patterns, not content-type which is too broad)
+    if is_sitemap_url(target_url) {
         let bytes = response.bytes().await?;
         let (page_urls, sitemap_urls) = parse_sitemap(&bytes);
 
@@ -387,7 +369,6 @@ async fn fetch_and_process_url(
 
     let html_body = response.text().await?;
     let (readable_text, extracted_links, page_title) = find_main_content(html_body.as_bytes())?;
-    use unicode_normalization::UnicodeNormalization;
     let page_content = readable_text.nfkc().collect::<String>();
 
     let child_tasks = extracted_links
@@ -502,10 +483,10 @@ async fn main() -> Result<()> {
     // New bucketed task manager
     let mut crawl_buckets = CrawlTaskBuckets::new(cli_args.max_crawl_depth + 1);
     for url in seed_urls {
-        db.seen_urls_bloom.insert(url.as_str());
         if db.is_url_already_processed(&url, &crawl_buckets) {
             continue;
         }
+        db.seen_urls_bloom.insert(url.as_str());
         crawl_buckets.insert(url, 0);
     }
 
@@ -595,7 +576,7 @@ async fn main() -> Result<()> {
                 &robots_cache,
             ) {
                 db.seen_urls_bloom.insert(child_task.target_url.as_str());
-                crawl_buckets.insert(child_task.target_url.clone(), child_task.crawl_depth);
+                crawl_buckets.insert(child_task.target_url, child_task.crawl_depth);
             }
         }
 
@@ -763,9 +744,7 @@ impl CrawlTaskBuckets {
 
     /// Total number of tasks
     fn len(&self) -> usize {
-        let mut count = self.url_map.len();
-        count += self.collisions.len();
-        count
+        self.url_map.len() + self.collisions.len()
     }
 
     /// Hash a Url to usize
