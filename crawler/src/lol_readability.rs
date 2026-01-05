@@ -292,6 +292,7 @@ pub fn find_main_content(html: &[u8]) -> anyhow::Result<(String, Vec<String>, St
         best_content: Option<String>,
         best_content_score: f32,
         skip_depth: u32,
+        anchor_depth: u32, // Track nesting inside <a> tags for link density
         extracted_urls: Vec<String>,
         page_title: String,
         currently_in_title: bool,
@@ -302,6 +303,7 @@ pub fn find_main_content(html: &[u8]) -> anyhow::Result<(String, Vec<String>, St
         best_content: None,
         best_content_score: 0.0,
         skip_depth: 0,
+        anchor_depth: 0,
         extracted_urls: Vec::new(),
         page_title: String::new(),
         currently_in_title: false,
@@ -336,6 +338,7 @@ pub fn find_main_content(html: &[u8]) -> anyhow::Result<(String, Vec<String>, St
                     }
 
                     // Determine what to do with this element
+                    let is_anchor = tag_name == "a";
                     let (pushed_element_frame, incremented_skip_depth) = {
                         let mut context = context_for_open.borrow_mut();
 
@@ -367,6 +370,9 @@ pub fn find_main_content(html: &[u8]) -> anyhow::Result<(String, Vec<String>, St
                             let frame =
                                 ElementFrame::new(&tag_name, id.as_deref(), class.as_deref());
                             context.element_stack.push(frame);
+                            if is_anchor {
+                                context.anchor_depth += 1;
+                            }
                             (true, false)
                         }
                     };
@@ -392,6 +398,11 @@ pub fn find_main_content(html: &[u8]) -> anyhow::Result<(String, Vec<String>, St
                             // If we didn't push a frame, nothing to do
                             if !pushed_element_frame {
                                 return Ok(());
+                            }
+
+                            // Decrement anchor depth if this was an <a> tag
+                            if is_anchor {
+                                context.anchor_depth -= 1;
                             }
 
                             // Pop the frame for this element and evaluate it
@@ -447,6 +458,7 @@ pub fn find_main_content(html: &[u8]) -> anyhow::Result<(String, Vec<String>, St
                     }
 
                     // Add text to current element frame
+                    let inside_anchor = context.anchor_depth > 0;
                     if let Some(current_frame) = context.element_stack.last_mut() {
                         let text_length = text.len() as u32;
                         let comma_count = text.bytes().filter(|&b| b == b',').count() as u32;
@@ -456,7 +468,8 @@ pub fn find_main_content(html: &[u8]) -> anyhow::Result<(String, Vec<String>, St
                         current_frame.append_text(text);
 
                         // Track link text separately (for link density calculation)
-                        if matches!(current_frame.tag_type, Some(TagType::A)) {
+                        // Use anchor_depth to handle nested elements inside <a> tags
+                        if inside_anchor {
                             current_frame.link_text_len += text_length;
                         }
                     }
@@ -1043,6 +1056,45 @@ mod tests {
         assert!(
             !text.contains("Jump to navigation"),
             "Should not select navigation text"
+        );
+    }
+
+    #[test]
+    fn test_nested_link_text_counted_for_density() {
+        // Text nested inside <a> tags should count toward link density
+        // even when wrapped in other elements like <span>.
+        // Section-a: MORE text but 100% link density (all in nested links)
+        // Section-b: LESS text but 0% link density
+        // If link density works, section-b should win despite being shorter.
+        // If link density is broken, section-a wins due to longer text.
+        let html = r#"
+            <html>
+                <body>
+                    <div class="section-a">
+                        <a href="/1"><span>These are words inside a link with span wrapper element</span></a>
+                        <a href="/2"><em><strong>More words here also inside deeply nested link tags</strong></em></a>
+                        <a href="/3"><span>Even more words in another nested link wrapper here</span></a>
+                        <a href="/4"><span>And yet another link with nested span containing text</span></a>
+                        <a href="/5"><span>Plus one more nested link to make this section longer</span></a>
+                    </div>
+                    <div class="section-b">
+                        Plain text without any links at all here.
+                        More plain text also without links.
+                    </div>
+                </body>
+            </html>
+        "#;
+
+        let result = find_main_content(html.as_bytes());
+        assert!(result.is_ok());
+        let (text, _urls, _title) = result.unwrap();
+        // section-a is LONGER but has 100% link density -> score *= ~0
+        // section-b is SHORTER but has 0% link density -> no penalty
+        // section-b should win despite being shorter
+        assert!(
+            text.contains("Plain text without"),
+            "Shorter 0% link-dense section should beat longer 100% link-dense section, got: {}",
+            text
         );
     }
 
