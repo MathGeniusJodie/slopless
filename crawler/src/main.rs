@@ -247,7 +247,6 @@ async fn crawl_domain(
     db: DbHandle,
     max_depth: usize,
     excluded_prefixes: Arc<Vec<String>>,
-    verbose: bool,
 ) {
     let url = format!("https://{}/", domain);
     let mut website = Website::new(&url);
@@ -255,7 +254,6 @@ async fn crawl_domain(
     website.configuration.respect_robots_txt = true;
     website.configuration.subdomains = false;
     website.configuration.depth = max_depth;
-    website.with_limit(1);
     website.with_normalize(true);
 
     if !excluded_prefixes.is_empty() {
