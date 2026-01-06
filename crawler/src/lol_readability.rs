@@ -4,6 +4,7 @@ use regex::Regex;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::LazyLock;
+use url::Url;
 
 // -----------------------------------------------------------------------------
 // Static Configuration (Compiled Once)
@@ -280,9 +281,10 @@ fn is_non_content_leaf(tag: &str) -> bool {
 // -----------------------------------------------------------------------------
 
 /// Find and extract the main content as plain text.
-/// Returns: (content_text, title)
+/// Returns: (content_text, title, url)
+/// The URL will be the canonical URL if found, otherwise the input URL.
 /// Returns an error if no suitable content element was found.
-pub fn find_main_content(html: &[u8]) -> anyhow::Result<(String, String)> {
+pub fn find_main_content(html: &[u8], url: &str) -> anyhow::Result<(String, String, String)> {
     /// Parsing context shared across HTML rewriter callbacks
     struct ParsingContext {
         element_stack: Vec<ElementFrame>,
@@ -292,6 +294,7 @@ pub fn find_main_content(html: &[u8]) -> anyhow::Result<(String, String)> {
         anchor_depth: u32, // Track nesting inside <a> tags for link density
         page_title: String,
         currently_in_title: bool,
+        canonical_url: Option<String>,
     }
 
     let parsing_context = Rc::new(RefCell::new(ParsingContext {
@@ -302,15 +305,26 @@ pub fn find_main_content(html: &[u8]) -> anyhow::Result<(String, String)> {
         anchor_depth: 0,
         page_title: String::new(),
         currently_in_title: false,
+        canonical_url: None,
     }));
 
     let context_for_open = parsing_context.clone();
     let context_for_text = parsing_context.clone();
     let context_for_close = parsing_context.clone();
+    let context_for_link = parsing_context.clone();
 
     let mut rewriter = HtmlRewriter::new(
         Settings {
             element_content_handlers: vec![
+                // Extract canonical URL from <link rel="canonical" href="...">
+                element!("link[rel=canonical]", move |el| {
+                    if let Some(href) = el.get_attribute("href") {
+                        if !href.is_empty() {
+                            context_for_link.borrow_mut().canonical_url = Some(href);
+                        }
+                    }
+                    Ok(())
+                }),
                 element!("*", move |el| {
                     let tag_name = el.tag_name();
                     let is_container_skip = is_non_content_container(&tag_name);
@@ -480,7 +494,24 @@ pub fn find_main_content(html: &[u8]) -> anyhow::Result<(String, String)> {
         .into_inner();
 
     match final_context.best_content {
-        Some(content_text) => Ok((content_text, final_context.page_title)),
+        Some(content_text) => {
+            // Parse and normalize the base URL
+            let base_url = Url::parse(url)?;
+
+            // Resolve canonical URL (may be relative) or use base URL
+            let resolved_url = match final_context.canonical_url {
+                Some(canonical) => base_url.join(&canonical)?,
+                None => base_url,
+            };
+
+            // Normalize: strip trailing slash (but not for root paths like "https://example.com/")
+            let mut url_str = resolved_url.to_string();
+            if url_str.ends_with('/') && resolved_url.path().len() > 1 {
+                url_str.pop();
+            }
+
+            Ok((content_text, final_context.page_title, url_str))
+        }
         None => anyhow::bail!("No main content found"),
     }
 }
@@ -508,9 +539,9 @@ mod tests {
             </html>
         "#;
 
-        let result = find_main_content(html.as_bytes());
+        let result = find_main_content(html.as_bytes(), "https://example.com/test");
         assert!(result.is_ok(), "Should find a main content element");
-        let (text, _title) = result.unwrap();
+        let (text, _title, _canonical) = result.unwrap();
         // Should extract the article text
         assert!(
             text.contains("main article content") && text.contains("multiple sentences"),
@@ -536,9 +567,9 @@ mod tests {
             </html>
         "#;
 
-        let result = find_main_content(html.as_bytes());
+        let result = find_main_content(html.as_bytes(), "https://example.com/test");
         assert!(result.is_ok(), "Should find content element");
-        let (text, _title) = result.unwrap();
+        let (text, _title, _canonical) = result.unwrap();
         assert!(
             text.contains("real content of the page"),
             "Expected content text, got: {}",
@@ -566,9 +597,9 @@ mod tests {
             </html>
         "#;
 
-        let result = find_main_content(html.as_bytes());
+        let result = find_main_content(html.as_bytes(), "https://example.com/test");
         assert!(result.is_ok());
-        let (text, _title) = result.unwrap();
+        let (text, _title, _canonical) = result.unwrap();
         // Should prefer article over navigation due to link density penalty
         assert!(
             text.contains("actual article text"),
@@ -593,9 +624,9 @@ mod tests {
             </html>
         "#;
 
-        let result = find_main_content(html.as_bytes());
+        let result = find_main_content(html.as_bytes(), "https://example.com/test");
         assert!(result.is_ok());
-        let (text, _title) = result.unwrap();
+        let (text, _title, _canonical) = result.unwrap();
         // Should prefer post/entry over sidebar/widget
         assert!(
             text.contains("main post content"),
@@ -607,7 +638,7 @@ mod tests {
     #[test]
     fn test_empty_html() {
         let html = b"<html><body></body></html>";
-        let result = find_main_content(html);
+        let result = find_main_content(html, "https://example.com/test");
         // Empty page should return an error
         assert!(result.is_err());
     }
@@ -616,7 +647,7 @@ mod tests {
     fn test_minimal_content() {
         // Minimal content without id/class won't be identified as main content
         let html = b"<html><body><p>Hello world</p></body></html>";
-        let result = find_main_content(html);
+        let result = find_main_content(html, "https://example.com/test");
         assert!(result.is_err());
     }
 
@@ -641,9 +672,9 @@ mod tests {
             </html>
         "#;
 
-        let result = find_main_content(html.as_bytes());
+        let result = find_main_content(html.as_bytes(), "https://example.com/test");
         assert!(result.is_ok(), "Should find content element");
-        let (text, _title) = result.unwrap();
+        let (text, _title, _canonical) = result.unwrap();
         // Should find the body content, not include head content
         assert!(
             text.contains("actual body content") && !text.contains("Page Title"),
@@ -670,9 +701,9 @@ mod tests {
             </html>
         "#;
 
-        let result = find_main_content(html.as_bytes());
+        let result = find_main_content(html.as_bytes(), "https://example.com/test");
         assert!(result.is_ok());
-        let (text, _title) = result.unwrap();
+        let (text, _title, _canonical) = result.unwrap();
         assert!(
             text.contains("Real article content") && !text.contains("var x"),
             "Should find article text without script content, got: {}",
@@ -713,9 +744,9 @@ mod tests {
             </html>
         "#;
 
-        let result = find_main_content(html.as_bytes());
+        let result = find_main_content(html.as_bytes(), "https://example.com/test");
         assert!(result.is_ok(), "Should find the article content");
-        let (text, _title) = result.unwrap();
+        let (text, _title, _canonical) = result.unwrap();
         // Should extract the article prose
         assert!(
             text.contains("programming language") && text.contains("Rust Foundation"),
@@ -748,9 +779,9 @@ mod tests {
             </html>
         "#;
 
-        let result = find_main_content(html.as_bytes());
+        let result = find_main_content(html.as_bytes(), "https://example.com/test");
         assert!(result.is_ok());
-        let (text, _title) = result.unwrap();
+        let (text, _title, _canonical) = result.unwrap();
         // Should NOT contain form content
         assert!(
             text.contains("actual page content") && !text.contains("Option one"),
@@ -776,14 +807,87 @@ mod tests {
             </html>
         "#;
 
-        let result = find_main_content(html.as_bytes());
+        let result = find_main_content(html.as_bytes(), "https://example.com/test");
         assert!(result.is_ok());
-        let (_text, title) = result.unwrap();
+        let (_text, title, _canonical) = result.unwrap();
         assert_eq!(
             title, "My Page Title",
             "Should extract title, got: {}",
             title
         );
+    }
+
+    #[test]
+    fn test_extracts_canonical_url() {
+        let html = r#"
+            <html>
+                <head>
+                    <title>Test Page</title>
+                    <link rel="canonical" href="https://example.com/canonical-page">
+                </head>
+                <body>
+                    <article>
+                        <p>This is the main article content with lots of text.
+                        It has multiple sentences, and commas too.
+                        The article discusses important topics that readers care about.</p>
+                    </article>
+                </body>
+            </html>
+        "#;
+
+        let result = find_main_content(html.as_bytes(), "https://example.com/original");
+        assert!(result.is_ok());
+        let (_text, _title, url) = result.unwrap();
+        assert_eq!(
+            url,
+            "https://example.com/canonical-page",
+            "Should return canonical URL when present"
+        );
+    }
+
+    #[test]
+    fn test_no_canonical_returns_input_url() {
+        let html = r#"
+            <html>
+                <head><title>Test Page</title></head>
+                <body>
+                    <article>
+                        <p>This is the main article content with lots of text.
+                        It has multiple sentences, and commas too.
+                        The article discusses important topics that readers care about.</p>
+                    </article>
+                </body>
+            </html>
+        "#;
+
+        let result = find_main_content(html.as_bytes(), "https://example.com/original");
+        assert!(result.is_ok());
+        let (_text, _title, url) = result.unwrap();
+        assert_eq!(url, "https://example.com/original", "Should return input URL when no canonical");
+    }
+
+    #[test]
+    fn test_relative_canonical_resolved() {
+        let html = r#"
+            <html>
+                <head>
+                    <title>Test Page</title>
+                    <link rel="canonical" href="/canonical-page">
+                </head>
+                <body>
+                    <article>
+                        <p>This is the main article content with lots of text.
+                        It has multiple sentences, and commas too.
+                        The article discusses important topics that readers care about.</p>
+                    </article>
+                </body>
+            </html>
+        "#;
+
+        let result = find_main_content(html.as_bytes(), "https://example.com/some/path/page.html");
+        assert!(result.is_ok());
+        let (_text, _title, url) = result.unwrap();
+        assert_eq!(url, "https://example.com/canonical-page", "Should resolve relative canonical against base URL");
     }
 
     #[test]
@@ -808,12 +912,12 @@ mod tests {
             </html>
         "#;
 
-        let result = find_main_content(html.as_bytes());
+        let result = find_main_content(html.as_bytes(), "https://example.com/test");
         assert!(
             result.is_ok(),
             "Should find content in semantic tags without id/class"
         );
-        let (text, _title) = result.unwrap();
+        let (text, _title, _canonical) = result.unwrap();
         assert!(
             text.contains("main article content"),
             "Expected article text, got: {}",
@@ -841,9 +945,9 @@ mod tests {
             </html>
         "#;
 
-        let result = find_main_content(html.as_bytes());
+        let result = find_main_content(html.as_bytes(), "https://example.com/test");
         assert!(result.is_ok());
-        let (text, _title) = result.unwrap();
+        let (text, _title, _canonical) = result.unwrap();
         assert!(
             text.contains("actual main content"),
             "Large content should beat small element, got: {}",
@@ -874,9 +978,9 @@ mod tests {
             </html>
         "#;
 
-        let result = find_main_content(html.as_bytes());
+        let result = find_main_content(html.as_bytes(), "https://example.com/test");
         assert!(result.is_ok());
-        let (text, _title) = result.unwrap();
+        let (text, _title, _canonical) = result.unwrap();
         assert!(
             text.contains("actual wiki article"),
             "Should find article content, got: {}",
@@ -914,9 +1018,9 @@ mod tests {
             </html>
         "#;
 
-        let result = find_main_content(html.as_bytes());
+        let result = find_main_content(html.as_bytes(), "https://example.com/test");
         assert!(result.is_ok());
-        let (text, _title) = result.unwrap();
+        let (text, _title, _canonical) = result.unwrap();
         // section-a is LONGER but has 100% link density -> score *= ~0
         // section-b is SHORTER but has 0% link density -> no penalty
         // section-b should win despite being shorter
@@ -946,9 +1050,9 @@ mod tests {
             </html>
         "#;
 
-        let result = find_main_content(html.as_bytes());
+        let result = find_main_content(html.as_bytes(), "https://example.com/test");
         assert!(result.is_ok());
-        let (text, _title) = result.unwrap();
+        let (text, _title, _canonical) = result.unwrap();
         assert!(
             text.contains("actual article content"),
             "Should find article, not index garbage, got: {}",
@@ -958,5 +1062,41 @@ mod tests {
             !text.contains("a a a"),
             "Should not select single-letter garbage"
         );
+    }
+
+    #[test]
+    fn test_url_normalization_trailing_slash() {
+        let html = r#"
+            <html>
+                <head><title>Test</title></head>
+                <body>
+                    <article>
+                        <p>This is the main article content with lots of text.
+                        It has multiple sentences, and commas too.
+                        The article discusses important topics that readers care about.</p>
+                    </article>
+                </body>
+            </html>
+        "#;
+
+        // Trailing slash should be stripped
+        let result = find_main_content(html.as_bytes(), "https://example.com/page/");
+        let (_text, _title, url) = result.unwrap();
+        assert_eq!(url, "https://example.com/page", "Should strip trailing slash");
+
+        // Root path should keep its slash
+        let result = find_main_content(html.as_bytes(), "https://example.com/");
+        let (_text, _title, url) = result.unwrap();
+        assert_eq!(url, "https://example.com/", "Should keep trailing slash for root");
+
+        // Host should be lowercased
+        let result = find_main_content(html.as_bytes(), "https://EXAMPLE.COM/page");
+        let (_text, _title, url) = result.unwrap();
+        assert_eq!(url, "https://example.com/page", "Should lowercase host");
+
+        // Path case should be preserved (important for base64 params etc)
+        let result = find_main_content(html.as_bytes(), "https://example.com/Page/ABC123");
+        let (_text, _title, url) = result.unwrap();
+        assert_eq!(url, "https://example.com/Page/ABC123", "Should preserve path case");
     }
 }

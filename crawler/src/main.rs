@@ -9,7 +9,7 @@ use tantivy::schema::{
     IndexRecordOption, Schema, TextFieldIndexing, TextOptions, FAST, STORED, STRING, TEXT,
 };
 use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
-use tantivy::Index;
+use tantivy::{Index, Term};
 use tokio::sync::{mpsc, oneshot};
 use unicode_normalization::UnicodeNormalization;
 use url::Url;
@@ -155,20 +155,24 @@ impl CrawlDb {
 
     /// Returns: true = indexed, false = failed
     fn process_page(&mut self, url: &str, domain: &str, html: &str) -> bool {
-        // Parse HTML to extract readable content
-        let (readable_text, page_title) = match lol_readability::find_main_content(html.as_bytes())
-        {
-            Ok(result) => result,
-            Err(_) => return false,
-        };
+        // Parse HTML to extract readable content (returns canonical URL if present)
+        let (readable_text, page_title, resolved_url) =
+            match lol_readability::find_main_content(html.as_bytes(), url) {
+                Ok(result) => result,
+                Err(_) => return false,
+            };
 
         // Normalize unicode
         let content: String = readable_text.nfkc().collect();
         let title: String = page_title.nfkc().collect();
 
+        // Delete any existing document with this URL (idiomatic upsert pattern)
+        let url_term = Term::from_field_text(self.url_field, &resolved_url);
+        self.index_writer.delete_term(url_term);
+
         // Index the document
         let mut doc = tantivy::TantivyDocument::new();
-        doc.add_text(self.url_field, url);
+        doc.add_text(self.url_field, &resolved_url);
         doc.add_text(self.domain_field, domain);
         doc.add_text(self.title_field, &title);
         doc.add_text(self.body_field, &content);
@@ -177,8 +181,8 @@ impl CrawlDb {
     }
 
     fn commit(&mut self) -> Result<u64> {
-        let reader = self.index.reader()?;
         self.index_writer.commit()?;
+        let reader = self.index.reader()?;
         Ok(reader.searcher().num_docs())
     }
 
@@ -253,6 +257,7 @@ async fn crawl_domain(
     website.configuration.subdomains = false;
     website.configuration.depth = max_depth;
     website.with_limit(1);
+    website.with_normalize(true);
 
     if !excluded_prefixes.is_empty() {
         website.with_blacklist_url(Some(
