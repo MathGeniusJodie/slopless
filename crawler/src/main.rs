@@ -22,9 +22,7 @@ struct Args {
     input_file: String,
     #[arg(short = 'x', long = "exclude")]
     excluded_url_prefixes: Vec<String>,
-    #[arg(short = 'd', long = "depth", default_value_t = 5)]
-    max_crawl_depth: usize,
-    #[arg(short = 'c', long = "concurrency", default_value_t = 50)]
+    #[arg(short = 'c', long = "concurrency", default_value_t = 200)]
     max_concurrent_domains: usize,
     #[arg(short = 'v', long = "verbose", default_value_t = false)]
     verbose_logging: bool,
@@ -241,20 +239,25 @@ fn load_domains(file_path: &str) -> Result<Vec<String>> {
     Ok(domains)
 }
 
+const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
+const CRAWL_DEPTH: usize = 25;
+
 /// Crawl a single domain using spider
 async fn crawl_domain(
     domain: String,
     db: DbHandle,
-    max_depth: usize,
     excluded_prefixes: Arc<Vec<String>>,
+    verbose: bool,
 ) {
     let url = format!("https://{}/", domain);
     let mut website = Website::new(&url);
 
     website.configuration.respect_robots_txt = true;
-    website.configuration.subdomains = false;
-    website.configuration.depth = max_depth;
-    website.with_normalize(true);
+    website.configuration.subdomains = true;
+    website.configuration.depth = CRAWL_DEPTH;
+    website.configuration.only_html = true;
+    website.configuration.delay = 5000; // 5 second delay between requests
+    website.with_user_agent(Some(USER_AGENT));
 
     if !excluded_prefixes.is_empty() {
         website.with_blacklist_url(Some(
@@ -262,7 +265,7 @@ async fn crawl_domain(
         ));
     }
 
-    let Some(mut rx) = website.subscribe(256) else {
+    let Some(mut rx) = website.subscribe(16384) else {
         eprintln!("Failed to subscribe to {} crawl events", domain);
         return;
     };
@@ -273,28 +276,63 @@ async fn crawl_domain(
     });
 
     // Process pages as they stream in
-    while let Ok(page) = rx.recv().await {
+    let mut pages_received = 0usize;
+    let mut pages_empty_html = 0usize;
+    let mut pages_readability_failed = 0usize;
+    let mut pages_indexed = 0usize;
+    let mut lagged_count = 0usize;
+
+    loop {
+        let page = match rx.recv().await {
+            Ok(page) => page,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                lagged_count += n as usize;
+                continue;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        };
+
+        pages_received += 1;
+        if verbose {
+            eprintln!("[{}] Page: {}", domain, page.get_url());
+        }
         let html = page.get_html();
-        if !html.is_empty() {
-            // Use final redirect destination to handle redirects properly
-            let url = page
-                .final_redirect_destination
-                .as_deref()
-                .unwrap_or_else(|| page.get_url());
-            // Extract readable content from HTML
-            if let Ok((content, title, resolved_url)) =
-                lol_readability::find_main_content(html.as_bytes(), url)
-            {
+        if html.is_empty() {
+            pages_empty_html += 1;
+            if verbose {
+                eprintln!("[{}] Empty HTML: {}", domain, page.get_url());
+            }
+            continue;
+        }
+
+        // Use final redirect destination to handle redirects properly
+        let url = page
+            .final_redirect_destination
+            .as_deref()
+            .unwrap_or_else(|| page.get_url());
+        // Extract readable content from HTML
+        match lol_readability::find_main_content(html.as_bytes(), url) {
+            Ok((content, title, resolved_url)) => {
                 db.process_page(resolved_url, domain.clone(), title, content)
                     .await;
+                pages_indexed += 1;
+            }
+            Err(e) => {
+                pages_readability_failed += 1;
+                if verbose {
+                    eprintln!("[{}] Readability failed for {}: {}", domain, url, e);
+                }
             }
         }
     }
 
-    // Ensure crawl task completed
     let _ = crawl_handle.await;
-
-    println!("Finished crawling {}", domain);
+    if pages_received != 0 {
+        println!(
+            "Finished crawling {} - received: {}, empty: {}, readability_failed: {}, indexed: {}, lagged: {}",
+            domain, pages_received, pages_empty_html, pages_readability_failed, pages_indexed, lagged_count
+        );
+    }
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 20)]
@@ -311,9 +349,8 @@ async fn main() -> Result<()> {
     println!("Loaded {} domains to crawl", domains.len());
 
     let excluded_prefixes = Arc::new(cli_args.excluded_url_prefixes);
-    let max_depth = cli_args.max_crawl_depth;
-    let verbose = cli_args.verbose_logging;
     let max_concurrent = cli_args.max_concurrent_domains;
+    let verbose = cli_args.verbose_logging;
 
     // Spawn background task for periodic status updates and commits
     let db_for_status = db.clone();
@@ -343,7 +380,7 @@ async fn main() -> Result<()> {
             let db = db.clone();
             let excluded = excluded_prefixes.clone();
             async move {
-                crawl_domain(domain, db, max_depth, excluded, verbose).await;
+                crawl_domain(domain, db, excluded, verbose).await;
             }
         })
         .await;
