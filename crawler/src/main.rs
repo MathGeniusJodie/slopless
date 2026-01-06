@@ -5,13 +5,11 @@ use spider::website::Website;
 use std::fs::read_to_string;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tantivy::collector::TopDocs;
-use tantivy::query::TermQuery;
 use tantivy::schema::{
-    IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, FAST, STORED, STRING, TEXT,
+    IndexRecordOption, Schema, TextFieldIndexing, TextOptions, FAST, STORED, STRING, TEXT,
 };
 use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
-use tantivy::{Index, Term};
+use tantivy::Index;
 use tokio::sync::{mpsc, oneshot};
 use unicode_normalization::UnicodeNormalization;
 use url::Url;
@@ -45,11 +43,6 @@ enum DbMessage {
         url: String,
         domain: String,
         html: String,
-        reply: oneshot::Sender<bool>, // true = indexed, false = failed
-    },
-    GetUrlsForDomain {
-        domain: String,
-        reply: oneshot::Sender<Vec<String>>,
     },
     Commit {
         reply: oneshot::Sender<Result<u64>>,
@@ -64,27 +57,11 @@ struct DbHandle {
 }
 
 impl DbHandle {
-    async fn process_page(&self, url: String, domain: String, html: String) -> bool {
-        let (reply, rx) = oneshot::channel();
+    async fn process_page(&self, url: String, domain: String, html: String) {
         self.tx
-            .send(DbMessage::ProcessPage {
-                url,
-                domain,
-                html,
-                reply,
-            })
+            .send(DbMessage::ProcessPage { url, domain, html })
             .await
             .ok();
-        rx.await.unwrap_or(false)
-    }
-
-    async fn get_urls_for_domain(&self, domain: String) -> Vec<String> {
-        let (reply, rx) = oneshot::channel();
-        self.tx
-            .send(DbMessage::GetUrlsForDomain { domain, reply })
-            .await
-            .ok();
-        rx.await.unwrap_or_default()
     }
 
     async fn commit(&self) -> Result<u64> {
@@ -176,6 +153,7 @@ impl CrawlDb {
         })
     }
 
+    /// Returns: true = indexed, false = failed
     fn process_page(&mut self, url: &str, domain: &str, html: &str) -> bool {
         // Parse HTML to extract readable content
         let (readable_text, page_title) = match lol_readability::find_main_content(html.as_bytes())
@@ -204,47 +182,18 @@ impl CrawlDb {
         Ok(reader.searcher().num_docs())
     }
 
-    fn get_urls_for_domain(&self, domain: &str) -> Vec<String> {
-        let Ok(reader) = self.index.reader() else {
-            return Vec::new();
-        };
-        let searcher = reader.searcher();
-
-        let term = Term::from_field_text(self.domain_field, domain);
-        let query = TermQuery::new(term, IndexRecordOption::Basic);
-
-        let Ok(top_docs) = searcher.search(&query, &TopDocs::with_limit(100_000)) else {
-            return Vec::new();
-        };
-
-        top_docs
-            .into_iter()
-            .filter_map(|(_, doc_address)| {
-                let doc: tantivy::TantivyDocument = searcher.doc(doc_address).ok()?;
-                doc.get_first(self.url_field)?.as_str().map(String::from)
-            })
-            .collect()
-    }
-
-    fn run(mut self, mut rx: mpsc::Receiver<DbMessage>) {
+    fn run(mut self, mut rx: mpsc::Receiver<DbMessage>, metrics: Arc<CrawlMetrics>) {
         while let Some(msg) = rx.blocking_recv() {
             match msg {
-                DbMessage::ProcessPage {
-                    url,
-                    domain,
-                    html,
-                    reply,
-                } => {
-                    let success = self.process_page(&url, &domain, &html);
-                    reply.send(success).ok();
-                }
-                DbMessage::GetUrlsForDomain { domain, reply } => {
-                    let urls = self.get_urls_for_domain(&domain);
-                    reply.send(urls).ok();
+                DbMessage::ProcessPage { url, domain, html } => {
+                    if self.process_page(&url, &domain, &html) {
+                        metrics.pages_crawled.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        metrics.pages_failed.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 DbMessage::Commit { reply } => {
-                    let result = self.commit();
-                    reply.send(result).ok();
+                    reply.send(self.commit()).ok();
                 }
                 DbMessage::Shutdown => break,
             }
@@ -253,10 +202,10 @@ impl CrawlDb {
 }
 
 /// Spawn the DB thread and return a handle for communication
-fn spawn_db_thread() -> Result<(DbHandle, std::thread::JoinHandle<()>)> {
+fn spawn_db_thread(metrics: Arc<CrawlMetrics>) -> Result<(DbHandle, std::thread::JoinHandle<()>)> {
     let db = CrawlDb::new()?;
     let (tx, rx) = mpsc::channel(1024);
-    let handle = std::thread::spawn(move || db.run(rx));
+    let handle = std::thread::spawn(move || db.run(rx, metrics));
     Ok((DbHandle { tx }, handle))
 }
 
@@ -293,22 +242,11 @@ fn load_domains(file_path: &str) -> Result<Vec<String>> {
 async fn crawl_domain(
     domain: String,
     db: DbHandle,
-    metrics: Arc<CrawlMetrics>,
     max_depth: usize,
     excluded_prefixes: Arc<Vec<String>>,
     verbose: bool,
 ) {
     let url = format!("https://{}/", domain);
-
-    let existing_urls = db.get_urls_for_domain(domain.clone()).await;
-    if verbose && !existing_urls.is_empty() {
-        println!(
-            "{}: skipping {} already-indexed URLs",
-            domain,
-            existing_urls.len()
-        );
-    }
-
     let mut website = Website::new(&url);
 
     website.configuration.respect_robots_txt = true;
@@ -316,12 +254,10 @@ async fn crawl_domain(
     website.configuration.depth = max_depth;
     website.with_limit(1);
 
-    let blacklist: Vec<String> = existing_urls
-        .into_iter()
-        .chain(excluded_prefixes.iter().cloned())
-        .collect();
-    if !blacklist.is_empty() {
-        website.with_blacklist_url(Some(blacklist.into_iter().map(Into::into).collect()));
+    if !excluded_prefixes.is_empty() {
+        website.with_blacklist_url(Some(
+            excluded_prefixes.iter().cloned().map(Into::into).collect(),
+        ));
     }
 
     let mut rx = match website.subscribe(16) {
@@ -334,34 +270,32 @@ async fn crawl_domain(
         }
     };
 
-    // Forward pages to DB thread for processing
-    let processor = tokio::spawn({
-        let db = db.clone();
-        let metrics = metrics.clone();
-        let domain = domain.clone();
-        async move {
-            while let Ok(page) = rx.recv().await {
-                let html = page.get_html();
-                if html.is_empty() {
-                    continue;
-                }
+    let crawl = website.crawl();
+    tokio::pin!(crawl);
 
-                let success = db
-                    .process_page(page.get_url().to_string(), domain.clone(), html)
-                    .await;
-
-                if success {
-                    metrics.pages_crawled.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    metrics.pages_failed.fetch_add(1, Ordering::Relaxed);
+    let mut crawl_done = false;
+    loop {
+        tokio::select! {
+            biased;
+            result = rx.recv() => {
+                match result {
+                    Ok(page) => {
+                        let html = page.get_html();
+                        if !html.is_empty() {
+                            db.process_page(page.get_url().to_string(), domain.clone(), html).await;
+                        }
+                    }
+                    Err(_) => break,
                 }
             }
+            _ = &mut crawl, if !crawl_done => {
+                crawl_done = true;
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)), if crawl_done => {
+                break;
+            }
         }
-    });
-
-    website.crawl().await;
-    drop(website);
-    let _ = processor.await;
+    }
 
     if verbose {
         println!("Finished crawling {}", domain);
@@ -372,11 +306,11 @@ async fn crawl_domain(
 async fn main() -> Result<()> {
     let cli_args = Args::parse();
 
-    let (db, db_thread) = spawn_db_thread()?;
     let metrics = Arc::new(CrawlMetrics {
         pages_crawled: AtomicUsize::new(0),
         pages_failed: AtomicUsize::new(0),
     });
+    let (db, db_thread) = spawn_db_thread(metrics.clone())?;
 
     let domains = load_domains(&cli_args.input_file)?;
     println!("Loaded {} domains to crawl", domains.len());
@@ -412,10 +346,9 @@ async fn main() -> Result<()> {
     futures::stream::iter(domains)
         .for_each_concurrent(max_concurrent, |domain| {
             let db = db.clone();
-            let metrics = metrics.clone();
             let excluded = excluded_prefixes.clone();
             async move {
-                crawl_domain(domain, db, metrics, max_depth, excluded, verbose).await;
+                crawl_domain(domain, db, max_depth, excluded, verbose).await;
             }
         })
         .await;

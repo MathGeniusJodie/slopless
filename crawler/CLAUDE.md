@@ -87,11 +87,10 @@ rm -rf search_db/
 
 1. Parse seed domains from input file
 2. Initialize Tantivy index (reuses existing `search_db/` if present)
-3. Create shared `CrawlDb` (Mutex-protected) and `CrawlMetrics` (atomic counters)
+3. Create shared `CrawlDb` and `CrawlMetrics` (atomic counters)
 4. Start background task for periodic status updates and index commits
 5. Crawl domains concurrently using `for_each_concurrent`:
    - Each domain uses spider library with depth limit and robots.txt respect
-   - Query existing URLs for domain (via indexed `domain` field) to build blacklist
    - Subscribe to page events, extract content, index to Tantivy
 6. Final commit when all domains complete
 
@@ -100,7 +99,7 @@ rm -rf search_db/
 - **Domain-level concurrency**: Configurable max concurrent domains (default 50)
 - **Per-domain rate limiting**: Spider configured with `with_limit(1)` - one request at a time per domain
 - **Lock-free metrics**: Atomic counters avoid contention during status updates
-- **Mutex for indexing**: `CrawlDb` protected by Mutex, but lock held only during index operations
+- **Dedicated DB thread**: `CrawlDb` runs in its own thread, communicates via mpsc channel
 
 ### Tantivy Schema
 
@@ -141,8 +140,20 @@ The element with the highest final score becomes the main content.
 - `depth`: Configurable crawl depth (default 5)
 - `with_limit(1)`: One concurrent request per domain
 
-### URL Deduplication
-When resuming a crawl, existing URLs for each domain are queried from Tantivy using an efficient term query on the indexed `domain` field, then added to spider's blacklist.
+### IMPORTANT: Stream pages, don't buffer them
+**DO NOT use `website.scrape()` + `website.get_pages()`** - this buffers all pages in memory and will cause OOM on large crawls.
+
+Instead, use `website.subscribe()` to get a channel, spawn the crawl in a separate tokio task (so the Website is dropped when done, closing the channel), and process pages as they stream in:
+```rust
+let mut rx = website.subscribe(16).unwrap();
+let crawl_task = tokio::spawn(async move {
+    website.crawl().await;
+});
+while let Ok(page) = rx.recv().await {
+    // process page
+}
+let _ = crawl_task.await;
+```
 
 ### Unicode Normalization
 Page content is normalized with NFKC before indexing to handle equivalent Unicode representations.
