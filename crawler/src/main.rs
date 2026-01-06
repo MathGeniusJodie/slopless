@@ -4,17 +4,19 @@ use futures::StreamExt;
 use spider::website::Website;
 use std::fs::read_to_string;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tantivy::collector::TopDocs;
+use tantivy::query::TermQuery;
 use tantivy::schema::{
-    IndexRecordOption, Schema, TextFieldIndexing, TextOptions, FAST, STORED, STRING, TEXT,
+    IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, FAST, STORED, STRING, TEXT,
 };
 use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
 use tantivy::{Index, Term};
+use tokio::sync::{mpsc, oneshot};
 use unicode_normalization::UnicodeNormalization;
 use url::Url;
 
 mod lol_readability;
-use lol_readability::find_main_content;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -37,19 +39,77 @@ struct CrawlMetrics {
     pages_failed: AtomicUsize,
 }
 
-/// Manages Tantivy search index
+/// Messages sent to the DB thread
+enum DbMessage {
+    ProcessPage {
+        url: String,
+        domain: String,
+        html: String,
+        reply: oneshot::Sender<bool>, // true = indexed, false = failed
+    },
+    GetUrlsForDomain {
+        domain: String,
+        reply: oneshot::Sender<Vec<String>>,
+    },
+    Commit {
+        reply: oneshot::Sender<Result<u64>>,
+    },
+    Shutdown,
+}
+
+/// Handle to communicate with the DB thread
+#[derive(Clone)]
+struct DbHandle {
+    tx: mpsc::Sender<DbMessage>,
+}
+
+impl DbHandle {
+    async fn process_page(&self, url: String, domain: String, html: String) -> bool {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(DbMessage::ProcessPage {
+                url,
+                domain,
+                html,
+                reply,
+            })
+            .await
+            .ok();
+        rx.await.unwrap_or(false)
+    }
+
+    async fn get_urls_for_domain(&self, domain: String) -> Vec<String> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(DbMessage::GetUrlsForDomain { domain, reply })
+            .await
+            .ok();
+        rx.await.unwrap_or_default()
+    }
+
+    async fn commit(&self) -> Result<u64> {
+        let (reply, rx) = oneshot::channel();
+        self.tx.send(DbMessage::Commit { reply }).await.ok();
+        rx.await?
+    }
+
+    async fn shutdown(&self) {
+        self.tx.send(DbMessage::Shutdown).await.ok();
+    }
+}
+
+/// Manages Tantivy search index (runs in dedicated thread)
 struct CrawlDb {
     index: Index,
     index_writer: tantivy::IndexWriter,
     url_field: tantivy::schema::Field,
-    domain_field: Option<tantivy::schema::Field>, // Optional for backwards compatibility
+    domain_field: tantivy::schema::Field,
     title_field: tantivy::schema::Field,
     body_field: tantivy::schema::Field,
 }
 
 impl CrawlDb {
     fn new() -> Result<Self> {
-        // Set up search tokenizer with lowercasing and stemming
         let search_tokenizer = TextAnalyzer::builder(SimpleTokenizer::default())
             .filter(LowerCaser)
             .filter(tantivy::tokenizer::Stemmer::new(
@@ -57,36 +117,26 @@ impl CrawlDb {
             ))
             .build();
 
-        // Open existing index or create new one
         let (index, url_field, domain_field, title_field, body_field) =
             if std::path::Path::new("search_db").exists() {
-                // Open existing index and use its schema
                 let index = Index::open_in_dir("search_db")?;
                 let schema = index.schema();
 
                 let url_field = schema
                     .get_field("url")
                     .context("Existing index missing 'url' field")?;
+                let domain_field = schema
+                    .get_field("domain")
+                    .context("Existing index missing 'domain' field - delete search_db/ and re-crawl")?;
                 let title_field = schema
                     .get_field("title")
                     .context("Existing index missing 'title' field")?;
                 let body_field = schema
                     .get_field("body")
                     .context("Existing index missing 'body' field")?;
-                // domain field may not exist in old indexes
-                let domain_field = schema.get_field("domain").ok();
-
-                if domain_field.is_none() {
-                    eprintln!(
-                        "Warning: Existing index lacks 'domain' field. \
-                         URL lookups will use slower regex queries. \
-                         Delete search_db/ and re-crawl for better performance."
-                    );
-                }
 
                 (index, url_field, domain_field, title_field, body_field)
             } else {
-                // Build new schema with domain field
                 let body_field_indexing = TextFieldIndexing::default()
                     .set_tokenizer("norm_tokenizer")
                     .set_index_option(IndexRecordOption::WithFreqsAndPositions);
@@ -107,7 +157,7 @@ impl CrawlDb {
                     tantivy::IndexSettings::default(),
                 )?;
 
-                (index, url_field, Some(domain_field), title_field, body_field)
+                (index, url_field, domain_field, title_field, body_field)
             };
 
         index
@@ -126,49 +176,44 @@ impl CrawlDb {
         })
     }
 
-    fn index_page(&mut self, url: &str, domain: &str, title: &str, content: &str) -> Result<()> {
+    fn process_page(&mut self, url: &str, domain: &str, html: &str) -> bool {
+        // Parse HTML to extract readable content
+        let (readable_text, page_title) = match lol_readability::find_main_content(html.as_bytes())
+        {
+            Ok(result) => result,
+            Err(_) => return false,
+        };
+
+        // Normalize unicode
+        let content: String = readable_text.nfkc().collect();
+        let title: String = page_title.nfkc().collect();
+
+        // Index the document
         let mut doc = tantivy::TantivyDocument::new();
         doc.add_text(self.url_field, url);
-        if let Some(domain_field) = self.domain_field {
-            doc.add_text(domain_field, domain);
-        }
-        doc.add_text(self.title_field, title);
-        doc.add_text(self.body_field, content);
-        self.index_writer.add_document(doc)?;
-        Ok(())
+        doc.add_text(self.domain_field, domain);
+        doc.add_text(self.title_field, &title);
+        doc.add_text(self.body_field, &content);
+
+        self.index_writer.add_document(doc).is_ok()
     }
 
-    fn commit(&mut self) -> Result<()> {
+    fn commit(&mut self) -> Result<u64> {
+        let reader = self.index.reader()?;
         self.index_writer.commit()?;
-        Ok(())
+        Ok(reader.searcher().num_docs())
     }
 
-    /// Get all indexed URLs for a domain
     fn get_urls_for_domain(&self, domain: &str) -> Vec<String> {
-        use tantivy::collector::TopDocs;
-        use tantivy::schema::Value;
-
         let Ok(reader) = self.index.reader() else {
             return Vec::new();
         };
         let searcher = reader.searcher();
 
-        // Use efficient term query if domain field exists, otherwise fall back to regex
-        let top_docs = if let Some(domain_field) = self.domain_field {
-            use tantivy::query::TermQuery;
-            let term = Term::from_field_text(domain_field, domain);
-            let query = TermQuery::new(term, IndexRecordOption::Basic);
-            searcher.search(&query, &TopDocs::with_limit(100_000))
-        } else {
-            use tantivy::query::RegexQuery;
-            let pattern = format!("https://{}/.*", regex::escape(domain));
-            let Ok(query) = RegexQuery::from_pattern(&pattern, self.url_field) else {
-                return Vec::new();
-            };
-            searcher.search(&query, &TopDocs::with_limit(100_000))
-        };
+        let term = Term::from_field_text(self.domain_field, domain);
+        let query = TermQuery::new(term, IndexRecordOption::Basic);
 
-        let Ok(top_docs) = top_docs else {
+        let Ok(top_docs) = searcher.search(&query, &TopDocs::with_limit(100_000)) else {
             return Vec::new();
         };
 
@@ -180,6 +225,39 @@ impl CrawlDb {
             })
             .collect()
     }
+
+    fn run(mut self, mut rx: mpsc::Receiver<DbMessage>) {
+        while let Some(msg) = rx.blocking_recv() {
+            match msg {
+                DbMessage::ProcessPage {
+                    url,
+                    domain,
+                    html,
+                    reply,
+                } => {
+                    let success = self.process_page(&url, &domain, &html);
+                    reply.send(success).ok();
+                }
+                DbMessage::GetUrlsForDomain { domain, reply } => {
+                    let urls = self.get_urls_for_domain(&domain);
+                    reply.send(urls).ok();
+                }
+                DbMessage::Commit { reply } => {
+                    let result = self.commit();
+                    reply.send(result).ok();
+                }
+                DbMessage::Shutdown => break,
+            }
+        }
+    }
+}
+
+/// Spawn the DB thread and return a handle for communication
+fn spawn_db_thread() -> Result<(DbHandle, std::thread::JoinHandle<()>)> {
+    let db = CrawlDb::new()?;
+    let (tx, rx) = mpsc::channel(1024);
+    let handle = std::thread::spawn(move || db.run(rx));
+    Ok((DbHandle { tx }, handle))
 }
 
 /// Load domain list from file
@@ -195,13 +273,11 @@ fn load_domains(file_path: &str) -> Result<Vec<String>> {
             continue;
         }
 
-        // Clean domain (remove http:// or https:// prefix if present)
         let clean_domain = domain
             .trim_start_matches("http://")
             .trim_start_matches("https://")
             .trim_end_matches('/');
 
-        // Validate by parsing as URL
         let url_str = format!("https://{}/", clean_domain);
         if Url::parse(&url_str).is_ok() {
             domains.push(clean_domain.to_string());
@@ -216,7 +292,7 @@ fn load_domains(file_path: &str) -> Result<Vec<String>> {
 /// Crawl a single domain using spider
 async fn crawl_domain(
     domain: String,
-    db: Arc<Mutex<CrawlDb>>,
+    db: DbHandle,
     metrics: Arc<CrawlMetrics>,
     max_depth: usize,
     excluded_prefixes: Arc<Vec<String>>,
@@ -224,24 +300,22 @@ async fn crawl_domain(
 ) {
     let url = format!("https://{}/", domain);
 
-    // Get already-indexed URLs for this domain to skip
-    let existing_urls: Vec<String> = {
-        let db = db.lock().unwrap();
-        db.get_urls_for_domain(&domain)
-    };
+    let existing_urls = db.get_urls_for_domain(domain.clone()).await;
     if verbose && !existing_urls.is_empty() {
-        println!("{}: skipping {} already-indexed URLs", domain, existing_urls.len());
+        println!(
+            "{}: skipping {} already-indexed URLs",
+            domain,
+            existing_urls.len()
+        );
     }
 
     let mut website = Website::new(&url);
 
-    // Configure spider for polite crawling: 1 request at a time per domain
     website.configuration.respect_robots_txt = true;
     website.configuration.subdomains = false;
     website.configuration.depth = max_depth;
     website.with_limit(1);
 
-    // Build blacklist: existing URLs + excluded prefixes
     let blacklist: Vec<String> = existing_urls
         .into_iter()
         .chain(excluded_prefixes.iter().cloned())
@@ -250,8 +324,7 @@ async fn crawl_domain(
         website.with_blacklist_url(Some(blacklist.into_iter().map(Into::into).collect()));
     }
 
-    // Subscribe to page events
-    let mut rx = match website.subscribe(256) {
+    let mut rx = match website.subscribe(16) {
         Some(rx) => rx,
         None => {
             if verbose {
@@ -261,56 +334,32 @@ async fn crawl_domain(
         }
     };
 
-    // Spawn task to process received pages
+    // Forward pages to DB thread for processing
     let processor = tokio::spawn({
         let db = db.clone();
         let metrics = metrics.clone();
         let domain = domain.clone();
         async move {
             while let Ok(page) = rx.recv().await {
-                let page_url = page.get_url();
-
-                // Get HTML content
                 let html = page.get_html();
                 if html.is_empty() {
                     continue;
                 }
 
-                // Extract readable content
-                let (readable_text, page_title) = match find_main_content(html.as_bytes()) {
-                    Ok(result) => result,
-                    Err(e) => {
-                        if verbose {
-                            eprintln!("Error extracting content from {}: {:?}", page_url, e);
-                        }
-                        metrics.pages_failed.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                };
+                let success = db
+                    .process_page(page.get_url().to_string(), domain.clone(), html)
+                    .await;
 
-                // Normalize and index
-                let content: String = readable_text.nfkc().collect();
-                let title: String = page_title.nfkc().collect();
-
-                {
-                    let mut db = db.lock().unwrap();
-                    if let Err(e) = db.index_page(page_url, &domain, &title, &content) {
-                        if verbose {
-                            eprintln!("Error indexing {}: {:?}", page_url, e);
-                        }
-                        metrics.pages_failed.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        metrics.pages_crawled.fetch_add(1, Ordering::Relaxed);
-                    }
+                if success {
+                    metrics.pages_crawled.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    metrics.pages_failed.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
     });
 
-    // Start the crawl
     website.crawl().await;
-
-    // Wait for processor to finish
     drop(website);
     let _ = processor.await;
 
@@ -323,7 +372,7 @@ async fn crawl_domain(
 async fn main() -> Result<()> {
     let cli_args = Args::parse();
 
-    let db = Arc::new(Mutex::new(CrawlDb::new()?));
+    let (db, db_thread) = spawn_db_thread()?;
     let metrics = Arc::new(CrawlMetrics {
         pages_crawled: AtomicUsize::new(0),
         pages_failed: AtomicUsize::new(0),
@@ -345,30 +394,21 @@ async fn main() -> Result<()> {
         loop {
             interval.tick().await;
 
-            // Read metrics without holding the lock
             let crawled = metrics_for_status.pages_crawled.load(Ordering::Relaxed);
             let failed = metrics_for_status.pages_failed.load(Ordering::Relaxed);
             println!("Pages indexed: {}, Failed: {}", crawled, failed);
 
-            // Acquire lock only for commit operation
-            let commit_result = {
-                let mut db = db_for_status.lock().unwrap();
-                db.commit()
-            };
-
-            if let Err(e) = commit_result {
-                eprintln!("Warning: Failed to commit index: {:?}", e);
-            } else {
-                // Read doc count without holding the mutex
-                let db = db_for_status.lock().unwrap();
-                if let Ok(reader) = db.index.reader() {
-                    println!("  Total indexed documents: {}", reader.searcher().num_docs());
+            match db_for_status.commit().await {
+                Ok(doc_count) => {
+                    println!("  Total indexed documents: {}", doc_count);
+                }
+                Err(e) => {
+                    eprintln!("Warning: Failed to commit index: {:?}", e);
                 }
             }
         }
     });
 
-    // Use for_each_concurrent to crawl domains with max concurrency
     futures::stream::iter(domains)
         .for_each_concurrent(max_concurrent, |domain| {
             let db = db.clone();
@@ -380,22 +420,25 @@ async fn main() -> Result<()> {
         })
         .await;
 
-    // Cancel the status task
     status_task.abort();
 
     // Final commit
-    {
-        let mut db = db.lock().unwrap();
-        db.commit()?;
-        let crawled = metrics.pages_crawled.load(Ordering::Relaxed);
-        let failed = metrics.pages_failed.load(Ordering::Relaxed);
-        println!(
-            "Crawl finished. Pages indexed: {}, Failed: {}, Total docs: {}",
-            crawled,
-            failed,
-            db.index.reader()?.searcher().num_docs()
-        );
+    let crawled = metrics.pages_crawled.load(Ordering::Relaxed);
+    let failed = metrics.pages_failed.load(Ordering::Relaxed);
+    match db.commit().await {
+        Ok(doc_count) => {
+            println!(
+                "Crawl finished. Pages indexed: {}, Failed: {}, Total docs: {}",
+                crawled, failed, doc_count
+            );
+        }
+        Err(e) => {
+            eprintln!("Final commit failed: {:?}", e);
+        }
     }
+
+    db.shutdown().await;
+    db_thread.join().ok();
 
     Ok(())
 }
