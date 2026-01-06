@@ -5,19 +5,16 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }
-reqwest = { version = "0.13.1", features = ["json", "stream", "rustls"] }
 lol_html = "2.7.0"
 tantivy = "0.25.0"
 url = "2.4"
 anyhow = "1.0"
 regex = "1"
 futures = "0.3"
-bytes = "1.11.0"
 clap = { version = "4.0", features = ["derive"] }
-ahash = "0.8.12"
 unicode-normalization = "0.1.25"
-fastbloom = "0.14.0"
-texting_robots = "0.2"
-sitemap = "0.4"
+spider = { version = "2", features = ["sync"] }
+html-escape = "0.2"
+
 [profile.release]
 debug = true # Adds debug symbols to the optimized binary

@@ -1,3 +1,4 @@
+use html_escape::decode_html_entities;
 use lol_html::{element, text, EndTagHandler, HtmlRewriter, Settings};
 use regex::Regex;
 use std::cell::RefCell;
@@ -14,15 +15,16 @@ const MAX_ELEMENT_STACK_DEPTH: usize = 256;
 // Regex patterns for scoring element class/id attributes
 
 /// Patterns that are very unlikely to be main content (heavily penalize)
+/// Note: RE_MAYBE patterns override these (prevent the -50 penalty)
 static RE_UNLIKELY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)banner|combx|comment|community|disqus|extra|foot|header|menu|related|remark|rss|share|shoutbox|sidebar|skyscraper|sponsor|ad-break|agegate|pagination|popup"
+        r"(?i)combx|community|disqus|extra|remark|rss|share|shoutbox|skyscraper|ad-break|agegate|popup"
     ).unwrap()
 });
 
-/// Ambiguous patterns that could go either way
+/// Ambiguous patterns - if matched, prevents RE_UNLIKELY penalty
 static RE_MAYBE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)and|article|body|column|main|shadow").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)and|column|shadow").unwrap());
 
 /// Positive signals that suggest main content
 static RE_POSITIVE: LazyLock<Regex> = LazyLock::new(|| {
@@ -33,7 +35,7 @@ static RE_POSITIVE: LazyLock<Regex> = LazyLock::new(|| {
 /// Negative signals that suggest non-content elements
 static RE_NEGATIVE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)hidden|banner|combx|comment|com-|contact|foot|footer|footnote|masthead|media|meta|outbrain|promo|related|scroll|shoutbox|sidebar|sponsor|shopping|tags|tool|widget|nav|namespace|action|catlinks|toc|printfooter|jump-to|siteSub|contentSub"
+        r"(?i)hidden|banner|comment|com-|contact|foot|footer|footnote|header|masthead|media|meta|menu|nav|outbrain|promo|related|scroll|sidebar|sponsor|shopping|tags|tool|widget|namespace|action|catlinks|toc|printfooter|jump-to|siteSub|contentSub"
     ).unwrap()
 });
 
@@ -135,9 +137,12 @@ impl ElementFrame {
         0.0
     }
 
-    /// Append text content, normalizing whitespace
+    /// Append text content, decoding HTML entities and normalizing whitespace
     fn append_text(&mut self, text: &str) {
-        let mut words = text.split_whitespace().peekable();
+        // Decode HTML entities like &amp; &lt; &#123; etc.
+        let decoded = decode_html_entities(text);
+
+        let mut words = decoded.split_whitespace().peekable();
         if words.peek().is_none() {
             return; // Empty after whitespace normalization
         }
@@ -252,26 +257,21 @@ fn is_void_element(tag: &str) -> bool {
     )
 }
 
-/// Non-content leaf tags
+/// Non-content leaf tags (excludes void elements which are handled separately)
 fn is_non_content_leaf(tag: &str) -> bool {
     matches!(
         tag,
         "title"
-            | "base"
-            | "input"
             | "textarea"
             | "select"
             | "option"
             | "optgroup"
             | "button"
-            | "area"
             | "map"
-            | "param"
             | "datalist"
             | "output"
             | "progress"
             | "meter"
-            | "picture"
     )
 }
 
@@ -280,9 +280,9 @@ fn is_non_content_leaf(tag: &str) -> bool {
 // -----------------------------------------------------------------------------
 
 /// Find and extract the main content as plain text.
-/// Returns: (content_text, urls, title)
+/// Returns: (content_text, title)
 /// Returns an error if no suitable content element was found.
-pub fn find_main_content(html: &[u8]) -> anyhow::Result<(String, Vec<String>, String)> {
+pub fn find_main_content(html: &[u8]) -> anyhow::Result<(String, String)> {
     /// Parsing context shared across HTML rewriter callbacks
     struct ParsingContext {
         element_stack: Vec<ElementFrame>,
@@ -290,7 +290,6 @@ pub fn find_main_content(html: &[u8]) -> anyhow::Result<(String, Vec<String>, St
         best_content_score: f32,
         skip_depth: u32,
         anchor_depth: u32, // Track nesting inside <a> tags for link density
-        extracted_urls: Vec<String>,
         page_title: String,
         currently_in_title: bool,
     }
@@ -301,7 +300,6 @@ pub fn find_main_content(html: &[u8]) -> anyhow::Result<(String, Vec<String>, St
         best_content_score: 0.0,
         skip_depth: 0,
         anchor_depth: 0,
-        extracted_urls: Vec::new(),
         page_title: String::new(),
         currently_in_title: false,
     }));
@@ -318,15 +316,6 @@ pub fn find_main_content(html: &[u8]) -> anyhow::Result<(String, Vec<String>, St
                     let is_container_skip = is_non_content_container(&tag_name);
                     let is_leaf_skip = is_non_content_leaf(&tag_name);
                     let is_void = is_void_element(&tag_name);
-
-                    // Extract URLs from all <a> tags (for link discovery)
-                    if tag_name == "a" {
-                        if let Some(href) = el.get_attribute("href") {
-                            if !href.is_empty() {
-                                context_for_open.borrow_mut().extracted_urls.push(href);
-                            }
-                        }
-                    }
 
                     // Track <title> element (special case: in <head>, but we want its text)
                     let is_title = tag_name == "title";
@@ -442,10 +431,13 @@ pub fn find_main_content(html: &[u8]) -> anyhow::Result<(String, Vec<String>, St
 
                     // Special case: capture <title> text
                     if context.currently_in_title {
-                        if !context.page_title.is_empty() {
-                            context.page_title.push(' ');
+                        let decoded = decode_html_entities(text.trim());
+                        if !decoded.is_empty() {
+                            if !context.page_title.is_empty() {
+                                context.page_title.push(' ');
+                            }
+                            context.page_title.push_str(&decoded);
                         }
-                        context.page_title.push_str(text.trim());
                         return Ok(());
                     }
 
@@ -488,11 +480,7 @@ pub fn find_main_content(html: &[u8]) -> anyhow::Result<(String, Vec<String>, St
         .into_inner();
 
     match final_context.best_content {
-        Some(content_text) => Ok((
-            content_text,
-            final_context.extracted_urls,
-            final_context.page_title,
-        )),
+        Some(content_text) => Ok((content_text, final_context.page_title)),
         None => anyhow::bail!("No main content found"),
     }
 }
@@ -522,7 +510,7 @@ mod tests {
 
         let result = find_main_content(html.as_bytes());
         assert!(result.is_ok(), "Should find a main content element");
-        let (text, _urls, _title) = result.unwrap();
+        let (text, _title) = result.unwrap();
         // Should extract the article text
         assert!(
             text.contains("main article content") && text.contains("multiple sentences"),
@@ -550,7 +538,7 @@ mod tests {
 
         let result = find_main_content(html.as_bytes());
         assert!(result.is_ok(), "Should find content element");
-        let (text, _urls, _title) = result.unwrap();
+        let (text, _title) = result.unwrap();
         assert!(
             text.contains("real content of the page"),
             "Expected content text, got: {}",
@@ -580,7 +568,7 @@ mod tests {
 
         let result = find_main_content(html.as_bytes());
         assert!(result.is_ok());
-        let (text, _urls, _title) = result.unwrap();
+        let (text, _title) = result.unwrap();
         // Should prefer article over navigation due to link density penalty
         assert!(
             text.contains("actual article text"),
@@ -607,7 +595,7 @@ mod tests {
 
         let result = find_main_content(html.as_bytes());
         assert!(result.is_ok());
-        let (text, _urls, _title) = result.unwrap();
+        let (text, _title) = result.unwrap();
         // Should prefer post/entry over sidebar/widget
         assert!(
             text.contains("main post content"),
@@ -655,7 +643,7 @@ mod tests {
 
         let result = find_main_content(html.as_bytes());
         assert!(result.is_ok(), "Should find content element");
-        let (text, _urls, _title) = result.unwrap();
+        let (text, _title) = result.unwrap();
         // Should find the body content, not include head content
         assert!(
             text.contains("actual body content") && !text.contains("Page Title"),
@@ -684,7 +672,7 @@ mod tests {
 
         let result = find_main_content(html.as_bytes());
         assert!(result.is_ok());
-        let (text, _urls, _title) = result.unwrap();
+        let (text, _title) = result.unwrap();
         assert!(
             text.contains("Real article content") && !text.contains("var x"),
             "Should find article text without script content, got: {}",
@@ -727,7 +715,7 @@ mod tests {
 
         let result = find_main_content(html.as_bytes());
         assert!(result.is_ok(), "Should find the article content");
-        let (text, _urls, _title) = result.unwrap();
+        let (text, _title) = result.unwrap();
         // Should extract the article prose
         assert!(
             text.contains("programming language") && text.contains("Rust Foundation"),
@@ -762,168 +750,12 @@ mod tests {
 
         let result = find_main_content(html.as_bytes());
         assert!(result.is_ok());
-        let (text, _urls, _title) = result.unwrap();
+        let (text, _title) = result.unwrap();
         // Should NOT contain form content
         assert!(
             text.contains("actual page content") && !text.contains("Option one"),
             "Should find content without form text, got: {}",
             text
-        );
-    }
-
-    #[test]
-    fn test_extracts_all_urls() {
-        let html = r#"
-            <html>
-                <body>
-                    <div id="content">
-                        <p>Check out <a href="https://example.com">this site</a> and
-                        <a href="https://another.com/page">another page</a> for more information.
-                        This article contains substantial text with multiple sentences.
-                        The content discusses important topics that readers care about.</p>
-                        <a href="/relative/path">Relative link</a>
-                    </div>
-                </body>
-            </html>
-        "#;
-
-        let result = find_main_content(html.as_bytes());
-        assert!(result.is_ok());
-        let (_text, urls, _title) = result.unwrap();
-        assert_eq!(urls.len(), 3, "Should find 3 URLs, got: {:?}", urls);
-        assert!(urls.contains(&"https://example.com".to_string()));
-        assert!(urls.contains(&"https://another.com/page".to_string()));
-        assert!(urls.contains(&"/relative/path".to_string()));
-    }
-
-    #[test]
-    fn test_extracts_urls_preserves_order() {
-        let html = r#"
-            <html>
-                <body>
-                    <div id="content">
-                        <p>This article has multiple links that should be extracted in order.
-                        It contains substantial text content with commas, periods, and details.</p>
-                        <a href="/first">First</a>
-                        <a href="/second">Second</a>
-                        <a href="/third">Third</a>
-                    </div>
-                </body>
-            </html>
-        "#;
-
-        let result = find_main_content(html.as_bytes());
-        assert!(result.is_ok());
-        let (_text, urls, _title) = result.unwrap();
-        assert_eq!(urls, vec!["/first", "/second", "/third"]);
-    }
-
-    #[test]
-    fn test_no_urls_on_page_without_links() {
-        let html = r#"
-            <html>
-                <body>
-                    <div id="content">
-                        <p>This page has no links at all, just plain text content here.
-                        It contains substantial text with multiple sentences and paragraphs.
-                        The content discusses important topics that readers care about.</p>
-                    </div>
-                </body>
-            </html>
-        "#;
-
-        let result = find_main_content(html.as_bytes());
-        assert!(result.is_ok());
-        let (_text, urls, _title) = result.unwrap();
-        assert!(urls.is_empty(), "Should have no URLs, got: {:?}", urls);
-    }
-
-    #[test]
-    fn test_ignores_empty_href() {
-        let html = r#"
-            <html>
-                <body>
-                    <div id="content">
-                        <p>This page has various link types, some valid and some not.
-                        The content extraction should find all valid hrefs while ignoring empty ones.
-                        Multiple sentences with commas, periods, and substantial text.</p>
-                        <a href="">Empty href</a>
-                        <a href="https://valid.com">Valid link</a>
-                        <a>No href at all</a>
-                    </div>
-                </body>
-            </html>
-        "#;
-
-        let result = find_main_content(html.as_bytes());
-        assert!(result.is_ok());
-        let (_text, urls, _title) = result.unwrap();
-        assert_eq!(urls.len(), 1, "Should find 1 valid URL, got: {:?}", urls);
-        assert_eq!(urls[0], "https://valid.com");
-    }
-
-    #[test]
-    fn test_extracts_urls_from_nav_and_content() {
-        // URLs should be collected from the entire page, not just main content
-        let html = r#"
-            <html>
-                <body>
-                    <nav>
-                        <a href="/nav1">Nav 1</a>
-                        <a href="/nav2">Nav 2</a>
-                    </nav>
-                    <div id="article">
-                        <p>Article content with <a href="/article-link">a link</a>.
-                        This article has substantial text with multiple sentences.
-                        The content discusses important topics that readers care about.</p>
-                    </div>
-                    <footer>
-                        <a href="/footer">Footer link</a>
-                    </footer>
-                </body>
-            </html>
-        "#;
-
-        let result = find_main_content(html.as_bytes());
-        assert!(result.is_ok());
-        let (_text, urls, _title) = result.unwrap();
-        assert_eq!(urls.len(), 4, "Should find all 4 URLs, got: {:?}", urls);
-        assert!(urls.contains(&"/nav1".to_string()));
-        assert!(urls.contains(&"/nav2".to_string()));
-        assert!(urls.contains(&"/article-link".to_string()));
-        assert!(urls.contains(&"/footer".to_string()));
-    }
-
-    #[test]
-    fn test_handles_various_url_formats() {
-        let html = r##"
-            <html>
-                <body>
-                    <div id="content">
-                        <p>This page demonstrates various URL formats that can appear in links.
-                        The extraction should handle all of them correctly, including protocols,
-                        relative paths, anchors, and special schemes like mailto and javascript.</p>
-                        <a href="https://secure.example.com">HTTPS</a>
-                        <a href="http://insecure.example.com">HTTP</a>
-                        <a href="//protocol-relative.com">Protocol relative</a>
-                        <a href="/absolute/path">Absolute path</a>
-                        <a href="relative/path">Relative path</a>
-                        <a href="#anchor">Anchor</a>
-                        <a href="mailto:test@example.com">Email</a>
-                        <a href="javascript:void(0)">JavaScript</a>
-                    </div>
-                </body>
-            </html>
-        "##;
-
-        let result = find_main_content(html.as_bytes());
-        assert!(result.is_ok());
-        let (_text, urls, _title) = result.unwrap();
-        assert_eq!(
-            urls.len(),
-            8,
-            "Should collect all href values, got: {:?}",
-            urls
         );
     }
 
@@ -946,7 +778,7 @@ mod tests {
 
         let result = find_main_content(html.as_bytes());
         assert!(result.is_ok());
-        let (_text, _urls, title) = result.unwrap();
+        let (_text, title) = result.unwrap();
         assert_eq!(
             title, "My Page Title",
             "Should extract title, got: {}",
@@ -981,7 +813,7 @@ mod tests {
             result.is_ok(),
             "Should find content in semantic tags without id/class"
         );
-        let (text, _urls, _title) = result.unwrap();
+        let (text, _title) = result.unwrap();
         assert!(
             text.contains("main article content"),
             "Expected article text, got: {}",
@@ -1011,7 +843,7 @@ mod tests {
 
         let result = find_main_content(html.as_bytes());
         assert!(result.is_ok());
-        let (text, _urls, _title) = result.unwrap();
+        let (text, _title) = result.unwrap();
         assert!(
             text.contains("actual main content"),
             "Large content should beat small element, got: {}",
@@ -1044,7 +876,7 @@ mod tests {
 
         let result = find_main_content(html.as_bytes());
         assert!(result.is_ok());
-        let (text, _urls, _title) = result.unwrap();
+        let (text, _title) = result.unwrap();
         assert!(
             text.contains("actual wiki article"),
             "Should find article content, got: {}",
@@ -1084,7 +916,7 @@ mod tests {
 
         let result = find_main_content(html.as_bytes());
         assert!(result.is_ok());
-        let (text, _urls, _title) = result.unwrap();
+        let (text, _title) = result.unwrap();
         // section-a is LONGER but has 100% link density -> score *= ~0
         // section-b is SHORTER but has 0% link density -> no penalty
         // section-b should win despite being shorter
@@ -1116,7 +948,7 @@ mod tests {
 
         let result = find_main_content(html.as_bytes());
         assert!(result.is_ok());
-        let (text, _urls, _title) = result.unwrap();
+        let (text, _title) = result.unwrap();
         assert!(
             text.contains("actual article content"),
             "Should find article, not index garbage, got: {}",
