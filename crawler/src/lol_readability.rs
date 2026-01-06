@@ -4,6 +4,7 @@ use regex::Regex;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::LazyLock;
+use unicode_normalization::UnicodeNormalization;
 use url::Url;
 
 // -----------------------------------------------------------------------------
@@ -510,7 +511,11 @@ pub fn find_main_content(html: &[u8], url: &str) -> anyhow::Result<(String, Stri
                 url_str.pop();
             }
 
-            Ok((content_text, final_context.page_title, url_str))
+            // Normalize unicode (NFKC)
+            let content: String = content_text.nfkc().collect();
+            let title: String = final_context.page_title.nfkc().collect();
+
+            Ok((content, title, url_str))
         }
         None => anyhow::bail!("No main content found"),
     }

@@ -11,7 +11,6 @@ use tantivy::schema::{
 use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
 use tantivy::{Index, Term};
 use tokio::sync::{mpsc, oneshot};
-use unicode_normalization::UnicodeNormalization;
 use url::Url;
 
 mod lol_readability;
@@ -156,15 +155,11 @@ impl CrawlDb {
     /// Returns: true = indexed, false = failed
     fn process_page(&mut self, url: &str, domain: &str, html: &str) -> bool {
         // Parse HTML to extract readable content (returns canonical URL if present)
-        let (readable_text, page_title, resolved_url) =
+        let (content, title, resolved_url) =
             match lol_readability::find_main_content(html.as_bytes(), url) {
                 Ok(result) => result,
                 Err(_) => return false,
             };
-
-        // Normalize unicode
-        let content: String = readable_text.nfkc().collect();
-        let title: String = page_title.nfkc().collect();
 
         // Delete any existing document with this URL (idiomatic upsert pattern)
         let url_term = Term::from_field_text(self.url_field, &resolved_url);
