@@ -25,8 +25,7 @@ static RE_UNLIKELY: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Ambiguous patterns - if matched, prevents RE_UNLIKELY penalty
-static RE_MAYBE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)and|column|shadow").unwrap());
+static RE_MAYBE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)and|column|shadow").unwrap());
 
 /// Positive signals that suggest main content
 static RE_POSITIVE: LazyLock<Regex> = LazyLock::new(|| {
@@ -465,7 +464,9 @@ pub fn find_main_content(html: &[u8], url: &str) -> anyhow::Result<(String, Stri
                     let inside_anchor = context.anchor_depth > 0;
                     if let Some(current_frame) = context.element_stack.last_mut() {
                         let text_length = u32::try_from(text.len()).unwrap_or(u32::MAX);
-                        let comma_count = u32::try_from(text.bytes().filter(|&b| b == b',').count()).unwrap_or(u32::MAX);
+                        let comma_count =
+                            u32::try_from(text.bytes().filter(|&b| b == b',').count())
+                                .unwrap_or(u32::MAX);
 
                         current_frame.text_len += text_length;
                         current_frame.comma_count += comma_count;
@@ -844,8 +845,7 @@ mod tests {
         assert!(result.is_ok());
         let (_text, _title, url) = result.unwrap();
         assert_eq!(
-            url,
-            "https://example.com/canonical-page",
+            url, "https://example.com/canonical-page",
             "Should return canonical URL when present"
         );
     }
@@ -868,7 +868,10 @@ mod tests {
         let result = find_main_content(html.as_bytes(), "https://example.com/original");
         assert!(result.is_ok());
         let (_text, _title, url) = result.unwrap();
-        assert_eq!(url, "https://example.com/original", "Should return input URL when no canonical");
+        assert_eq!(
+            url, "https://example.com/original",
+            "Should return input URL when no canonical"
+        );
     }
 
     #[test]
@@ -892,7 +895,10 @@ mod tests {
         let result = find_main_content(html.as_bytes(), "https://example.com/some/path/page.html");
         assert!(result.is_ok());
         let (_text, _title, url) = result.unwrap();
-        assert_eq!(url, "https://example.com/canonical-page", "Should resolve relative canonical against base URL");
+        assert_eq!(
+            url, "https://example.com/canonical-page",
+            "Should resolve relative canonical against base URL"
+        );
     }
 
     #[test]
@@ -1087,12 +1093,18 @@ mod tests {
         // Trailing slash should be stripped
         let result = find_main_content(html.as_bytes(), "https://example.com/page/");
         let (_text, _title, url) = result.unwrap();
-        assert_eq!(url, "https://example.com/page", "Should strip trailing slash");
+        assert_eq!(
+            url, "https://example.com/page",
+            "Should strip trailing slash"
+        );
 
         // Root path should keep its slash
         let result = find_main_content(html.as_bytes(), "https://example.com/");
         let (_text, _title, url) = result.unwrap();
-        assert_eq!(url, "https://example.com/", "Should keep trailing slash for root");
+        assert_eq!(
+            url, "https://example.com/",
+            "Should keep trailing slash for root"
+        );
 
         // Host should be lowercased
         let result = find_main_content(html.as_bytes(), "https://EXAMPLE.COM/page");
@@ -1102,6 +1114,9 @@ mod tests {
         // Path case should be preserved (important for base64 params etc)
         let result = find_main_content(html.as_bytes(), "https://example.com/Page/ABC123");
         let (_text, _title, url) = result.unwrap();
-        assert_eq!(url, "https://example.com/Page/ABC123", "Should preserve path case");
+        assert_eq!(
+            url, "https://example.com/Page/ABC123",
+            "Should preserve path case"
+        );
     }
 }

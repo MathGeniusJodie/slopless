@@ -101,9 +101,9 @@ impl CrawlDb {
                 let url_field = schema
                     .get_field("url")
                     .context("Existing index missing 'url' field")?;
-                let domain_field = schema
-                    .get_field("domain")
-                    .context("Existing index missing 'domain' field - delete search_db/ and re-crawl")?;
+                let domain_field = schema.get_field("domain").context(
+                    "Existing index missing 'domain' field - delete search_db/ and re-crawl",
+                )?;
                 let title_field = schema
                     .get_field("title")
                     .context("Existing index missing 'title' field")?;
