@@ -41,7 +41,8 @@ enum DbMessage {
     ProcessPage {
         url: String,
         domain: String,
-        html: String,
+        title: String,
+        content: String,
     },
     Commit {
         reply: oneshot::Sender<Result<u64>>,
@@ -56,9 +57,14 @@ struct DbHandle {
 }
 
 impl DbHandle {
-    async fn process_page(&self, url: String, domain: String, html: String) {
+    async fn process_page(&self, url: String, domain: String, title: String, content: String) {
         self.tx
-            .send(DbMessage::ProcessPage { url, domain, html })
+            .send(DbMessage::ProcessPage {
+                url,
+                domain,
+                title,
+                content,
+            })
             .await
             .ok();
     }
@@ -153,24 +159,17 @@ impl CrawlDb {
     }
 
     /// Returns: true = indexed, false = failed
-    fn process_page(&mut self, url: &str, domain: &str, html: &str) -> bool {
-        // Parse HTML to extract readable content (returns canonical URL if present)
-        let (content, title, resolved_url) =
-            match lol_readability::find_main_content(html.as_bytes(), url) {
-                Ok(result) => result,
-                Err(_) => return false,
-            };
-
+    fn process_page(&mut self, url: &str, domain: &str, title: &str, content: &str) -> bool {
         // Delete any existing document with this URL (idiomatic upsert pattern)
-        let url_term = Term::from_field_text(self.url_field, &resolved_url);
+        let url_term = Term::from_field_text(self.url_field, url);
         self.index_writer.delete_term(url_term);
 
         // Index the document
         let mut doc = tantivy::TantivyDocument::new();
-        doc.add_text(self.url_field, &resolved_url);
+        doc.add_text(self.url_field, url);
         doc.add_text(self.domain_field, domain);
-        doc.add_text(self.title_field, &title);
-        doc.add_text(self.body_field, &content);
+        doc.add_text(self.title_field, title);
+        doc.add_text(self.body_field, content);
 
         self.index_writer.add_document(doc).is_ok()
     }
@@ -184,8 +183,13 @@ impl CrawlDb {
     fn run(mut self, mut rx: mpsc::Receiver<DbMessage>, metrics: Arc<CrawlMetrics>) {
         while let Some(msg) = rx.blocking_recv() {
             match msg {
-                DbMessage::ProcessPage { url, domain, html } => {
-                    if self.process_page(&url, &domain, &html) {
+                DbMessage::ProcessPage {
+                    url,
+                    domain,
+                    title,
+                    content,
+                } => {
+                    if self.process_page(&url, &domain, &title, &content) {
                         metrics.pages_crawled.fetch_add(1, Ordering::Relaxed);
                     } else {
                         metrics.pages_failed.fetch_add(1, Ordering::Relaxed);
@@ -279,8 +283,14 @@ async fn crawl_domain(
     while let Ok(page) = rx.recv().await {
         let html = page.get_html();
         if !html.is_empty() {
-            db.process_page(page.get_url().to_string(), domain.clone(), html)
-                .await;
+            let url = page.get_url();
+            // Extract readable content from HTML
+            if let Ok((content, title, resolved_url)) =
+                lol_readability::find_main_content(html.as_bytes(), url)
+            {
+                db.process_page(resolved_url, domain.clone(), title, content)
+                    .await;
+            }
         }
     }
 
