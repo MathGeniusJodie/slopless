@@ -265,9 +265,7 @@ async fn crawl_domain(
     }
 
     let Some(mut rx) = website.subscribe(256) else {
-        if verbose {
-            eprintln!("Failed to subscribe to {} crawl events", domain);
-        }
+        eprintln!("Failed to subscribe to {} crawl events", domain);
         return;
     };
 
@@ -298,9 +296,7 @@ async fn crawl_domain(
     // Ensure crawl task completed
     let _ = crawl_handle.await;
 
-    if verbose {
-        println!("Finished crawling {}", domain);
-    }
+    println!("Finished crawling {}", domain);
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 20)]
