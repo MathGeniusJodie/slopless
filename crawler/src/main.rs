@@ -260,7 +260,7 @@ async fn crawl_domain(
         ));
     }
 
-    let mut rx = match website.subscribe(16) {
+    let mut rx = match website.subscribe(256) {
         Some(rx) => rx,
         None => {
             if verbose {
@@ -270,32 +270,22 @@ async fn crawl_domain(
         }
     };
 
-    let crawl = website.crawl();
-    tokio::pin!(crawl);
+    // Spawn crawl so website is dropped when done, closing the channel
+    let crawl_handle = tokio::spawn(async move {
+        website.crawl().await;
+    });
 
-    let mut crawl_done = false;
-    loop {
-        tokio::select! {
-            biased;
-            result = rx.recv() => {
-                match result {
-                    Ok(page) => {
-                        let html = page.get_html();
-                        if !html.is_empty() {
-                            db.process_page(page.get_url().to_string(), domain.clone(), html).await;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-            _ = &mut crawl, if !crawl_done => {
-                crawl_done = true;
-            }
-            _ = tokio::time::sleep(std::time::Duration::from_millis(100)), if crawl_done => {
-                break;
-            }
+    // Process pages as they stream in
+    while let Ok(page) = rx.recv().await {
+        let html = page.get_html();
+        if !html.is_empty() {
+            db.process_page(page.get_url().to_string(), domain.clone(), html)
+                .await;
         }
     }
+
+    // Ensure crawl task completed
+    let _ = crawl_handle.await;
 
     if verbose {
         println!("Finished crawling {}", domain);
