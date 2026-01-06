@@ -264,14 +264,11 @@ async fn crawl_domain(
         ));
     }
 
-    let mut rx = match website.subscribe(256) {
-        Some(rx) => rx,
-        None => {
-            if verbose {
-                eprintln!("Failed to subscribe to {} crawl events", domain);
-            }
-            return;
+    let Some(mut rx) = website.subscribe(256) else {
+        if verbose {
+            eprintln!("Failed to subscribe to {} crawl events", domain);
         }
+        return;
     };
 
     // Spawn crawl so website is dropped when done, closing the channel

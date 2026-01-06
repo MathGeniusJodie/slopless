@@ -495,31 +495,30 @@ pub fn find_main_content(html: &[u8], url: &str) -> anyhow::Result<(String, Stri
         .expect("Rc should have single owner")
         .into_inner();
 
-    match final_context.best_content {
-        Some(content_text) => {
-            // Parse and normalize the base URL
-            let base_url = Url::parse(url)?;
+    let Some(content_text) = final_context.best_content else {
+        anyhow::bail!("No main content found")
+    };
 
-            // Resolve canonical URL (may be relative) or use base URL
-            let resolved_url = match final_context.canonical_url {
-                Some(canonical) => base_url.join(&canonical)?,
-                None => base_url,
-            };
+    // Parse and normalize the base URL
+    let base_url = Url::parse(url)?;
 
-            // Normalize: strip trailing slash (but not for root paths like "https://example.com/")
-            let mut url_str = resolved_url.to_string();
-            if url_str.ends_with('/') && resolved_url.path().len() > 1 {
-                url_str.pop();
-            }
+    // Resolve canonical URL (may be relative) or use base URL
+    let resolved_url = match final_context.canonical_url {
+        Some(canonical) => base_url.join(&canonical)?,
+        None => base_url,
+    };
 
-            // Normalize unicode (NFKC)
-            let content: String = content_text.nfkc().collect();
-            let title: String = final_context.page_title.nfkc().collect();
-
-            Ok((content, title, url_str))
-        }
-        None => anyhow::bail!("No main content found"),
+    // Normalize: strip trailing slash (but not for root paths like "https://example.com/")
+    let mut url_str = resolved_url.to_string();
+    if url_str.ends_with('/') && resolved_url.path().len() > 1 {
+        url_str.pop();
     }
+
+    // Normalize unicode (NFKC)
+    let content: String = content_text.nfkc().collect();
+    let title: String = final_context.page_title.nfkc().collect();
+
+    Ok((content, title, url_str))
 }
 
 #[cfg(test)]
