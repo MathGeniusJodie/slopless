@@ -5,11 +5,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project Overview
 
 This is a high-performance web crawler written in Rust that:
-- Crawls websites starting from seed domains
+- Crawls websites starting from seed domains using the `spider` library
 - Extracts readable content using a custom readability algorithm
 - Indexes content using Tantivy (full-text search engine)
-- Uses Bloom filters for efficient URL deduplication
-- Implements concurrent crawling with configurable limits
+- Implements concurrent crawling with configurable domain-level concurrency
 
 ## Build, Test, and Run Commands
 
@@ -30,7 +29,6 @@ cargo build --release
 cargo test
 
 # Run tests for a specific module
-cargo test bloom
 cargo test lol_readability
 
 # Run tests with output visible
@@ -73,54 +71,43 @@ rm -rf search_db/
 ### Core Components
 
 **main.rs** - Orchestrates the crawl:
-- `CrawlTask`: Represents a URL to crawl with its depth and domain
-- `CrawlDb`: Manages the Tantivy search index and Bloom filter for URL deduplication
-- `SearchIndex`: Wraps Tantivy index with URL, title, and body fields
-- Main crawl loop uses `JoinSet` for concurrent task management
+- `CrawlDb`: Manages the Tantivy search index with fields for URL, domain, title, and body
+- `CrawlMetrics`: Atomic counters for pages crawled/failed (lock-free status updates)
+- `crawl_domain()`: Crawls a single domain using the spider library
+- Main loop uses `futures::stream::for_each_concurrent` for domain-level concurrency
 
 **lol_readability.rs** - Content extraction:
 - Single-pass HTML parser using `lol_html` streaming rewriter
 - Implements a readability algorithm inspired by Mozilla Readability
 - Scores elements based on tag type, id/class attributes, text length, and link density
-- Returns: (readable_text, extracted_urls, page_title)
-- Key function: `find_main_content(html: &[u8])`
-
-**bloom.rs** - URL deduplication:
-- Custom Bloom filter implementation with double hashing
-- Uses `ahash::RandomState` for fast hashing
-- `BloomFilter::insert()` returns true if URL may have been seen before
-- Reduces expensive Tantivy lookups by ~99% for unseen URLs
+- Returns: `(readable_text, page_title)`
+- Key function: `find_main_content(html: &[u8]) -> Result<(String, String)>`
 
 ### Crawl Flow
 
 1. Parse seed domains from input file
 2. Initialize Tantivy index (reuses existing `search_db/` if present)
-3. Create initial `CrawlTask` queue with depth 0
-4. Main loop:
-   - Spawn tasks up to `max_concurrent_requests` limit
-   - Domain-level concurrency control: only one request per domain at a time (prevents hammering)
-   - When task completes:
-     - Extract links and content via `find_main_content()`
-     - Filter discovered URLs (same-domain only, depth limit, Bloom filter check)
-     - Index page content in Tantivy
-   - Commit index every 5 seconds
-5. Exit when queue is empty and all workers are done
+3. Create shared `CrawlDb` (Mutex-protected) and `CrawlMetrics` (atomic counters)
+4. Start background task for periodic status updates and index commits
+5. Crawl domains concurrently using `for_each_concurrent`:
+   - Each domain uses spider library with depth limit and robots.txt respect
+   - Query existing URLs for domain (via indexed `domain` field) to build blacklist
+   - Subscribe to page events, extract content, index to Tantivy
+6. Final commit when all domains complete
 
-### Task Queue Design
+### Concurrency Model
 
-- Uses `BTreeSet<CrawlTask>` sorted by depth (DESCENDING) to process deepest pages first
-- `domains_in_progress` HashSet ensures only one concurrent request per domain
-- `queued_urls` HashSet prevents duplicate tasks before they're added to Bloom filter
-- Tasks are removed from queue only when spawned (allows domain-lock to release)
+- **Domain-level concurrency**: Configurable max concurrent domains (default 50)
+- **Per-domain rate limiting**: Spider configured with `with_limit(1)` - one request at a time per domain
+- **Lock-free metrics**: Atomic counters avoid contention during status updates
+- **Mutex for indexing**: `CrawlDb` protected by Mutex, but lock held only during index operations
 
-### Deduplication Strategy
+### Tantivy Schema
 
-Three-layer approach to prevent duplicate crawls:
-1. **queued_urls** HashSet: Fast check for URLs already in the task queue
-2. **Bloom filter**: Probabilistic check with ~0.1% false positive rate
-3. **Tantivy query**: Fallback for Bloom filter collisions (queries the url field)
-
-The Bloom filter dramatically reduces expensive Tantivy lookups.
+- `url`: TEXT | STORED | FAST (for storage and retrieval)
+- `domain`: STRING | FAST (for efficient domain-based queries)
+- `title`: TEXT | STORED
+- `body`: TEXT with custom "norm_tokenizer" (lowercasing + stemming)
 
 ### Readability Algorithm
 
@@ -148,15 +135,14 @@ The element with the highest final score becomes the main content.
 
 ## Key Implementation Details
 
-### HTTP Client Configuration
-- User-Agent set to Chrome (some sites block default reqwest UA)
-- `pool_idle_timeout(None)`: Keep connections alive for performance
-- `tcp_nodelay(true)`: Reduce latency for small requests
+### Spider Configuration
+- `respect_robots_txt = true`: Polite crawling
+- `subdomains = false`: Stay within the exact domain
+- `depth`: Configurable crawl depth (default 5)
+- `with_limit(1)`: One concurrent request per domain
 
-### Tantivy Schema
-- `url`: TEXT | STORED | FAST (for exact lookups and sorting)
-- `title`: TEXT | STORED
-- `body`: TEXT with custom "norm_tokenizer" (lowercasing + stemming)
+### URL Deduplication
+When resuming a crawl, existing URLs for each domain are queried from Tantivy using an efficient term query on the indexed `domain` field, then added to spider's blacklist.
 
 ### Unicode Normalization
 Page content is normalized with NFKC before indexing to handle equivalent Unicode representations.
@@ -170,12 +156,8 @@ Configured with 20 worker threads (`#[tokio::main(flavor = "multi_thread", worke
 Edit the `Args` struct in main.rs with the `#[arg(...)]` attribute from clap.
 
 ### Modifying the readability algorithm
-The scoring logic is in `Frame::new()` and the element closing handler in `lol_readability.rs`.
-Key tunables: minimum text length (line 321), base scores (lines 66-73), regex patterns (lines 10-25).
-
-### Changing Bloom filter sizing
-`expected_url_count` in main.rs:344 controls the Bloom filter size.
-Current: 100M URLs with 8 bits per URL (96 MB memory).
+The scoring logic is in `ElementFrame::new()` and `ElementFrame::calculate_base_score()` in `lol_readability.rs`.
+Key tunables: minimum text length (line ~197), base scores (lines ~100-107), regex patterns (lines ~19-40).
 
 ### Running tests with specific output
 The `lol_readability` module has extensive tests demonstrating various HTML patterns.

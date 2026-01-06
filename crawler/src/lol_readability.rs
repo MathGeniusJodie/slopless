@@ -449,8 +449,8 @@ pub fn find_main_content(html: &[u8]) -> anyhow::Result<(String, String)> {
                     // Add text to current element frame
                     let inside_anchor = context.anchor_depth > 0;
                     if let Some(current_frame) = context.element_stack.last_mut() {
-                        let text_length = text.len() as u32;
-                        let comma_count = text.bytes().filter(|&b| b == b',').count() as u32;
+                        let text_length = u32::try_from(text.len()).unwrap_or(u32::MAX);
+                        let comma_count = u32::try_from(text.bytes().filter(|&b| b == b',').count()).unwrap_or(u32::MAX);
 
                         current_frame.text_len += text_length;
                         current_frame.comma_count += comma_count;
