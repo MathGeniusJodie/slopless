@@ -283,7 +283,11 @@ async fn crawl_domain(
     while let Ok(page) = rx.recv().await {
         let html = page.get_html();
         if !html.is_empty() {
-            let url = page.get_url();
+            // Use final redirect destination to handle redirects properly
+            let url = page
+                .final_redirect_destination
+                .as_deref()
+                .unwrap_or_else(|| page.get_url());
             // Extract readable content from HTML
             if let Ok((content, title, resolved_url)) =
                 lol_readability::find_main_content(html.as_bytes(), url)
