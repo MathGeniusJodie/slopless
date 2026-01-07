@@ -1,3 +1,25 @@
+//! # Readability Algorithm
+//!
+//! Extracts the "main content" from an HTML page using a single-pass streaming parser.
+//!
+//! ## How It Works
+//!
+//! 1. **Stream HTML through lol_html** - No DOM tree built in memory
+//! 2. **Score each element** based on:
+//!    - Tag type: `<article>`, `<main>`, `<section>` score high; `<nav>`, `<footer>` score low
+//!    - Class/ID attributes: "content", "article" are positive; "sidebar", "nav" are negative
+//!    - Text length: More text = more likely to be content (uses sqrt to avoid over-weighting)
+//!    - Link density: Navigation has lots of links, articles don't (>50% links = penalty)
+//!    - Commas: Real sentences have punctuation, spam doesn't
+//! 3. **Track nested elements** - Child stats bubble up to parents
+//! 4. **Return the highest-scoring element's text**
+//!
+//! ## Usage
+//!
+//! ```ignore
+//! let (text, title, url) = find_main_content(html_bytes, "https://example.com")?;
+//! ```
+
 use bytecount::count;
 use html_escape::decode_html_entities;
 use lol_html::{element, text, HtmlRewriter, Settings};
@@ -24,24 +46,25 @@ const LINK_DENSITY_THRESHOLD: f32 = 0.5;
 // Regex patterns for scoring element class/id attributes
 
 /// Patterns that are very unlikely to be main content (heavily penalize)
-/// Note: RE_MAYBE patterns override these (prevent the -50 penalty)
-static RE_UNLIKELY: LazyLock<Regex> = LazyLock::new(|| {
+/// Note: AMBIGUOUS_PATTERN matches override these (prevent the -50 penalty)
+static UNLIKELY_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?i)combx|community|disqus|extra|remark|rss|share|shoutbox|skyscraper|ad-break|agegate|popup"
     ).unwrap()
 });
 
-/// Ambiguous patterns - if matched, prevents RE_UNLIKELY penalty
-static RE_MAYBE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)and|column|shadow").unwrap());
+/// Ambiguous patterns - if matched, prevents UNLIKELY_PATTERN penalty
+static AMBIGUOUS_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)and|column|shadow").unwrap());
 
 /// Positive signals that suggest main content
-static RE_POSITIVE: LazyLock<Regex> = LazyLock::new(|| {
+static POSITIVE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)article|body|content|entry|hentry|main|page|pagination|post|text|blog|story")
         .unwrap()
 });
 
 /// Negative signals that suggest non-content elements
-static RE_NEGATIVE: LazyLock<Regex> = LazyLock::new(|| {
+static NEGATIVE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?i)hidden|banner|comment|com-|contact|foot|footer|footnote|header|masthead|media|meta|menu|nav|outbrain|promo|related|scroll|sidebar|sponsor|shopping|tags|tool|widget|namespace|action|catlinks|toc|printfooter|jump-to|siteSub|contentSub"
     ).unwrap()
@@ -66,11 +89,12 @@ pub(crate) enum TagType {
 #[derive(Debug)]
 pub(crate) struct ElementFrame {
     pub(crate) tag_type: TagType,
-    pub(crate) base_score: f32, // Initial score from tag type + class/id
-    pub(crate) text_len: usize, // Total character count
-    pub(crate) link_text_len: usize, // Character count inside <a> tags
-    pub(crate) comma_count: usize, // Number of commas (heuristic for real sentences)
-    pub(crate) accumulated_text: String, // Actual text content for this element
+    pub(crate) base_score: f32,
+    pub(crate) char_count: usize,
+    pub(crate) link_char_count: usize,
+    /// Proxy for sentence count - real content has punctuation, spam doesn't
+    pub(crate) comma_count: usize,
+    pub(crate) extracted_text: String,
 }
 
 impl ElementFrame {
@@ -82,13 +106,12 @@ impl ElementFrame {
         Self {
             tag_type,
             base_score,
-            text_len: 0,
-            link_text_len: 0,
+            char_count: 0,
+            link_char_count: 0,
             comma_count: 0,
-            accumulated_text: String::new(),
+            extracted_text: String::new(),
         }
     }
-
     /// Map HTML tag name to internal tag type
     pub(crate) fn classify_tag(tag_name: &str) -> TagType {
         match tag_name {
@@ -101,7 +124,6 @@ impl ElementFrame {
             _ => TagType::Other,
         }
     }
-
     /// Calculate initial score based on tag type and class/id attributes
     pub(crate) fn calculate_base_score(
         tag_type: TagType,
@@ -121,39 +143,35 @@ impl ElementFrame {
         score += class.map(Self::score_attribute).unwrap_or(0.0);
         score
     }
-
     /// Score a class or id attribute value based on regex patterns
     pub(crate) fn score_attribute(attr_value: &str) -> f32 {
         // Heavily penalize obvious non-content patterns
         match attr_value {
-            v if RE_UNLIKELY.is_match(v) && !RE_MAYBE.is_match(v) => -50.0,
-            v if RE_POSITIVE.is_match(v) => 25.0,
-            v if RE_NEGATIVE.is_match(v) => -25.0,
+            v if UNLIKELY_PATTERN.is_match(v) && !AMBIGUOUS_PATTERN.is_match(v) => -50.0,
+            v if POSITIVE_PATTERN.is_match(v) => 25.0,
+            v if NEGATIVE_PATTERN.is_match(v) => -25.0,
             _ => 0.0,
         }
     }
-
     /// Append text content, decoding HTML entities and normalizing whitespace
     pub(crate) fn append_text(&mut self, text: &str) {
         let decoded = decode_html_entities(text);
         for part in decoded.split_whitespace() {
-            if !self.accumulated_text.is_empty() {
-                self.accumulated_text.push(' ');
+            if !self.extracted_text.is_empty() {
+                self.extracted_text.push(' ');
             }
-            self.accumulated_text.push_str(part);
+            self.extracted_text.push_str(part);
         }
     }
-
-    /// Append text and return the content length added (excluding separator spaces)
-    pub(crate) fn append_text_and_measure(&mut self, text: &str) -> usize {
-        let mut len_before = self.accumulated_text.len();
+    /// Append text and return the number of characters added (excluding separator spaces)
+    pub(crate) fn add_text(&mut self, text: &str) -> usize {
+        let mut len_before = self.extracted_text.len();
         self.append_text(text);
-        if self.accumulated_text.chars().nth(len_before) == Some(' ') {
-            len_before += 1; // space seperators don't count towards length, todo: optimize
+        if self.extracted_text.chars().nth(len_before) == Some(' ') {
+            len_before += 1; // space separators don't count towards length
         }
-        self.accumulated_text.len().saturating_sub(len_before)
+        self.extracted_text.len().saturating_sub(len_before)
     }
-
     /// Calculate final score including text-based heuristics
     pub(crate) fn calculate_final_score(&self) -> f32 {
         let mut score = self.base_score;
@@ -162,30 +180,26 @@ impl ElementFrame {
         score *= self.link_density_multiplier();
         score
     }
-
     /// Score contribution from text length (sqrt to avoid over-weighting long elements)
     fn text_length_score(&self) -> f32 {
-        (self.text_len as f32).sqrt()
+        (self.char_count as f32).sqrt()
     }
-
     /// Multiplier based on link density (penalizes navigation-heavy content)
     fn link_density_multiplier(&self) -> f32 {
-        if self.text_len == 0 {
+        if self.char_count == 0 {
             return 1.0;
         }
-        let link_density = self.link_text_len as f32 / self.text_len as f32;
+        let link_density = self.link_char_count as f32 / self.char_count as f32;
         if link_density > LINK_DENSITY_THRESHOLD {
             1.0 - link_density
         } else {
             1.0
         }
     }
-
     /// Check if this element is a viable candidate for main content
     pub(crate) fn is_viable_candidate(&self) -> bool {
         self.is_content_tag() && self.has_enough_text()
     }
-
     /// Check if this is a content-bearing tag type
     fn is_content_tag(&self) -> bool {
         matches!(
@@ -193,76 +207,59 @@ impl ElementFrame {
             TagType::Article | TagType::Div | TagType::P | TagType::Other
         )
     }
-
     /// Check if element has enough text to be considered content
     fn has_enough_text(&self) -> bool {
-        self.text_len >= MIN_TEXT_LENGTH
+        self.char_count >= MIN_TEXT_LENGTH
     }
 }
 
 // -----------------------------------------------------------------------------
-// Helper Functions
+// Tag Classification
 // -----------------------------------------------------------------------------
 
-/// Container tags whose entire content should be ignored
-pub(crate) fn is_non_content_container(tag: &str) -> bool {
-    matches!(
-        tag,
-        "head"
-            | "script"
-            | "style"
-            | "noscript"
-            | "template"
-            | "svg"
-            | "math"
-            | "canvas"
-            | "iframe"
-            | "object"
-            | "embed"
-            | "applet"
-            | "audio"
-            | "video"
-            | "form"
-    )
+/// Categories of HTML tags for parsing decisions
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TagCategory {
+    /// Container whose content should be ignored (head, script, style, etc.)
+    NonContentContainer,
+    /// Self-closing tags with no content (br, img, input, etc.)
+    VoidElement,
+    /// Non-content tags that have content we skip (textarea, select, etc.)
+    NonContentLeaf,
+    /// Normal content-bearing element
+    Content,
 }
 
-/// Void/self-closing tags
-pub(crate) fn is_void_element(tag: &str) -> bool {
-    matches!(
-        tag,
-        "area"
-            | "base"
-            | "br"
-            | "col"
-            | "embed"
-            | "hr"
-            | "img"
-            | "input"
-            | "link"
-            | "meta"
-            | "param"
-            | "source"
-            | "track"
-            | "wbr"
-    )
+/// Classify an HTML tag into a category for parsing decisions
+pub(crate) fn categorize_tag(tag: &str) -> TagCategory {
+    match tag {
+        // Container tags whose entire content should be ignored
+        "head" | "script" | "style" | "noscript" | "template" | "svg" | "math" | "canvas"
+        | "iframe" | "object" | "embed" | "applet" | "audio" | "video" | "form" => {
+            TagCategory::NonContentContainer
+        }
+        // Void/self-closing tags
+        "area" | "base" | "br" | "col" | "hr" | "img" | "input" | "link" | "meta" | "param"
+        | "source" | "track" | "wbr" => TagCategory::VoidElement,
+        // Non-content leaf tags
+        "title" | "textarea" | "select" | "option" | "optgroup" | "button" | "map" | "datalist"
+        | "output" | "progress" | "meter" => TagCategory::NonContentLeaf,
+        // Everything else is content
+        _ => TagCategory::Content,
+    }
 }
 
-/// Non-content leaf tags (excludes void elements which are handled separately)
-pub(crate) fn is_non_content_leaf(tag: &str) -> bool {
-    matches!(
-        tag,
-        "title"
-            | "textarea"
-            | "select"
-            | "option"
-            | "optgroup"
-            | "button"
-            | "map"
-            | "datalist"
-            | "output"
-            | "progress"
-            | "meter"
-    )
+// Convenience functions for common checks
+fn is_void_element(tag: &str) -> bool {
+    categorize_tag(tag) == TagCategory::VoidElement
+}
+
+fn is_non_content_container(tag: &str) -> bool {
+    categorize_tag(tag) == TagCategory::NonContentContainer
+}
+
+fn is_non_content_leaf(tag: &str) -> bool {
+    categorize_tag(tag) == TagCategory::NonContentLeaf
 }
 
 /// What action to take when encountering an HTML element
@@ -283,12 +280,14 @@ enum ElementAction {
 /// Parsing context shared across HTML rewriter callbacks
 struct ParsingContext {
     element_stack: Vec<ElementFrame>,
-    best_content: Option<String>,
-    best_content_score: f32,
-    skip_depth: u32,
-    anchor_depth: u32,
+    best_extracted_text: Option<String>,
+    highest_score: f32,
+    /// Depth inside non-content containers (script, style, head, etc.)
+    non_content_depth: u32,
+    /// Depth inside <a> tags (for tracking link text)
+    link_nesting_depth: u32,
     page_title: String,
-    currently_in_title: bool,
+    inside_title_tag: bool,
     canonical_url: Option<String>,
 }
 
@@ -296,12 +295,12 @@ impl ParsingContext {
     fn new() -> Self {
         Self {
             element_stack: Vec::with_capacity(64),
-            best_content: None,
-            best_content_score: 0.0,
-            skip_depth: 0,
-            anchor_depth: 0,
+            best_extracted_text: None,
+            highest_score: 0.0,
+            non_content_depth: 0,
+            link_nesting_depth: 0,
             page_title: String::new(),
-            currently_in_title: false,
+            inside_title_tag: false,
             canonical_url: None,
         }
     }
@@ -311,71 +310,64 @@ impl ParsingContext {
         if tag_name == "title" {
             return ElementAction::TrackTitle;
         }
-
         let is_void = is_void_element(tag_name);
-
-        // Inside a skipped container?
-        if self.skip_depth > 0 {
+        // Inside a non-content container?
+        if self.non_content_depth > 0 {
             return if is_void {
                 ElementAction::Ignore
             } else {
                 ElementAction::IncrementSkipDepth
             };
         }
-
         // Non-content container (script, style, head, etc.)?
         if is_non_content_container(tag_name) {
             return ElementAction::StartSkipping;
         }
-
         // Non-content leaf or void element?
         if is_non_content_leaf(tag_name) || is_void {
             return ElementAction::Ignore;
         }
-
         // Stack depth limit reached?
         if self.element_stack.len() >= MAX_ELEMENT_STACK_DEPTH {
             return ElementAction::Ignore;
         }
-
         ElementAction::PushFrame
     }
 
     /// Handle closing a title element
     fn close_title(&mut self) {
-        self.currently_in_title = false;
+        self.inside_title_tag = false;
     }
 
-    /// Decrement skip depth when closing a skipped element
+    /// Decrement non-content depth when closing a skipped element
     fn close_skipped(&mut self) {
-        self.skip_depth -= 1;
+        self.non_content_depth -= 1;
     }
 
     /// Handle closing a content element: pop frame, bubble stats, maybe update best
-    fn close_content_element(&mut self, is_anchor: bool) {
-        if is_anchor {
-            self.anchor_depth -= 1;
+    fn close_content_element(&mut self, is_link: bool) {
+        if is_link {
+            self.link_nesting_depth -= 1;
         }
-
         let Some(frame) = self.element_stack.pop() else {
             return;
         };
 
         let score = frame.calculate_final_score();
-        let is_new_best = frame.is_viable_candidate() && score > self.best_content_score;
+        let is_new_best = frame.is_viable_candidate() && score > self.highest_score;
 
         // Bubble stats to parent
         if let Some(parent) = self.element_stack.last_mut() {
-            parent.text_len += frame.text_len;
-            parent.link_text_len += frame.link_text_len;
+            parent.char_count += frame.char_count;
+            parent.link_char_count += frame.link_char_count;
             parent.comma_count += frame.comma_count;
-            parent.append_text(&frame.accumulated_text);
+            parent.append_text(&frame.extracted_text);
         }
 
         // Update best if this is better
         if is_new_best {
-            self.best_content_score = score;
-            self.best_content = Some(frame.accumulated_text);
+            self.highest_score = score;
+            self.best_extracted_text = Some(frame.extracted_text);
         }
     }
 
@@ -396,13 +388,12 @@ impl ParsingContext {
         let Some(frame) = self.element_stack.last_mut() else {
             return;
         };
-
-        let text_len = frame.append_text_and_measure(text);
-        frame.text_len += text_len;
+        let chars_added = frame.add_text(text);
+        frame.char_count += chars_added;
         frame.comma_count += count(text.as_bytes(), b',');
 
-        if self.anchor_depth > 0 {
-            frame.link_text_len += text_len;
+        if self.link_nesting_depth > 0 {
+            frame.link_char_count += chars_added;
         }
     }
 }
@@ -418,42 +409,44 @@ impl ParsingContext {
 pub fn find_main_content(html: &[u8], url: &str) -> anyhow::Result<(String, String, String)> {
     let ctx = Rc::new(RefCell::new(ParsingContext::new()));
 
-    let ctx_canonical = ctx.clone();
-    let ctx_element = ctx.clone();
-    let ctx_text = ctx.clone();
+    // Each callback closure needs its own Rc clone (same underlying context)
+    let ctx_for_canonical = ctx.clone();
+    let ctx_for_elements = ctx.clone();
+    let ctx_for_text = ctx.clone();
 
     let mut rewriter = HtmlRewriter::new(
         Settings {
             element_content_handlers: vec![
-                // Extract canonical URL
-                element!("link[rel=canonical]", move |el| {
-                    if let Some(href) = el.get_attribute("href").filter(|h| !h.is_empty()) {
-                        ctx_canonical.borrow_mut().canonical_url = Some(href);
+                // Extract canonical URL from <link rel="canonical">
+                element!("link[rel=canonical]", move |element| {
+                    if let Some(href) = element.get_attribute("href").filter(|h| !h.is_empty()) {
+                        ctx_for_canonical.borrow_mut().canonical_url = Some(href);
                     }
                     Ok(())
                 }),
-                // Process all elements
-                element!("*", move |el| {
-                    let tag_name = el.tag_name();
-                    let is_anchor = tag_name == "a";
+                // Process all elements for scoring
+                element!("*", move |element| {
+                    let tag_name = element.tag_name();
+                    let is_link = tag_name == "a";
 
-                    let action = ctx_element.borrow().classify_element(&tag_name);
-                    if !execute_open_action(&ctx_element, &el, &tag_name, action, is_anchor) {
+                    let action = ctx_for_elements.borrow().classify_element(&tag_name);
+                    if !execute_open_action(&ctx_for_elements, &element, &tag_name, action, is_link)
+                    {
                         return Ok(());
                     }
-                    let Some(handlers) = el.end_tag_handlers() else {
+                    let Some(end_tag_handlers) = element.end_tag_handlers() else {
                         return Ok(());
                     };
 
-                    let ctx_close = ctx_element.clone();
-                    handlers.push(Box::new(move |_| {
-                        let mut ctx = ctx_close.borrow_mut();
+                    let ctx_for_close = ctx_for_elements.clone();
+                    end_tag_handlers.push(Box::new(move |_| {
+                        let mut ctx = ctx_for_close.borrow_mut();
                         match action {
                             ElementAction::TrackTitle => ctx.close_title(),
                             ElementAction::IncrementSkipDepth | ElementAction::StartSkipping => {
                                 ctx.close_skipped()
                             }
-                            ElementAction::PushFrame => ctx.close_content_element(is_anchor),
+                            ElementAction::PushFrame => ctx.close_content_element(is_link),
                             ElementAction::Ignore => {}
                         }
                         Ok(())
@@ -466,12 +459,11 @@ pub fn find_main_content(html: &[u8], url: &str) -> anyhow::Result<(String, Stri
                     if text.trim().is_empty() {
                         return Ok(());
                     }
-
-                    let mut context = ctx_text.borrow_mut();
-                    if context.currently_in_title {
-                        context.append_title_text(text);
-                    } else if context.skip_depth == 0 {
-                        context.append_content_text(text);
+                    let mut ctx = ctx_for_text.borrow_mut();
+                    if ctx.inside_title_tag {
+                        ctx.append_title_text(text);
+                    } else if ctx.non_content_depth == 0 {
+                        ctx.append_content_text(text);
                     }
                     Ok(())
                 }),
@@ -483,34 +475,33 @@ pub fn find_main_content(html: &[u8], url: &str) -> anyhow::Result<(String, Stri
 
     rewriter.write(html)?;
     rewriter.end()?;
-
     finalize_result(ctx, url)
 }
 
 /// Execute the open tag action; returns true if a close handler is needed
 fn execute_open_action(
     ctx: &Rc<RefCell<ParsingContext>>,
-    el: &lol_html::html_content::Element<'_, '_>,
+    element: &lol_html::html_content::Element<'_, '_>,
     tag_name: &str,
     action: ElementAction,
-    is_anchor: bool,
+    is_link: bool,
 ) -> bool {
     match action {
         ElementAction::TrackTitle => {
-            ctx.borrow_mut().currently_in_title = true;
+            ctx.borrow_mut().inside_title_tag = true;
         }
         ElementAction::IncrementSkipDepth | ElementAction::StartSkipping => {
-            ctx.borrow_mut().skip_depth += 1;
+            ctx.borrow_mut().non_content_depth += 1;
         }
         ElementAction::PushFrame => {
-            let id = el.get_attribute("id");
-            let class = el.get_attribute("class");
+            let id = element.get_attribute("id");
+            let class = element.get_attribute("class");
             let frame = ElementFrame::new(tag_name, id.as_deref(), class.as_deref());
 
             let mut ctx = ctx.borrow_mut();
             ctx.element_stack.push(frame);
-            if is_anchor {
-                ctx.anchor_depth += 1;
+            if is_link {
+                ctx.link_nesting_depth += 1;
             }
         }
         ElementAction::Ignore => return false,
@@ -526,33 +517,26 @@ fn finalize_result(
     let final_context = Rc::into_inner(ctx)
         .expect("Rc should have single owner")
         .into_inner();
-
-    let Some(content_text) = final_context.best_content else {
+    let Some(extracted_text) = final_context.best_extracted_text else {
         anyhow::bail!("No main content found")
     };
-
     let resolved_url = resolve_url(url, final_context.canonical_url.as_deref())?;
-    let content: String = content_text.nfkc().collect();
+    let content: String = extracted_text.nfkc().collect();
     let title: String = final_context.page_title.nfkc().collect();
-
     Ok((content, title, resolved_url))
 }
 
 /// Resolve canonical URL against base URL and normalize
 fn resolve_url(base: &str, canonical: Option<&str>) -> anyhow::Result<String> {
     let base_url = Url::parse(base)?;
-
     let resolved = match canonical {
         Some(c) => base_url.join(c)?,
         None => base_url,
     };
-
     let mut url_str = resolved.to_string();
-
     // Strip trailing slash (but not for root paths like "https://example.com/")
     if url_str.ends_with('/') && resolved.path().len() > 1 {
         url_str.pop();
     }
-
     Ok(url_str)
 }
