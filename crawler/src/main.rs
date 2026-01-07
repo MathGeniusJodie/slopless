@@ -284,7 +284,6 @@ async fn main() -> Result<()> {
                 last_status = std::time::Instant::now();
             }
         }
-
         // Final commit
         db.commit()
     });
@@ -302,12 +301,9 @@ async fn main() -> Result<()> {
 
     // Drop the sender to signal writer thread to finish
     drop(state);
-
     // Wait for writer to complete
     let total = writer_handle.join().expect("Writer thread panicked")?;
-
     println!("Crawl finished. Total docs: {}", total);
-
     Ok(())
 }
 
