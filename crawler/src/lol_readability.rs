@@ -304,8 +304,8 @@ struct ParsingContext {
     canonical_url: Option<String>,
 }
 
-impl ParsingContext {
-    fn new() -> Self {
+impl Default for ParsingContext {
+    fn default() -> Self {
         Self {
             element_stack: Vec::with_capacity(64),
             best_extracted_text: None,
@@ -317,7 +317,9 @@ impl ParsingContext {
             canonical_url: None,
         }
     }
+}
 
+impl ParsingContext {
     /// Determine what action to take for an element based on current state and tag properties
     fn classify_element(&self, tag_name: &str) -> ElementAction {
         if tag_name == "title" {
@@ -423,7 +425,7 @@ impl ParsingContext {
 /// The URL will be the canonical URL if found, otherwise the input URL.
 /// Returns an error if no suitable content element was found.
 pub fn find_main_content(html: &[u8], url: &str) -> anyhow::Result<(String, String, String)> {
-    let ctx = Rc::new(RefCell::new(ParsingContext::new()));
+    let ctx = Rc::new(RefCell::new(ParsingContext::default()));
 
     // Each callback closure needs its own Rc clone (same underlying context)
     let ctx_for_canonical = ctx.clone();

@@ -232,10 +232,9 @@ async fn crawl_domain(
         let page_url = page
             .final_redirect_destination
             .as_deref()
-            .unwrap_or_else(|| page.get_url())
-            .to_string();
+            .unwrap_or_else(|| page.get_url());
 
-        match lol_readability::find_main_content(html.as_bytes(), &page_url) {
+        match lol_readability::find_main_content(html.as_bytes(), page_url) {
             Ok((content, title, url)) => {
                 // Send to writer thread - if channel is closed (writer crashed), count as failed
                 if state
