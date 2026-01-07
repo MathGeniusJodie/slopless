@@ -1254,4 +1254,338 @@ mod tests {
         let (text, _title, _url) = result.unwrap();
         assert!(text.contains("much longer article"));
     }
+
+    // =========================================================================
+    // Additional edge case tests for refactoring safety
+    // =========================================================================
+
+    #[test]
+    fn test_unclosed_tags_handled() {
+        // Malformed HTML with unclosed tags
+        let html = r#"
+            <html><body>
+                <div id="content">
+                    <p>This paragraph is never closed but has substantial content here.
+                    The article discusses important topics that readers care about.
+                    More text with commas, periods, and proper structure.
+                <article>
+                    <p>This is the main article content with lots of text.
+                    It has multiple sentences, and commas too.
+                    The article discusses important topics that readers care about.</p>
+                </article>
+            </body></html>
+        "#;
+
+        let result = find_main_content(html.as_bytes(), "https://example.com/test");
+        // Should still find content despite malformed HTML
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_void_elements_in_content() {
+        // Void elements like br, hr, img should not break parsing
+        let html = r#"
+            <html><body>
+                <article id="content">
+                    <p>First line of content<br>second line after break.
+                    <hr>
+                    <img src="test.jpg" alt="test">
+                    More substantial content here with multiple sentences.
+                    The article discusses important topics that readers care about.</p>
+                </article>
+            </body></html>
+        "#;
+
+        let result = find_main_content(html.as_bytes(), "https://example.com/test");
+        assert!(result.is_ok());
+        let (text, _title, _url) = result.unwrap();
+        assert!(text.contains("First line"));
+        assert!(text.contains("second line"));
+    }
+
+    #[test]
+    fn test_multiple_canonical_urls_last_wins() {
+        // If multiple canonical links exist (invalid HTML but happens), last one is used
+        let html = r#"
+            <html>
+                <head>
+                    <link rel="canonical" href="https://example.com/first">
+                    <link rel="canonical" href="https://example.com/second">
+                </head>
+                <body>
+                    <article>
+                        <p>This is the main article content with lots of text.
+                        It has multiple sentences, and commas too.
+                        The article discusses important topics that readers care about.</p>
+                    </article>
+                </body>
+            </html>
+        "#;
+
+        let result = find_main_content(html.as_bytes(), "https://example.com/original");
+        assert!(result.is_ok());
+        let (_text, _title, url) = result.unwrap();
+        // Last canonical wins (streaming parser overwrites)
+        assert_eq!(url, "https://example.com/second");
+    }
+
+    #[test]
+    fn test_empty_canonical_href_ignored() {
+        let html = r#"
+            <html>
+                <head>
+                    <link rel="canonical" href="">
+                </head>
+                <body>
+                    <article>
+                        <p>This is the main article content with lots of text.
+                        It has multiple sentences, and commas too.
+                        The article discusses important topics that readers care about.</p>
+                    </article>
+                </body>
+            </html>
+        "#;
+
+        let result = find_main_content(html.as_bytes(), "https://example.com/original");
+        assert!(result.is_ok());
+        let (_text, _title, url) = result.unwrap();
+        // Empty canonical should be ignored, original URL used
+        assert_eq!(url, "https://example.com/original");
+    }
+
+    #[test]
+    fn test_nested_non_content_containers() {
+        // Script inside div inside body - should all be skipped
+        let html = r#"
+            <html><body>
+                <div id="widgets">
+                    <script>var x = "script text here";</script>
+                    <style>.foo { color: red; }</style>
+                </div>
+                <article>
+                    <p>This is the main article content with lots of text.
+                    It has multiple sentences, and commas too.
+                    The article discusses important topics that readers care about.</p>
+                </article>
+            </body></html>
+        "#;
+
+        let result = find_main_content(html.as_bytes(), "https://example.com/test");
+        assert!(result.is_ok());
+        let (text, _title, _url) = result.unwrap();
+        assert!(!text.contains("script text"));
+        assert!(!text.contains("color: red"));
+    }
+
+    #[test]
+    fn test_script_inside_anchor() {
+        // Edge case: script inside anchor (invalid but may occur)
+        let html = r#"
+            <html><body>
+                <article>
+                    <p>Regular content here with substantial text for the article.
+                    <a href="/link"><script>alert('xss')</script>Link text</a>
+                    More text here to establish main content area properly.
+                    The article discusses important topics that readers care about.</p>
+                </article>
+            </body></html>
+        "#;
+
+        let result = find_main_content(html.as_bytes(), "https://example.com/test");
+        assert!(result.is_ok());
+        let (text, _title, _url) = result.unwrap();
+        assert!(!text.contains("alert"));
+    }
+
+    #[test]
+    fn test_span_inside_p_is_content() {
+        let html = r#"
+            <html><body>
+                <article>
+                    <p><span class="intro">This is the intro span.</span>
+                    And this is the rest of the paragraph with more content.
+                    The article discusses important topics that readers care about.
+                    More text here with commas, periods, and proper structure.</p>
+                </article>
+            </body></html>
+        "#;
+
+        let result = find_main_content(html.as_bytes(), "https://example.com/test");
+        assert!(result.is_ok());
+        let (text, _title, _url) = result.unwrap();
+        assert!(text.contains("intro span"));
+        assert!(text.contains("rest of the paragraph"));
+    }
+
+    #[test]
+    fn test_blockquote_content_included() {
+        let html = r#"
+            <html><body>
+                <article>
+                    <p>Before the quote, some introductory text here.</p>
+                    <blockquote>This is a substantial quote with important content.
+                    The quote discusses topics that matter to readers today.</blockquote>
+                    <p>After the quote, more discussion and analysis follows.
+                    The article explores the implications of the quoted material.</p>
+                </article>
+            </body></html>
+        "#;
+
+        let result = find_main_content(html.as_bytes(), "https://example.com/test");
+        assert!(result.is_ok());
+        let (text, _title, _url) = result.unwrap();
+        assert!(text.contains("substantial quote"));
+    }
+
+    #[test]
+    fn test_table_content_included() {
+        let html = r#"
+            <html><body>
+                <article>
+                    <p>Introduction to the data table below with context.</p>
+                    <table>
+                        <tr><td>Cell one content</td><td>Cell two content</td></tr>
+                        <tr><td>Cell three content</td><td>Cell four content</td></tr>
+                    </table>
+                    <p>Analysis of the table data with substantial commentary.
+                    The article discusses the implications of this data set.</p>
+                </article>
+            </body></html>
+        "#;
+
+        let result = find_main_content(html.as_bytes(), "https://example.com/test");
+        assert!(result.is_ok());
+        let (text, _title, _url) = result.unwrap();
+        assert!(text.contains("Cell one"));
+    }
+
+    #[test]
+    fn test_pre_code_content_included() {
+        let html = r#"
+            <html><body>
+                <article>
+                    <p>Here is some code demonstrating the concept:</p>
+                    <pre><code>function example() {
+                        return "hello world";
+                    }</code></pre>
+                    <p>As you can see, the function returns a greeting string.
+                    This demonstrates the basic pattern we discussed above.</p>
+                </article>
+            </body></html>
+        "#;
+
+        let result = find_main_content(html.as_bytes(), "https://example.com/test");
+        assert!(result.is_ok());
+        let (text, _title, _url) = result.unwrap();
+        assert!(text.contains("function example"));
+    }
+
+    #[test]
+    fn test_figure_figcaption_content() {
+        let html = r#"
+            <html><body>
+                <article>
+                    <p>The following figure illustrates the concept clearly.</p>
+                    <figure>
+                        <img src="diagram.png" alt="diagram">
+                        <figcaption>Figure 1: A detailed diagram showing the architecture of the system and its components.</figcaption>
+                    </figure>
+                    <p>As the figure shows, the architecture is quite complex.
+                    We will discuss each component in detail below.</p>
+                </article>
+            </body></html>
+        "#;
+
+        let result = find_main_content(html.as_bytes(), "https://example.com/test");
+        assert!(result.is_ok());
+        let (text, _title, _url) = result.unwrap();
+        assert!(text.contains("detailed diagram"));
+    }
+
+    #[test]
+    fn test_multiple_title_parts() {
+        // Some pages have title split across multiple text nodes
+        let html = r#"
+            <html>
+                <head>
+                    <title>Part One - Part Two</title>
+                </head>
+                <body>
+                    <article>
+                        <p>This is the main article content with lots of text.
+                        It has multiple sentences, and commas too.
+                        The article discusses important topics that readers care about.</p>
+                    </article>
+                </body>
+            </html>
+        "#;
+
+        let result = find_main_content(html.as_bytes(), "https://example.com/test");
+        assert!(result.is_ok());
+        let (_text, title, _url) = result.unwrap();
+        assert_eq!(title, "Part One - Part Two");
+    }
+
+    #[test]
+    fn test_whitespace_only_content_rejected() {
+        let html = r#"
+            <html><body>
+                <div id="content">
+
+
+                </div>
+                <article>
+                    <p>This is the actual content that should be found here.
+                    The article has substantial text with multiple sentences.
+                    More content to establish this as the main readable area.</p>
+                </article>
+            </body></html>
+        "#;
+
+        let result = find_main_content(html.as_bytes(), "https://example.com/test");
+        assert!(result.is_ok());
+        let (text, _title, _url) = result.unwrap();
+        assert!(text.contains("actual content"));
+    }
+
+    #[test]
+    fn test_details_summary_content() {
+        let html = r#"
+            <html><body>
+                <article>
+                    <p>Main article content introduction paragraph here.</p>
+                    <details>
+                        <summary>Click to expand additional information</summary>
+                        <p>This is hidden content that expands when clicked.
+                        It contains additional details about the topic discussed.</p>
+                    </details>
+                    <p>Conclusion paragraph with final thoughts on the topic.
+                    The article wraps up the discussion with key takeaways.</p>
+                </article>
+            </body></html>
+        "#;
+
+        let result = find_main_content(html.as_bytes(), "https://example.com/test");
+        assert!(result.is_ok());
+        let (text, _title, _url) = result.unwrap();
+        // Both visible and hidden content should be included
+        assert!(text.contains("Click to expand"));
+        assert!(text.contains("hidden content"));
+    }
+
+    #[test]
+    fn test_element_frame_new_with_both_id_and_class() {
+        // Test that both id and class contribute to score
+        let frame = ElementFrame::new("div", Some("main-content"), Some("article-body"));
+        // div (5) + positive id (25) + positive class (25) = 55
+        assert_eq!(frame.base_score, 55.0);
+    }
+
+    #[test]
+    fn test_element_frame_new_mixed_id_class() {
+        // Positive id but negative class
+        let frame = ElementFrame::new("div", Some("content"), Some("sidebar"));
+        // div (5) + positive id (25) + negative class (-25) = 5
+        assert_eq!(frame.base_score, 5.0);
+    }
 }
