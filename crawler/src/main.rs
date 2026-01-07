@@ -13,7 +13,6 @@ use tantivy::schema::{
 use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
 use tantivy::{Index, Term};
 use tokio::sync::mpsc;
-use url::Url;
 
 mod lol_readability;
 
@@ -141,45 +140,11 @@ struct SharedState {
     pages_failed: AtomicUsize,
 }
 
-/// Parse a single domain line, returning the cleaned domain if valid
-fn parse_domain_line(line: &str) -> Option<String> {
-    let domain = line.trim();
-
-    if domain.is_empty() || domain.starts_with('#') {
-        return None;
-    }
-
-    let clean_domain = domain
-        .trim_start_matches("http://")
-        .trim_start_matches("https://")
-        .trim_end_matches('/');
-
-    let url_str = format!("https://{}/", clean_domain);
-    Url::parse(&url_str).ok()?;
-    Some(clean_domain.to_string())
-}
-
-fn parse_domains(content: &str) -> Vec<String> {
-    content.lines().filter_map(parse_domain_line).collect()
-}
-
-fn load_domains(file_path: &str) -> Result<Vec<String>> {
-    let file_content = read_to_string(file_path)
-        .with_context(|| format!("Failed to read input file: {}", file_path))?;
-    Ok(parse_domains(&file_content))
-}
-
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
 
 /// Crawl a single domain
-async fn crawl_domain(
-    domain: String,
-    state: Arc<SharedState>,
-    excluded_prefixes: Arc<Vec<String>>,
-) {
-    let url = format!("https://{}/", domain);
+async fn crawl_domain(url: &str, state: Arc<SharedState>, excluded_prefixes: Arc<Vec<String>>) {
     let mut website = Website::new(&url);
-
     website.configuration.respect_robots_txt = true;
     website.configuration.subdomains = true;
     website.configuration.only_html = true;
@@ -200,7 +165,7 @@ async fn crawl_domain(
     );
 
     let Some(mut rx) = website.subscribe(16384) else {
-        eprintln!("Failed to subscribe to {} crawl events", domain);
+        eprintln!("Failed to subscribe to {} crawl events", url);
         return;
     };
 
@@ -209,16 +174,13 @@ async fn crawl_domain(
     });
 
     let mut pages_sent_to_index = 0usize;
-    let mut lagged_count = 0usize;
 
     loop {
         let page = match rx.recv().await {
             Ok(page) => page,
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                 // Lagged pages are dropped by the broadcast channel - count as failed
-                let n = n as usize;
-                lagged_count += n;
-                state.pages_failed.fetch_add(n, Ordering::Relaxed);
+                state.pages_failed.fetch_add(n as usize, Ordering::Relaxed);
                 continue;
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -260,11 +222,8 @@ async fn crawl_domain(
 
     let _ = crawl_handle.await;
 
-    if pages_sent_to_index > 0 || lagged_count > 0 {
-        println!(
-            "Finished {} Sent: {}, Lagged: {}",
-            domain, pages_sent_to_index, lagged_count
-        );
+    if pages_sent_to_index > 0 {
+        println!("Finished {} Sent: {}", url, pages_sent_to_index);
     }
 }
 
@@ -279,9 +238,6 @@ async fn main() -> Result<()> {
         pages_indexed: AtomicUsize::new(0),
         pages_failed: AtomicUsize::new(0),
     });
-
-    let domains = load_domains(&cli_args.input_file)?;
-    println!("Loaded {} domains to crawl", domains.len());
 
     let excluded_prefixes = Arc::new(cli_args.excluded_url_prefixes);
     let max_concurrent = cli_args.max_concurrent_domains;
@@ -331,18 +287,23 @@ async fn main() -> Result<()> {
         db.commit()
     });
 
+    let file_content = read_to_string(cli_args.input_file)?;
     // Crawl all domains concurrently
-    futures::stream::iter(domains)
-        .for_each_concurrent(max_concurrent, |domain| {
-            let state = state.clone();
-            let excluded = excluded_prefixes.clone();
-            async move {
-                crawl_domain(domain, state, excluded).await;
-            }
-        })
-        .await;
+    futures::stream::iter(file_content.lines().filter_map(|line| {
+        let url_str = format!("https://{}", line.trim());
+        url::Url::parse(&url_str).ok().map(|url| url.to_string())
+    }))
+    .for_each_concurrent(max_concurrent, |domain| {
+        let state = state.clone();
+        let excluded = excluded_prefixes.clone();
+        async move {
+            crawl_domain(&domain, state, excluded).await;
+        }
+    })
+    .await;
 
-    // Drop the sender to signal writer thread to finish
+    // All crawler tasks are done. Dropping our Arc reference allows the
+    // channel to close (since no other senders remain).
     drop(state);
     // Wait for writer to complete
     let total = writer_handle.join().expect("Writer thread panicked")?;

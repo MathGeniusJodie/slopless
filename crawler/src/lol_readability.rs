@@ -181,6 +181,7 @@ impl ElementFrame {
 
     /// Append text with whitespace normalization (collapses whitespace, trims)
     fn append_whitespace_normalized(&mut self, text: &str) {
+        self.extracted_text.reserve(text.len() + 1);
         for part in text.split_whitespace() {
             if !self.extracted_text.is_empty() {
                 self.extracted_text.push(' ');
