@@ -539,7 +539,6 @@ dependencies = [
  "futures",
  "html-escape",
  "lol_html",
- "parking_lot",
  "regex",
  "spider",
  "tantivy",

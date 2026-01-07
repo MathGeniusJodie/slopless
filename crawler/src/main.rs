@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use futures::StreamExt;
-use parking_lot::Mutex;
 use spider::website::Website;
 use std::fs::read_to_string;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11,6 +10,7 @@ use tantivy::schema::{
 };
 use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
 use tantivy::{Index, Term};
+use tokio::sync::mpsc;
 use url::Url;
 
 mod lol_readability;
@@ -24,8 +24,6 @@ struct Args {
     excluded_url_prefixes: Vec<String>,
     #[arg(short = 'c', long = "concurrency", default_value_t = 100)]
     max_concurrent_domains: usize,
-    #[arg(short = 'v', long = "verbose", default_value_t = false)]
-    verbose_logging: bool,
 }
 
 /// Manages Tantivy search index
@@ -119,9 +117,16 @@ impl CrawlDb {
     }
 }
 
+/// Page data sent to the writer thread
+struct PageData {
+    url: String,
+    title: String,
+    content: String,
+}
+
 /// Shared state across all crawl tasks
 struct SharedState {
-    db: Mutex<CrawlDb>,
+    tx: mpsc::UnboundedSender<PageData>,
     pages_indexed: AtomicUsize,
     pages_failed: AtomicUsize,
 }
@@ -164,7 +169,6 @@ async fn crawl_domain(
     domain: String,
     state: Arc<SharedState>,
     excluded_prefixes: Arc<Vec<String>>,
-    verbose: bool,
 ) {
     let url = format!("https://{}/", domain);
     let mut website = Website::new(&url);
@@ -190,8 +194,6 @@ async fn crawl_domain(
         website.crawl().await;
     });
 
-    let mut pages_received = 0usize;
-    let mut pages_empty_html = 0usize;
     let mut pages_sent_to_index = 0usize;
     let mut lagged_count = 0usize;
 
@@ -205,11 +207,8 @@ async fn crawl_domain(
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         };
 
-        pages_received += 1;
-
         let html = page.get_html();
         if html.is_empty() {
-            pages_empty_html += 1;
             continue;
         }
 
@@ -219,36 +218,28 @@ async fn crawl_domain(
             .unwrap_or_else(|| page.get_url())
             .to_string();
 
-        // Move CPU-bound work (readability + indexing) to blocking threadpool
-        let state = state.clone();
-        let domain_for_log = if verbose { Some(domain.clone()) } else { None };
-
-        tokio::task::spawn_blocking(move || {
-            match lol_readability::find_main_content(html.as_bytes(), &page_url) {
-                Ok((content, title, resolved_url)) => {
-                    let mut db = state.db.lock();
-                    db.process_page(&resolved_url, &title, &content);
-                    drop(db);
-                    state.pages_indexed.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(e) => {
-                    state.pages_failed.fetch_add(1, Ordering::Relaxed);
-                    if let Some(d) = domain_for_log {
-                        eprintln!("[{}] Readability failed for {}: {}", d, page_url, e);
-                    }
-                }
+        match lol_readability::find_main_content(html.as_bytes(), &page_url) {
+            Ok((content, title, url)) => {
+                let _ = state.tx.send(PageData {
+                    url,
+                    title,
+                    content,
+                });
+                pages_sent_to_index += 1;
+                state.pages_indexed.fetch_add(1, Ordering::Relaxed);
             }
-        });
-
-        pages_sent_to_index += 1;
+            Err(_e) => {
+                state.pages_failed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     let _ = crawl_handle.await;
 
-    if pages_received > 1 {
+    if pages_sent_to_index > 0 {
         println!(
-            "Finished {} - received: {}, empty: {}, sent: {}, lagged: {}",
-            domain, pages_received, pages_empty_html, pages_sent_to_index, lagged_count
+            "Finished {} Indexed: {}, Lagged: {}",
+            domain, pages_sent_to_index, lagged_count
         );
     }
 }
@@ -257,8 +248,10 @@ async fn crawl_domain(
 async fn main() -> Result<()> {
     let cli_args = Args::parse();
 
+    let (tx, mut rx) = mpsc::unbounded_channel::<PageData>();
+
     let state = Arc::new(SharedState {
-        db: Mutex::new(CrawlDb::new()?),
+        tx,
         pages_indexed: AtomicUsize::new(0),
         pages_failed: AtomicUsize::new(0),
     });
@@ -268,60 +261,52 @@ async fn main() -> Result<()> {
 
     let excluded_prefixes = Arc::new(cli_args.excluded_url_prefixes);
     let max_concurrent = cli_args.max_concurrent_domains;
-    let verbose = cli_args.verbose_logging;
 
-    // Periodic status reporting and index commits
-    let state_for_maint = state.clone();
-    let maintenance_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
-        loop {
-            interval.tick().await;
-            let indexed = state_for_maint.pages_indexed.load(Ordering::Relaxed);
-            let failed = state_for_maint.pages_failed.load(Ordering::Relaxed);
+    // Dedicated writer thread - owns CrawlDb exclusively, no locks needed
+    let state_for_writer = state.clone();
+    let writer_handle = std::thread::spawn(move || -> Result<u64> {
+        let mut db = CrawlDb::new()?;
+        let mut last_status = std::time::Instant::now();
 
-            let mut db = state_for_maint.db.lock();
-            match db.commit() {
-                Ok(total_docs) => {
+        while let Some(page) = rx.blocking_recv() {
+            db.process_page(&page.url, &page.title, &page.content);
+
+            // Commit and report status every 10 seconds
+            if last_status.elapsed().as_secs() >= 10 {
+                if let Ok(total) = db.commit() {
+                    let indexed = state_for_writer.pages_indexed.load(Ordering::Relaxed);
+                    let failed = state_for_writer.pages_failed.load(Ordering::Relaxed);
                     println!(
-                        "Status: {} indexed, {} failed | committed, {} total docs",
-                        indexed, failed, total_docs
+                        "Status: {} indexed, {} failed | {} total docs",
+                        indexed, failed, total
                     );
                 }
-                Err(e) => {
-                    println!(
-                        "Status: {} indexed, {} failed | commit failed: {}",
-                        indexed, failed, e
-                    );
-                }
+                last_status = std::time::Instant::now();
             }
         }
+
+        // Final commit
+        db.commit()
     });
 
+    // Crawl all domains concurrently
     futures::stream::iter(domains)
         .for_each_concurrent(max_concurrent, |domain| {
             let state = state.clone();
             let excluded = excluded_prefixes.clone();
             async move {
-                crawl_domain(domain, state, excluded, verbose).await;
+                crawl_domain(domain, state, excluded).await;
             }
         })
         .await;
 
-    maintenance_task.abort();
+    // Drop the sender to signal writer thread to finish
+    drop(state);
 
-    // Final commit
-    let indexed = state.pages_indexed.load(Ordering::Relaxed);
-    let failed = state.pages_failed.load(Ordering::Relaxed);
+    // Wait for writer to complete
+    let total = writer_handle.join().expect("Writer thread panicked")?;
 
-    let total = {
-        let mut db = state.db.lock();
-        db.commit()?
-    };
-
-    println!(
-        "Crawl finished. Pages indexed: {}, Failed: {}, Total docs: {}",
-        indexed, failed, total
-    );
+    println!("Crawl finished. Total docs: {}", total);
 
     Ok(())
 }

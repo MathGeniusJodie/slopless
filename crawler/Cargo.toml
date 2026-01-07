@@ -15,7 +15,6 @@ clap = { version = "4.5.54", features = ["derive"] }
 unicode-normalization = "0.1.25"
 spider = { version = "2.38.120", features = ["sync", "encoding"] }
 html-escape = "0.2"
-parking_lot = "0.12"
 
 [profile.release]
 debug = true # Adds debug symbols to the optimized binary
