@@ -116,7 +116,9 @@ impl CrawlDb {
         doc.add_text(self.title_field, title);
         doc.add_text(self.body_field, content);
 
-        let _ = self.index_writer.add_document(doc);
+        if let Err(e) = self.index_writer.add_document(doc) {
+            eprintln!("Error adding document {}: {}", url, e);
+        }
     }
 
     fn commit(&mut self) -> Result<u64> {

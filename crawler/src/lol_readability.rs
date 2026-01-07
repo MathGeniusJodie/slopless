@@ -167,7 +167,7 @@ impl ElementFrame {
     pub(crate) fn add_text(&mut self, text: &str) -> usize {
         let mut len_before = self.extracted_text.len();
         self.append_text(text);
-        if self.extracted_text.chars().nth(len_before) == Some(' ') {
+        if self.extracted_text.as_bytes().get(len_before) == Some(&b' ') {
             len_before += 1; // space separators don't count towards length
         }
         self.extracted_text.len().saturating_sub(len_before)
@@ -249,19 +249,6 @@ pub(crate) fn categorize_tag(tag: &str) -> TagCategory {
     }
 }
 
-// Convenience functions for common checks
-fn is_void_element(tag: &str) -> bool {
-    categorize_tag(tag) == TagCategory::VoidElement
-}
-
-fn is_non_content_container(tag: &str) -> bool {
-    categorize_tag(tag) == TagCategory::NonContentContainer
-}
-
-fn is_non_content_leaf(tag: &str) -> bool {
-    categorize_tag(tag) == TagCategory::NonContentLeaf
-}
-
 /// What action to take when encountering an HTML element
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ElementAction {
@@ -310,7 +297,10 @@ impl ParsingContext {
         if tag_name == "title" {
             return ElementAction::TrackTitle;
         }
-        let is_void = is_void_element(tag_name);
+
+        let category = categorize_tag(tag_name);
+        let is_void = category == TagCategory::VoidElement;
+
         // Inside a non-content container?
         if self.non_content_depth > 0 {
             return if is_void {
@@ -319,14 +309,14 @@ impl ParsingContext {
                 ElementAction::IncrementSkipDepth
             };
         }
-        // Non-content container (script, style, head, etc.)?
-        if is_non_content_container(tag_name) {
-            return ElementAction::StartSkipping;
+
+        // Check tag category
+        match category {
+            TagCategory::NonContentContainer => return ElementAction::StartSkipping,
+            TagCategory::NonContentLeaf | TagCategory::VoidElement => return ElementAction::Ignore,
+            TagCategory::Content => {}
         }
-        // Non-content leaf or void element?
-        if is_non_content_leaf(tag_name) || is_void {
-            return ElementAction::Ignore;
-        }
+
         // Stack depth limit reached?
         if self.element_stack.len() >= MAX_ELEMENT_STACK_DEPTH {
             return ElementAction::Ignore;

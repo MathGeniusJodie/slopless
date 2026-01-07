@@ -463,7 +463,6 @@ dependencies = [
  "clap",
  "futures",
  "html-escape",
- "itertools",
  "lol_html",
  "regex",
  "reqwest",
