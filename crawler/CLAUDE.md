@@ -165,8 +165,25 @@ Edit the `Args` struct in main.rs with the `#[arg(...)]` attribute from clap.
 
 ### Modifying the readability algorithm
 The scoring logic is in `ElementFrame::new()` and `ElementFrame::calculate_base_score()` in `lol_readability.rs`.
-Key tunables: minimum text length (line ~197), base scores (lines ~100-107), regex patterns (lines ~19-40).
+Key tunables: minimum text length (line ~194), base scores (lines ~100-107), regex patterns (lines ~19-40).
 
 ### Running tests with specific output
 The `lol_readability` module has extensive tests demonstrating various HTML patterns.
 Run with `cargo test lol_readability -- --nocapture` to see extracted content.
+
+## Coding Standards
+
+### Tests go in separate files
+Tests should be placed in separate `*_tests.rs` files rather than in inline `#[cfg(test)] mod tests` blocks within the source file. This keeps the source files focused on implementation.
+
+- `src/main.rs` → tests in `src/main_tests.rs`
+- `src/lol_readability.rs` → tests in `src/lol_readability_tests.rs`
+
+Test files are conditionally compiled and included as modules:
+```rust
+#[cfg(test)]
+mod main_tests;
+
+#[cfg(test)]
+mod lol_readability_tests;
+```
