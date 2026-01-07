@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use futures::StreamExt;
+use parking_lot::Mutex;
 use spider::website::Website;
 use std::fs::read_to_string;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -10,7 +11,6 @@ use tantivy::schema::{
 };
 use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
 use tantivy::{Index, Term};
-use tokio::sync::{mpsc, oneshot};
 use url::Url;
 
 mod lol_readability;
@@ -28,55 +28,7 @@ struct Args {
     verbose_logging: bool,
 }
 
-/// Metrics tracked with atomic counters (no lock needed)
-struct CrawlMetrics {
-    pages_crawled: AtomicUsize,
-    pages_failed: AtomicUsize,
-}
-
-/// Messages sent to the DB thread
-enum DbMessage {
-    ProcessPage {
-        url: String,
-        title: String,
-        content: String,
-    },
-    Commit {
-        reply: oneshot::Sender<Result<u64>>,
-    },
-    Shutdown,
-}
-
-/// Handle to communicate with the DB thread
-#[derive(Clone)]
-struct DbHandle {
-    tx: mpsc::Sender<DbMessage>,
-}
-
-impl DbHandle {
-    async fn process_page(&self, url: String, title: String, content: String) {
-        self.tx
-            .send(DbMessage::ProcessPage {
-                url,
-                title,
-                content,
-            })
-            .await
-            .ok();
-    }
-
-    async fn commit(&self) -> Result<u64> {
-        let (reply, rx) = oneshot::channel();
-        self.tx.send(DbMessage::Commit { reply }).await.ok();
-        rx.await?
-    }
-
-    async fn shutdown(&self) {
-        self.tx.send(DbMessage::Shutdown).await.ok();
-    }
-}
-
-/// Manages Tantivy search index (runs in dedicated thread)
+/// Manages Tantivy search index
 struct CrawlDb {
     index: Index,
     index_writer: tantivy::IndexWriter,
@@ -148,19 +100,16 @@ impl CrawlDb {
         })
     }
 
-    /// Returns: true = indexed, false = failed
-    fn process_page(&mut self, url: &str, title: &str, content: &str) -> bool {
-        // Delete any existing document with this URL (idiomatic upsert pattern)
+    fn process_page(&mut self, url: &str, title: &str, content: &str) {
         let url_term = Term::from_field_text(self.url_field, url);
         self.index_writer.delete_term(url_term);
 
-        // Index the document
         let mut doc = tantivy::TantivyDocument::new();
         doc.add_text(self.url_field, url);
         doc.add_text(self.title_field, title);
         doc.add_text(self.body_field, content);
 
-        self.index_writer.add_document(doc).is_ok()
+        let _ = self.index_writer.add_document(doc);
     }
 
     fn commit(&mut self) -> Result<u64> {
@@ -168,55 +117,28 @@ impl CrawlDb {
         let reader = self.index.reader()?;
         Ok(reader.searcher().num_docs())
     }
-
-    fn run(mut self, mut rx: mpsc::Receiver<DbMessage>, metrics: Arc<CrawlMetrics>) {
-        while let Some(msg) = rx.blocking_recv() {
-            match msg {
-                DbMessage::ProcessPage {
-                    url,
-                    title,
-                    content,
-                } => {
-                    if self.process_page(&url, &title, &content) {
-                        metrics.pages_crawled.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        metrics.pages_failed.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                DbMessage::Commit { reply } => {
-                    reply.send(self.commit()).ok();
-                }
-                DbMessage::Shutdown => break,
-            }
-        }
-    }
 }
 
-/// Spawn the DB thread and return a handle for communication
-fn spawn_db_thread(metrics: Arc<CrawlMetrics>) -> Result<(DbHandle, std::thread::JoinHandle<()>)> {
-    let db = CrawlDb::new()?;
-    let (tx, rx) = mpsc::channel(1024);
-    let handle = std::thread::spawn(move || db.run(rx, metrics));
-    Ok((DbHandle { tx }, handle))
+/// Shared state across all crawl tasks
+struct SharedState {
+    db: Mutex<CrawlDb>,
+    pages_indexed: AtomicUsize,
+    pages_failed: AtomicUsize,
 }
 
 /// Parse a single domain line, returning the cleaned domain if valid
-/// Returns None for empty lines, comments, or invalid domains
 fn parse_domain_line(line: &str) -> Option<String> {
     let domain = line.trim();
 
-    // Skip empty lines and comments
     if domain.is_empty() || domain.starts_with('#') {
         return None;
     }
 
-    // Strip protocol prefix and trailing slash
     let clean_domain = domain
         .trim_start_matches("http://")
         .trim_start_matches("https://")
         .trim_end_matches('/');
 
-    // Validate by attempting to parse as URL
     let url_str = format!("https://{}/", clean_domain);
     if Url::parse(&url_str).is_ok() {
         Some(clean_domain.to_string())
@@ -225,19 +147,16 @@ fn parse_domain_line(line: &str) -> Option<String> {
     }
 }
 
-/// Parse multiple domain lines from content string
 fn parse_domains(content: &str) -> Vec<String> {
     content.lines().filter_map(parse_domain_line).collect()
 }
 
-/// Load domain list from file
 fn load_domains(file_path: &str) -> Result<Vec<String>> {
     let file_content = read_to_string(file_path)
         .with_context(|| format!("Failed to read input file: {}", file_path))?;
 
     let domains = parse_domains(&file_content);
 
-    // Log invalid domains (side effect, but useful for debugging)
     for line in file_content.lines() {
         let trimmed = line.trim();
         if !trimmed.is_empty() && !trimmed.starts_with('#') && parse_domain_line(line).is_none() {
@@ -250,10 +169,10 @@ fn load_domains(file_path: &str) -> Result<Vec<String>> {
 
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
 
-/// Crawl a single domain using spider
+/// Crawl a single domain
 async fn crawl_domain(
     domain: String,
-    db: DbHandle,
+    state: Arc<SharedState>,
     excluded_prefixes: Arc<Vec<String>>,
     verbose: bool,
 ) {
@@ -263,7 +182,7 @@ async fn crawl_domain(
     website.configuration.respect_robots_txt = true;
     website.configuration.subdomains = true;
     website.configuration.only_html = true;
-    website.configuration.delay = 5000; // 5 second delay between requests
+    website.configuration.delay = 5000;
     website.with_user_agent(Some(USER_AGENT));
 
     if !excluded_prefixes.is_empty() {
@@ -277,16 +196,13 @@ async fn crawl_domain(
         return;
     };
 
-    // Spawn crawl so website is dropped when done, closing the channel
     let crawl_handle = tokio::spawn(async move {
         website.crawl().await;
     });
 
-    // Process pages as they stream in
     let mut pages_received = 0usize;
     let mut pages_empty_html = 0usize;
-    let mut pages_readability_failed = 0usize;
-    let mut pages_indexed = 0usize;
+    let mut pages_sent_to_index = 0usize;
     let mut lagged_count = 0usize;
 
     loop {
@@ -300,43 +216,49 @@ async fn crawl_domain(
         };
 
         pages_received += 1;
-        if verbose {
-            eprintln!("[{}] Page: {}", domain, page.get_url());
-        }
+
         let html = page.get_html();
         if html.is_empty() {
             pages_empty_html += 1;
-            if verbose {
-                eprintln!("[{}] Empty HTML: {}", domain, page.get_url());
-            }
             continue;
         }
 
-        // Use final redirect destination to handle redirects properly
-        let url = page
+        let page_url = page
             .final_redirect_destination
             .as_deref()
-            .unwrap_or_else(|| page.get_url());
-        // Extract readable content from HTML
-        match lol_readability::find_main_content(html.as_bytes(), url) {
-            Ok((content, title, resolved_url)) => {
-                db.process_page(resolved_url, title, content).await;
-                pages_indexed += 1;
-            }
-            Err(e) => {
-                pages_readability_failed += 1;
-                if verbose {
-                    eprintln!("[{}] Readability failed for {}: {}", domain, url, e);
+            .unwrap_or_else(|| page.get_url())
+            .to_string();
+
+        // Move CPU-bound work (readability + indexing) to blocking threadpool
+        let state = state.clone();
+        let domain_for_log = if verbose { Some(domain.clone()) } else { None };
+
+        tokio::task::spawn_blocking(move || {
+            match lol_readability::find_main_content(html.as_bytes(), &page_url) {
+                Ok((content, title, resolved_url)) => {
+                    let mut db = state.db.lock();
+                    db.process_page(&resolved_url, &title, &content);
+                    drop(db);
+                    state.pages_indexed.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    state.pages_failed.fetch_add(1, Ordering::Relaxed);
+                    if let Some(d) = domain_for_log {
+                        eprintln!("[{}] Readability failed for {}: {}", d, page_url, e);
+                    }
                 }
             }
-        }
+        });
+
+        pages_sent_to_index += 1;
     }
 
     let _ = crawl_handle.await;
+
     if pages_received > 1 {
         println!(
-            "Finished crawling {} - received: {}, empty: {}, readability_failed: {}, indexed: {}, lagged: {}",
-            domain, pages_received, pages_empty_html, pages_readability_failed, pages_indexed, lagged_count
+            "Finished {} - received: {}, empty: {}, sent: {}, lagged: {}",
+            domain, pages_received, pages_empty_html, pages_sent_to_index, lagged_count
         );
     }
 }
@@ -345,11 +267,11 @@ async fn crawl_domain(
 async fn main() -> Result<()> {
     let cli_args = Args::parse();
 
-    let metrics = Arc::new(CrawlMetrics {
-        pages_crawled: AtomicUsize::new(0),
+    let state = Arc::new(SharedState {
+        db: Mutex::new(CrawlDb::new()?),
+        pages_indexed: AtomicUsize::new(0),
         pages_failed: AtomicUsize::new(0),
     });
-    let (db, db_thread) = spawn_db_thread(metrics.clone())?;
 
     let domains = load_domains(&cli_args.input_file)?;
     println!("Loaded {} domains to crawl", domains.len());
@@ -358,24 +280,28 @@ async fn main() -> Result<()> {
     let max_concurrent = cli_args.max_concurrent_domains;
     let verbose = cli_args.verbose_logging;
 
-    // Spawn background task for periodic status updates and commits
-    let db_for_status = db.clone();
-    let metrics_for_status = metrics.clone();
-    let status_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    // Periodic status reporting and index commits
+    let state_for_maint = state.clone();
+    let maintenance_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
         loop {
             interval.tick().await;
+            let indexed = state_for_maint.pages_indexed.load(Ordering::Relaxed);
+            let failed = state_for_maint.pages_failed.load(Ordering::Relaxed);
 
-            let crawled = metrics_for_status.pages_crawled.load(Ordering::Relaxed);
-            let failed = metrics_for_status.pages_failed.load(Ordering::Relaxed);
-            println!("Pages indexed: {}, Failed: {}", crawled, failed);
-
-            match db_for_status.commit().await {
-                Ok(doc_count) => {
-                    println!("  Total indexed documents: {}", doc_count);
+            let mut db = state_for_maint.db.lock();
+            match db.commit() {
+                Ok(total_docs) => {
+                    println!(
+                        "Status: {} indexed, {} failed | committed, {} total docs",
+                        indexed, failed, total_docs
+                    );
                 }
                 Err(e) => {
-                    eprintln!("Warning: Failed to commit index: {:?}", e);
+                    println!(
+                        "Status: {} indexed, {} failed | commit failed: {}",
+                        indexed, failed, e
+                    );
                 }
             }
         }
@@ -383,33 +309,29 @@ async fn main() -> Result<()> {
 
     futures::stream::iter(domains)
         .for_each_concurrent(max_concurrent, |domain| {
-            let db = db.clone();
+            let state = state.clone();
             let excluded = excluded_prefixes.clone();
             async move {
-                crawl_domain(domain, db, excluded, verbose).await;
+                crawl_domain(domain, state, excluded, verbose).await;
             }
         })
         .await;
 
-    status_task.abort();
+    maintenance_task.abort();
 
     // Final commit
-    let crawled = metrics.pages_crawled.load(Ordering::Relaxed);
-    let failed = metrics.pages_failed.load(Ordering::Relaxed);
-    match db.commit().await {
-        Ok(doc_count) => {
-            println!(
-                "Crawl finished. Pages indexed: {}, Failed: {}, Total docs: {}",
-                crawled, failed, doc_count
-            );
-        }
-        Err(e) => {
-            eprintln!("Final commit failed: {:?}", e);
-        }
-    }
+    let indexed = state.pages_indexed.load(Ordering::Relaxed);
+    let failed = state.pages_failed.load(Ordering::Relaxed);
 
-    db.shutdown().await;
-    db_thread.join().ok();
+    let total = {
+        let mut db = state.db.lock();
+        db.commit()?
+    };
+
+    println!(
+        "Crawl finished. Pages indexed: {}, Failed: {}, Total docs: {}",
+        indexed, failed, total
+    );
 
     Ok(())
 }
@@ -417,10 +339,6 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // =========================================================================
-    // Tests for parse_domain_line
-    // =========================================================================
 
     #[test]
     fn test_parse_domain_line_simple() {
@@ -476,7 +394,6 @@ mod tests {
 
     #[test]
     fn test_parse_domain_line_preserves_path() {
-        // Domain with path should preserve the path part
         assert_eq!(
             parse_domain_line("example.com/path"),
             Some("example.com/path".to_string())
@@ -510,7 +427,6 @@ mod tests {
 
     #[test]
     fn test_parse_domain_line_invalid() {
-        // Invalid domain formats
         assert_eq!(parse_domain_line("not a valid domain!@#$"), None);
         assert_eq!(parse_domain_line("http://"), None);
         assert_eq!(parse_domain_line("://missing-scheme"), None);
@@ -526,16 +442,11 @@ mod tests {
 
     #[test]
     fn test_parse_domain_line_international() {
-        // Punycode encoded international domain
         assert_eq!(
             parse_domain_line("xn--n3h.com"),
             Some("xn--n3h.com".to_string())
         );
     }
-
-    // =========================================================================
-    // Tests for parse_domains
-    // =========================================================================
 
     #[test]
     fn test_parse_domains_single() {
@@ -609,7 +520,6 @@ mod tests {
 
     #[test]
     fn test_parse_domains_deduplication_not_applied() {
-        // Note: parse_domains doesn't dedupe, each line is processed independently
         let content = "example.com\nexample.com";
         let domains = parse_domains(content);
         assert_eq!(domains, vec!["example.com", "example.com"]);
