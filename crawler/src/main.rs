@@ -6,7 +6,7 @@ use std::fs::read_to_string;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tantivy::schema::{
-    IndexRecordOption, Schema, TextFieldIndexing, TextOptions, FAST, STORED, STRING, TEXT,
+    IndexRecordOption, Schema, TextFieldIndexing, TextOptions, FAST, STORED, TEXT,
 };
 use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
 use tantivy::{Index, Term};
@@ -38,7 +38,6 @@ struct CrawlMetrics {
 enum DbMessage {
     ProcessPage {
         url: String,
-        domain: String,
         title: String,
         content: String,
     },
@@ -55,11 +54,10 @@ struct DbHandle {
 }
 
 impl DbHandle {
-    async fn process_page(&self, url: String, domain: String, title: String, content: String) {
+    async fn process_page(&self, url: String, title: String, content: String) {
         self.tx
             .send(DbMessage::ProcessPage {
                 url,
-                domain,
                 title,
                 content,
             })
@@ -83,7 +81,6 @@ struct CrawlDb {
     index: Index,
     index_writer: tantivy::IndexWriter,
     url_field: tantivy::schema::Field,
-    domain_field: tantivy::schema::Field,
     title_field: tantivy::schema::Field,
     body_field: tantivy::schema::Field,
 }
@@ -97,7 +94,7 @@ impl CrawlDb {
             ))
             .build();
 
-        let (index, url_field, domain_field, title_field, body_field) =
+        let (index, url_field, title_field, body_field) =
             if std::path::Path::new("search_db").exists() {
                 let index = Index::open_in_dir("search_db")?;
                 let schema = index.schema();
@@ -105,9 +102,6 @@ impl CrawlDb {
                 let url_field = schema
                     .get_field("url")
                     .context("Existing index missing 'url' field")?;
-                let domain_field = schema.get_field("domain").context(
-                    "Existing index missing 'domain' field - delete search_db/ and re-crawl",
-                )?;
                 let title_field = schema
                     .get_field("title")
                     .context("Existing index missing 'title' field")?;
@@ -115,7 +109,7 @@ impl CrawlDb {
                     .get_field("body")
                     .context("Existing index missing 'body' field")?;
 
-                (index, url_field, domain_field, title_field, body_field)
+                (index, url_field, title_field, body_field)
             } else {
                 let body_field_indexing = TextFieldIndexing::default()
                     .set_tokenizer("norm_tokenizer")
@@ -125,7 +119,6 @@ impl CrawlDb {
 
                 let mut schema_builder = Schema::builder();
                 let url_field = schema_builder.add_text_field("url", TEXT | STORED | FAST);
-                let domain_field = schema_builder.add_text_field("domain", STRING | FAST);
                 let title_field = schema_builder.add_text_field("title", TEXT | STORED);
                 let body_field = schema_builder.add_text_field("body", body_field_options);
                 let schema = schema_builder.build();
@@ -137,7 +130,7 @@ impl CrawlDb {
                     tantivy::IndexSettings::default(),
                 )?;
 
-                (index, url_field, domain_field, title_field, body_field)
+                (index, url_field, title_field, body_field)
             };
 
         index
@@ -150,14 +143,13 @@ impl CrawlDb {
             index,
             index_writer,
             url_field,
-            domain_field,
             title_field,
             body_field,
         })
     }
 
     /// Returns: true = indexed, false = failed
-    fn process_page(&mut self, url: &str, domain: &str, title: &str, content: &str) -> bool {
+    fn process_page(&mut self, url: &str, title: &str, content: &str) -> bool {
         // Delete any existing document with this URL (idiomatic upsert pattern)
         let url_term = Term::from_field_text(self.url_field, url);
         self.index_writer.delete_term(url_term);
@@ -165,7 +157,6 @@ impl CrawlDb {
         // Index the document
         let mut doc = tantivy::TantivyDocument::new();
         doc.add_text(self.url_field, url);
-        doc.add_text(self.domain_field, domain);
         doc.add_text(self.title_field, title);
         doc.add_text(self.body_field, content);
 
@@ -183,11 +174,10 @@ impl CrawlDb {
             match msg {
                 DbMessage::ProcessPage {
                     url,
-                    domain,
                     title,
                     content,
                 } => {
-                    if self.process_page(&url, &domain, &title, &content) {
+                    if self.process_page(&url, &title, &content) {
                         metrics.pages_crawled.fetch_add(1, Ordering::Relaxed);
                     } else {
                         metrics.pages_failed.fetch_add(1, Ordering::Relaxed);
@@ -313,8 +303,7 @@ async fn crawl_domain(
         // Extract readable content from HTML
         match lol_readability::find_main_content(html.as_bytes(), url) {
             Ok((content, title, resolved_url)) => {
-                db.process_page(resolved_url, domain.clone(), title, content)
-                    .await;
+                db.process_page(resolved_url, title, content).await;
                 pages_indexed += 1;
             }
             Err(e) => {
