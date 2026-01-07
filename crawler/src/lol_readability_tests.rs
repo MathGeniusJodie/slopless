@@ -1032,6 +1032,69 @@ mod tests {
     }
 
     // =========================================================================
+    // Unit tests for ElementFrame::append_text_and_measure
+    // =========================================================================
+
+    #[test]
+    fn test_append_text_and_measure_first_append() {
+        let mut frame = ElementFrame::new("div", None, None);
+        let len = frame.append_text_and_measure("Hello world");
+        assert_eq!(len, 11); // "Hello world" = 11 chars
+        assert_eq!(frame.accumulated_text, "Hello world");
+    }
+
+    #[test]
+    fn test_append_text_and_measure_subsequent_excludes_separator() {
+        let mut frame = ElementFrame::new("div", None, None);
+        frame.append_text_and_measure("Hello");
+        let len = frame.append_text_and_measure("world");
+        assert_eq!(len, 5); // "world" = 5 chars, separator space not counted
+        assert_eq!(frame.accumulated_text, "Hello world");
+    }
+
+    #[test]
+    fn test_append_text_and_measure_normalizes_whitespace() {
+        let mut frame = ElementFrame::new("div", None, None);
+        let len = frame.append_text_and_measure("Hello    world");
+        assert_eq!(len, 11); // Normalized to "Hello world"
+        assert_eq!(frame.accumulated_text, "Hello world");
+    }
+
+    #[test]
+    fn test_append_text_and_measure_decodes_entities() {
+        let mut frame = ElementFrame::new("div", None, None);
+        let len = frame.append_text_and_measure("&amp;&lt;&gt;");
+        assert_eq!(len, 3); // Decoded to "&<>" = 3 chars
+        assert_eq!(frame.accumulated_text, "&<>");
+    }
+
+    #[test]
+    fn test_append_text_and_measure_whitespace_only_returns_zero() {
+        let mut frame = ElementFrame::new("div", None, None);
+        frame.append_text_and_measure("Hello");
+        let len = frame.append_text_and_measure("   \t\n   ");
+        assert_eq!(len, 0);
+        assert_eq!(frame.accumulated_text, "Hello"); // Unchanged
+    }
+
+    #[test]
+    fn test_append_text_and_measure_nbsp_normalized() {
+        let mut frame = ElementFrame::new("div", None, None);
+        // &nbsp; entities should be decoded and treated as whitespace
+        let len = frame.append_text_and_measure("Hello&nbsp;&nbsp;&nbsp;world");
+        assert_eq!(len, 11); // "Hello world" after normalization
+        assert_eq!(frame.accumulated_text, "Hello world");
+    }
+
+    #[test]
+    fn test_append_text_and_measure_empty_string() {
+        let mut frame = ElementFrame::new("div", None, None);
+        let len = frame.append_text_and_measure("");
+        assert_eq!(len, 0);
+        assert_eq!(frame.accumulated_text, "");
+    }
+
+    // =========================================================================
     // Unit tests for ElementFrame::calculate_final_score
     // =========================================================================
 

@@ -1,4 +1,6 @@
+use bytecount::count;
 use html_escape::decode_html_entities;
+use itertools::Itertools;
 use lol_html::{element, text, HtmlRewriter, Settings};
 use regex::Regex;
 use std::cell::RefCell;
@@ -138,21 +140,31 @@ impl ElementFrame {
     /// Append text content, decoding HTML entities and normalizing whitespace
     pub(crate) fn append_text(&mut self, text: &str) {
         let decoded = decode_html_entities(text);
-        let mut words = decoded.split_whitespace();
+        let mut words = decoded.split_whitespace().peekable();
 
-        let Some(first_word) = words.next() else {
-            return; // Empty after whitespace normalization
-        };
-
+        if words.peek().is_none() {
+            return;
+        }
         // Add space separator if needed
         if !self.accumulated_text.is_empty() && !self.accumulated_text.ends_with(' ') {
             self.accumulated_text.push(' ');
         }
+        for part in words.intersperse(" ") {
+            self.accumulated_text.push_str(part);
+        }
+    }
 
-        self.accumulated_text.push_str(first_word);
-        for word in words {
-            self.accumulated_text.push(' ');
-            self.accumulated_text.push_str(word);
+    /// Append text and return the content length added (excluding separator spaces)
+    pub(crate) fn append_text_and_measure(&mut self, text: &str) -> usize {
+        let len_before = self.accumulated_text.len();
+        self.append_text(text);
+        let total_added = self.accumulated_text.len().saturating_sub(len_before);
+
+        // If we added a separator space, don't count it as content
+        if len_before > 0 && total_added > 0 {
+            total_added.saturating_sub(1)
+        } else {
+            total_added
         }
     }
 
@@ -410,16 +422,12 @@ impl ParsingContext {
             return;
         };
 
-        let text_length = u32::try_from(text.len()).unwrap_or(u32::MAX);
-        let comma_count =
-            u32::try_from(text.bytes().filter(|&b| b == b',').count()).unwrap_or(u32::MAX);
-
-        frame.text_len += text_length;
-        frame.comma_count += comma_count;
-        frame.append_text(text);
+        let text_len = frame.append_text_and_measure(text) as u32;
+        frame.text_len += text_len;
+        frame.comma_count += count(text.as_bytes(), b',') as u32;
 
         if self.anchor_depth > 0 {
-            frame.link_text_len += text_length;
+            frame.link_text_len += text_len;
         }
     }
 }

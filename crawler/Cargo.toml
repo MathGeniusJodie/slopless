@@ -30,6 +30,8 @@ reqwest = { version = "0.12", default-features = false, features = [
     "cookies",
 ] }
 html-escape = "0.2"
+itertools = "0.14"
+bytecount = "0.6"
 
 [profile.release]
 debug = true # Adds debug symbols to the optimized binary
