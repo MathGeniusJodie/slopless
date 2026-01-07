@@ -45,10 +45,8 @@ cargo run --release -- input.txt
 
 # With options
 cargo run --release -- input.txt \
-  --depth 5 \
   --concurrency 500 \
-  --exclude "https://example.com/admin" \
-  --verbose
+  --exclude "https://example.com/admin"
 
 # View help
 cargo run --release -- --help
@@ -71,8 +69,8 @@ rm -rf search_db/
 ### Core Components
 
 **main.rs** - Orchestrates the crawl:
-- `CrawlDb`: Manages the Tantivy search index with fields for URL, domain, title, and body
-- `CrawlMetrics`: Atomic counters for pages crawled/failed (lock-free status updates)
+- `CrawlDb`: Manages the Tantivy search index with fields for URL, title, and body
+- `SharedState`: Atomic counters for pages indexed/failed (lock-free status updates)
 - `crawl_domain()`: Crawls a single domain using the spider library
 - Main loop uses `futures::stream::for_each_concurrent` for domain-level concurrency
 
@@ -80,31 +78,30 @@ rm -rf search_db/
 - Single-pass HTML parser using `lol_html` streaming rewriter
 - Implements a readability algorithm inspired by Mozilla Readability
 - Scores elements based on tag type, id/class attributes, text length, and link density
-- Returns: `(readable_text, page_title)`
-- Key function: `find_main_content(html: &[u8]) -> Result<(String, String)>`
+- Returns: `(readable_text, page_title, canonical_url)`
+- Key function: `find_main_content(html: &[u8], url: &str) -> Result<(String, String, String)>`
 
 ### Crawl Flow
 
 1. Parse seed domains from input file
 2. Initialize Tantivy index (reuses existing `search_db/` if present)
-3. Create shared `CrawlDb` and `CrawlMetrics` (atomic counters)
-4. Start background task for periodic status updates and index commits
+3. Create shared `CrawlDb` and `SharedState` (atomic counters)
+4. Spawn dedicated writer thread that receives pages via channel and commits periodically
 5. Crawl domains concurrently using `for_each_concurrent`:
-   - Each domain uses spider library with depth limit and robots.txt respect
+   - Each domain uses spider library with robots.txt respect
    - Subscribe to page events, extract content, index to Tantivy
 6. Final commit when all domains complete
 
 ### Concurrency Model
 
-- **Domain-level concurrency**: Configurable max concurrent domains (default 50)
-- **Per-domain rate limiting**: Spider configured with `with_limit(1)` - one request at a time per domain
+- **Domain-level concurrency**: Configurable max concurrent domains (default 100)
+- **Per-domain rate limiting**: Spider configured with 4 second delay between requests
 - **Lock-free metrics**: Atomic counters avoid contention during status updates
 - **Dedicated DB thread**: `CrawlDb` runs in its own thread, communicates via mpsc channel
 
 ### Tantivy Schema
 
 - `url`: TEXT | STORED | FAST (for storage and retrieval)
-- `domain`: STRING | FAST (for efficient domain-based queries)
 - `title`: TEXT | STORED
 - `body`: TEXT with custom "norm_tokenizer" (lowercasing + stemming)
 
@@ -136,9 +133,9 @@ The element with the highest final score becomes the main content.
 
 ### Spider Configuration
 - `respect_robots_txt = true`: Polite crawling
-- `subdomains = false`: Stay within the exact domain
-- `depth`: Configurable crawl depth (default 5)
-- `with_limit(1)`: One concurrent request per domain
+- `subdomains = true`: Include subdomains in crawl
+- `only_html = true`: Only fetch HTML pages
+- `delay = 4000`: 4 second delay between requests per domain
 
 ### IMPORTANT: Stream pages, don't buffer them
 **DO NOT use `website.scrape()` + `website.get_pages()`** - this buffers all pages in memory and will cause OOM on large crawls.
