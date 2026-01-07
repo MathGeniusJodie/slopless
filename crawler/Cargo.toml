@@ -13,7 +13,7 @@ regex = "1"
 futures = "0.3"
 clap = { version = "4.0", features = ["derive"] }
 unicode-normalization = "0.1.25"
-spider = { version = "2", features = ["sync", "encoding", "smart", "chrome_stealth", "cookies"] }
+spider = { version = "2", features = ["sync", "encoding"] }
 html-escape = "0.2"
 
 [profile.release]

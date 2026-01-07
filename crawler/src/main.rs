@@ -230,7 +230,6 @@ fn load_domains(file_path: &str) -> Result<Vec<String>> {
 }
 
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
-const CRAWL_DEPTH: usize = 25;
 
 /// Crawl a single domain using spider
 async fn crawl_domain(
@@ -244,7 +243,6 @@ async fn crawl_domain(
 
     website.configuration.respect_robots_txt = true;
     website.configuration.subdomains = true;
-    website.configuration.depth = CRAWL_DEPTH;
     website.configuration.only_html = true;
     website.configuration.delay = 5000; // 5 second delay between requests
     website.with_user_agent(Some(USER_AGENT));
@@ -262,7 +260,7 @@ async fn crawl_domain(
 
     // Spawn crawl so website is dropped when done, closing the channel
     let crawl_handle = tokio::spawn(async move {
-        website.crawl().await; // temporarily disable crawl_smart
+        website.crawl().await;
     });
 
     // Process pages as they stream in
