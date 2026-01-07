@@ -156,12 +156,7 @@ impl ElementFrame {
         let decoded = decode_html_entities(text);
         let len_before = self.extracted_text.len();
 
-        for part in decoded.split_whitespace() {
-            if !self.extracted_text.is_empty() {
-                self.extracted_text.push(' ');
-            }
-            self.extracted_text.push_str(part);
-        }
+        self.append_whitespace_normalized(&decoded);
 
         // Count chars added, excluding the leading separator space (if any)
         let mut start = len_before;
@@ -179,6 +174,11 @@ impl ElementFrame {
 
     /// Append already-decoded text (used for bubbling child text to parent)
     pub(crate) fn append_text(&mut self, text: &str) {
+        self.append_whitespace_normalized(text);
+    }
+
+    /// Append text with whitespace normalization (collapses whitespace, trims)
+    fn append_whitespace_normalized(&mut self, text: &str) {
         for part in text.split_whitespace() {
             if !self.extracted_text.is_empty() {
                 self.extracted_text.push(' ');
@@ -485,23 +485,21 @@ fn execute_open_action(
     tag_name: &str,
     action: ElementAction,
 ) -> bool {
+    if action == ElementAction::Ignore {
+        return false;
+    }
+    let mut ctx = ctx.borrow_mut();
     match action {
-        ElementAction::TrackTitle => {
-            ctx.borrow_mut().inside_title_tag = true;
-        }
-        ElementAction::Skip => {
-            ctx.borrow_mut().non_content_depth += 1;
-        }
-        ElementAction::PushLink => {
-            ctx.borrow_mut().link_nesting_depth += 1;
-        }
+        ElementAction::TrackTitle => ctx.inside_title_tag = true,
+        ElementAction::Skip => ctx.non_content_depth += 1,
+        ElementAction::PushLink => ctx.link_nesting_depth += 1,
         ElementAction::PushFrame => {
             let id = element.get_attribute("id");
             let class = element.get_attribute("class");
-            let frame = ElementFrame::new(tag_name, id.as_deref(), class.as_deref());
-            ctx.borrow_mut().element_stack.push(frame);
+            ctx.element_stack
+                .push(ElementFrame::new(tag_name, id.as_deref(), class.as_deref()));
         }
-        ElementAction::Ignore => return false,
+        ElementAction::Ignore => unreachable!(),
     }
     true
 }

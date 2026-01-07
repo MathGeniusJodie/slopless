@@ -194,12 +194,10 @@ async fn crawl_domain(
         .expect("Failed to build HTTP client with rustls");
     website.set_http_client(client);
 
-    website.with_blacklist_url((!excluded_prefixes.is_empty()).then(|| {
-        excluded_prefixes
-            .iter()
-            .map(CompactString::new)
-            .collect()
-    }));
+    website.with_blacklist_url(
+        (!excluded_prefixes.is_empty())
+            .then(|| excluded_prefixes.iter().map(CompactString::new).collect()),
+    );
 
     let Some(mut rx) = website.subscribe(16384) else {
         eprintln!("Failed to subscribe to {} crawl events", domain);
