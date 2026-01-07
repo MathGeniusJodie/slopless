@@ -22,7 +22,7 @@ struct Args {
     input_file: String,
     #[arg(short = 'x', long = "exclude")]
     excluded_url_prefixes: Vec<String>,
-    #[arg(short = 'c', long = "concurrency", default_value_t = 200)]
+    #[arg(short = 'c', long = "concurrency", default_value_t = 100)]
     max_concurrent_domains: usize,
     #[arg(short = 'v', long = "verbose", default_value_t = false)]
     verbose_logging: bool,
@@ -172,7 +172,7 @@ async fn crawl_domain(
     website.configuration.respect_robots_txt = true;
     website.configuration.subdomains = true;
     website.configuration.only_html = true;
-    website.configuration.delay = 5000;
+    website.configuration.delay = 4000;
     website.with_user_agent(Some(USER_AGENT));
 
     if !excluded_prefixes.is_empty() {
