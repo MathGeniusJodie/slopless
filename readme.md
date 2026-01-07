@@ -96,7 +96,7 @@ Google and Bing suck now, they're overrun by SEO slop. The internet as most peop
 - [ ] Investigate https://yacy.net/
 - [ ] Investigate https://github.com/medialab/hyphe
 - [ ] Offline/datahoarder mode? https://www.httrack.com/ https://en.wikipedia.org/wiki/Heritrix
-- [ ] Make own wiby instance
+- [ ] Don't crawl websites that have search pages of their own and integrate their search instead
 
 
 ### AI Content

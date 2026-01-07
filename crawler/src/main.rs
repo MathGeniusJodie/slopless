@@ -272,7 +272,7 @@ async fn crawl_domain(
 
     // Spawn crawl so website is dropped when done, closing the channel
     let crawl_handle = tokio::spawn(async move {
-        website.crawl().await;
+        website.crawl_smart().await;
     });
 
     // Process pages as they stream in
