@@ -200,29 +200,48 @@ fn spawn_db_thread(metrics: Arc<CrawlMetrics>) -> Result<(DbHandle, std::thread:
     Ok((DbHandle { tx }, handle))
 }
 
+/// Parse a single domain line, returning the cleaned domain if valid
+/// Returns None for empty lines, comments, or invalid domains
+fn parse_domain_line(line: &str) -> Option<String> {
+    let domain = line.trim();
+
+    // Skip empty lines and comments
+    if domain.is_empty() || domain.starts_with('#') {
+        return None;
+    }
+
+    // Strip protocol prefix and trailing slash
+    let clean_domain = domain
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .trim_end_matches('/');
+
+    // Validate by attempting to parse as URL
+    let url_str = format!("https://{}/", clean_domain);
+    if Url::parse(&url_str).is_ok() {
+        Some(clean_domain.to_string())
+    } else {
+        None
+    }
+}
+
+/// Parse multiple domain lines from content string
+fn parse_domains(content: &str) -> Vec<String> {
+    content.lines().filter_map(parse_domain_line).collect()
+}
+
 /// Load domain list from file
 fn load_domains(file_path: &str) -> Result<Vec<String>> {
     let file_content = read_to_string(file_path)
         .with_context(|| format!("Failed to read input file: {}", file_path))?;
 
-    let mut domains = Vec::new();
+    let domains = parse_domains(&file_content);
 
+    // Log invalid domains (side effect, but useful for debugging)
     for line in file_content.lines() {
-        let domain = line.trim();
-        if domain.is_empty() {
-            continue;
-        }
-
-        let clean_domain = domain
-            .trim_start_matches("http://")
-            .trim_start_matches("https://")
-            .trim_end_matches('/');
-
-        let url_str = format!("https://{}/", clean_domain);
-        if Url::parse(&url_str).is_ok() {
-            domains.push(clean_domain.to_string());
-        } else {
-            eprintln!("Skipping invalid domain: {}", domain);
+        let trimmed = line.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with('#') && parse_domain_line(line).is_none() {
+            eprintln!("Skipping invalid domain: {}", trimmed);
         }
     }
 
@@ -393,4 +412,206 @@ async fn main() -> Result<()> {
     db_thread.join().ok();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // =========================================================================
+    // Tests for parse_domain_line
+    // =========================================================================
+
+    #[test]
+    fn test_parse_domain_line_simple() {
+        assert_eq!(
+            parse_domain_line("example.com"),
+            Some("example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_domain_line_with_subdomain() {
+        assert_eq!(
+            parse_domain_line("www.example.com"),
+            Some("www.example.com".to_string())
+        );
+        assert_eq!(
+            parse_domain_line("blog.example.com"),
+            Some("blog.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_domain_line_strips_https() {
+        assert_eq!(
+            parse_domain_line("https://example.com"),
+            Some("example.com".to_string())
+        );
+        assert_eq!(
+            parse_domain_line("https://example.com/"),
+            Some("example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_domain_line_strips_http() {
+        assert_eq!(
+            parse_domain_line("http://example.com"),
+            Some("example.com".to_string())
+        );
+        assert_eq!(
+            parse_domain_line("http://example.com/"),
+            Some("example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_domain_line_strips_trailing_slash() {
+        assert_eq!(
+            parse_domain_line("example.com/"),
+            Some("example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_domain_line_preserves_path() {
+        // Domain with path should preserve the path part
+        assert_eq!(
+            parse_domain_line("example.com/path"),
+            Some("example.com/path".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_domain_line_trims_whitespace() {
+        assert_eq!(
+            parse_domain_line("  example.com  "),
+            Some("example.com".to_string())
+        );
+        assert_eq!(
+            parse_domain_line("\texample.com\n"),
+            Some("example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_domain_line_empty() {
+        assert_eq!(parse_domain_line(""), None);
+        assert_eq!(parse_domain_line("   "), None);
+        assert_eq!(parse_domain_line("\t\n"), None);
+    }
+
+    #[test]
+    fn test_parse_domain_line_comment() {
+        assert_eq!(parse_domain_line("# this is a comment"), None);
+        assert_eq!(parse_domain_line("  # indented comment"), None);
+    }
+
+    #[test]
+    fn test_parse_domain_line_invalid() {
+        // Invalid domain formats
+        assert_eq!(parse_domain_line("not a valid domain!@#$"), None);
+        assert_eq!(parse_domain_line("http://"), None);
+        assert_eq!(parse_domain_line("://missing-scheme"), None);
+    }
+
+    #[test]
+    fn test_parse_domain_line_with_port() {
+        assert_eq!(
+            parse_domain_line("example.com:8080"),
+            Some("example.com:8080".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_domain_line_international() {
+        // Punycode encoded international domain
+        assert_eq!(
+            parse_domain_line("xn--n3h.com"),
+            Some("xn--n3h.com".to_string())
+        );
+    }
+
+    // =========================================================================
+    // Tests for parse_domains
+    // =========================================================================
+
+    #[test]
+    fn test_parse_domains_single() {
+        let content = "example.com";
+        let domains = parse_domains(content);
+        assert_eq!(domains, vec!["example.com"]);
+    }
+
+    #[test]
+    fn test_parse_domains_multiple() {
+        let content = "example.com\ntest.org\nfoo.bar";
+        let domains = parse_domains(content);
+        assert_eq!(domains, vec!["example.com", "test.org", "foo.bar"]);
+    }
+
+    #[test]
+    fn test_parse_domains_with_empty_lines() {
+        let content = "example.com\n\ntest.org\n\n\nfoo.bar\n";
+        let domains = parse_domains(content);
+        assert_eq!(domains, vec!["example.com", "test.org", "foo.bar"]);
+    }
+
+    #[test]
+    fn test_parse_domains_with_comments() {
+        let content = "# Domain list\nexample.com\n# Another comment\ntest.org";
+        let domains = parse_domains(content);
+        assert_eq!(domains, vec!["example.com", "test.org"]);
+    }
+
+    #[test]
+    fn test_parse_domains_mixed_protocols() {
+        let content = "https://example.com\nhttp://test.org/\nfoo.bar";
+        let domains = parse_domains(content);
+        assert_eq!(domains, vec!["example.com", "test.org", "foo.bar"]);
+    }
+
+    #[test]
+    fn test_parse_domains_filters_invalid() {
+        let content = "example.com\ninvalid!@#\ntest.org";
+        let domains = parse_domains(content);
+        assert_eq!(domains, vec!["example.com", "test.org"]);
+    }
+
+    #[test]
+    fn test_parse_domains_empty_content() {
+        let content = "";
+        let domains = parse_domains(content);
+        assert!(domains.is_empty());
+    }
+
+    #[test]
+    fn test_parse_domains_only_comments_and_empty() {
+        let content = "# Comment 1\n\n# Comment 2\n   \n";
+        let domains = parse_domains(content);
+        assert!(domains.is_empty());
+    }
+
+    #[test]
+    fn test_parse_domains_windows_line_endings() {
+        let content = "example.com\r\ntest.org\r\n";
+        let domains = parse_domains(content);
+        assert_eq!(domains, vec!["example.com", "test.org"]);
+    }
+
+    #[test]
+    fn test_parse_domains_preserves_order() {
+        let content = "zebra.com\nalpha.org\nmiddle.net";
+        let domains = parse_domains(content);
+        assert_eq!(domains, vec!["zebra.com", "alpha.org", "middle.net"]);
+    }
+
+    #[test]
+    fn test_parse_domains_deduplication_not_applied() {
+        // Note: parse_domains doesn't dedupe, each line is processed independently
+        let content = "example.com\nexample.com";
+        let domains = parse_domains(content);
+        assert_eq!(domains, vec!["example.com", "example.com"]);
+    }
 }
