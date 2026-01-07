@@ -1,6 +1,5 @@
 use bytecount::count;
 use html_escape::decode_html_entities;
-use itertools::Itertools;
 use lol_html::{element, text, HtmlRewriter, Settings};
 use regex::Regex;
 use std::cell::RefCell;
@@ -18,9 +17,6 @@ const MAX_ELEMENT_STACK_DEPTH: usize = 256;
 
 /// Minimum text length required for an element to be considered main content
 const MIN_TEXT_LENGTH: usize = 100;
-
-/// Minimum average word length to filter garbage like "a a a b b b"
-const MIN_AVG_WORD_LENGTH: usize = 2;
 
 /// Link density threshold above which content is penalized
 const LINK_DENSITY_THRESHOLD: f32 = 0.5;
@@ -70,10 +66,10 @@ pub(crate) enum TagType {
 #[derive(Debug)]
 pub(crate) struct ElementFrame {
     pub(crate) tag_type: TagType,
-    pub(crate) base_score: f32,        // Initial score from tag type + class/id
-    pub(crate) text_len: usize,        // Total character count
-    pub(crate) link_text_len: usize,   // Character count inside <a> tags
-    pub(crate) comma_count: usize,     // Number of commas (heuristic for real sentences)
+    pub(crate) base_score: f32, // Initial score from tag type + class/id
+    pub(crate) text_len: usize, // Total character count
+    pub(crate) link_text_len: usize, // Character count inside <a> tags
+    pub(crate) comma_count: usize, // Number of commas (heuristic for real sentences)
     pub(crate) accumulated_text: String, // Actual text content for this element
 }
 
@@ -140,32 +136,22 @@ impl ElementFrame {
     /// Append text content, decoding HTML entities and normalizing whitespace
     pub(crate) fn append_text(&mut self, text: &str) {
         let decoded = decode_html_entities(text);
-        let mut words = decoded.split_whitespace().peekable();
-
-        if words.peek().is_none() {
-            return;
-        }
-        // Add space separator if needed
-        if !self.accumulated_text.is_empty() && !self.accumulated_text.ends_with(' ') {
-            self.accumulated_text.push(' ');
-        }
-        for part in words.intersperse(" ") {
+        for part in decoded.split_whitespace() {
+            if !self.accumulated_text.is_empty() {
+                self.accumulated_text.push(' ');
+            }
             self.accumulated_text.push_str(part);
         }
     }
 
     /// Append text and return the content length added (excluding separator spaces)
     pub(crate) fn append_text_and_measure(&mut self, text: &str) -> usize {
-        let len_before = self.accumulated_text.len();
+        let mut len_before = self.accumulated_text.len();
         self.append_text(text);
-        let total_added = self.accumulated_text.len().saturating_sub(len_before);
-
-        // If we added a separator space, don't count it as content
-        if len_before > 0 && total_added > 0 {
-            total_added.saturating_sub(1)
-        } else {
-            total_added
+        if self.accumulated_text.chars().nth(len_before) == Some(' ') {
+            len_before += 1; // space seperators don't count towards length, todo: optimize
         }
+        self.accumulated_text.len().saturating_sub(len_before)
     }
 
     /// Calculate final score including text-based heuristics
@@ -197,7 +183,7 @@ impl ElementFrame {
 
     /// Check if this element is a viable candidate for main content
     pub(crate) fn is_viable_candidate(&self) -> bool {
-        self.is_content_tag() && self.has_enough_text() && self.has_real_words()
+        self.is_content_tag() && self.has_enough_text()
     }
 
     /// Check if this is a content-bearing tag type
@@ -211,17 +197,6 @@ impl ElementFrame {
     /// Check if element has enough text to be considered content
     fn has_enough_text(&self) -> bool {
         self.text_len >= MIN_TEXT_LENGTH
-    }
-
-    /// Check if element has real words (not garbage like "a a a b b b")
-    fn has_real_words(&self) -> bool {
-        let word_count = self.accumulated_text.split_whitespace().count();
-        let avg_word_length = self
-            .accumulated_text
-            .len()
-            .checked_div(word_count)
-            .unwrap_or(0);
-        avg_word_length > MIN_AVG_WORD_LENGTH
     }
 }
 
