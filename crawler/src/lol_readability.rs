@@ -17,7 +17,7 @@ use url::Url;
 const MAX_ELEMENT_STACK_DEPTH: usize = 256;
 
 /// Minimum text length required for an element to be considered main content
-const MIN_TEXT_LENGTH: u32 = 100;
+const MIN_TEXT_LENGTH: usize = 100;
 
 /// Minimum average word length to filter garbage like "a a a b b b"
 const MIN_AVG_WORD_LENGTH: usize = 2;
@@ -70,10 +70,10 @@ pub(crate) enum TagType {
 #[derive(Debug)]
 pub(crate) struct ElementFrame {
     pub(crate) tag_type: TagType,
-    pub(crate) base_score: f32, // Initial score from tag type + class/id
-    pub(crate) text_len: u32,   // Total character count
-    pub(crate) link_text_len: u32, // Character count inside <a> tags
-    pub(crate) comma_count: u32, // Number of commas (heuristic for real sentences)
+    pub(crate) base_score: f32,        // Initial score from tag type + class/id
+    pub(crate) text_len: usize,        // Total character count
+    pub(crate) link_text_len: usize,   // Character count inside <a> tags
+    pub(crate) comma_count: usize,     // Number of commas (heuristic for real sentences)
     pub(crate) accumulated_text: String, // Actual text content for this element
 }
 
@@ -422,9 +422,9 @@ impl ParsingContext {
             return;
         };
 
-        let text_len = frame.append_text_and_measure(text) as u32;
+        let text_len = frame.append_text_and_measure(text);
         frame.text_len += text_len;
-        frame.comma_count += count(text.as_bytes(), b',') as u32;
+        frame.comma_count += count(text.as_bytes(), b',');
 
         if self.anchor_depth > 0 {
             frame.link_text_len += text_len;
