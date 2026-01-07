@@ -276,6 +276,18 @@ fn is_non_content_leaf(tag: &str) -> bool {
     )
 }
 
+/// Parsing context shared across HTML rewriter callbacks
+struct ParsingContext {
+    element_stack: Vec<ElementFrame>,
+    best_content: Option<String>,
+    best_content_score: f32,
+    skip_depth: u32,
+    anchor_depth: u32, // Track nesting inside <a> tags for link density
+    page_title: String,
+    currently_in_title: bool,
+    canonical_url: Option<String>,
+}
+
 // -----------------------------------------------------------------------------
 // Main Function (Single Pass)
 // -----------------------------------------------------------------------------
@@ -285,18 +297,6 @@ fn is_non_content_leaf(tag: &str) -> bool {
 /// The URL will be the canonical URL if found, otherwise the input URL.
 /// Returns an error if no suitable content element was found.
 pub fn find_main_content(html: &[u8], url: &str) -> anyhow::Result<(String, String, String)> {
-    /// Parsing context shared across HTML rewriter callbacks
-    struct ParsingContext {
-        element_stack: Vec<ElementFrame>,
-        best_content: Option<String>,
-        best_content_score: f32,
-        skip_depth: u32,
-        anchor_depth: u32, // Track nesting inside <a> tags for link density
-        page_title: String,
-        currently_in_title: bool,
-        canonical_url: Option<String>,
-    }
-
     let parsing_context = Rc::new(RefCell::new(ParsingContext {
         element_stack: Vec::with_capacity(64),
         best_content: None,

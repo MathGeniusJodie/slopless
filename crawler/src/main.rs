@@ -154,17 +154,7 @@ fn parse_domains(content: &str) -> Vec<String> {
 fn load_domains(file_path: &str) -> Result<Vec<String>> {
     let file_content = read_to_string(file_path)
         .with_context(|| format!("Failed to read input file: {}", file_path))?;
-
-    let domains = parse_domains(&file_content);
-
-    for line in file_content.lines() {
-        let trimmed = line.trim();
-        if !trimmed.is_empty() && !trimmed.starts_with('#') && parse_domain_line(line).is_none() {
-            eprintln!("Skipping invalid domain: {}", trimmed);
-        }
-    }
-
-    Ok(domains)
+    Ok(parse_domains(&file_content))
 }
 
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
