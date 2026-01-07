@@ -267,24 +267,24 @@ async fn main() -> Result<()> {
     let writer_handle = std::thread::spawn(move || -> Result<u64> {
         let mut db = CrawlDb::new()?;
         let mut last_status = std::time::Instant::now();
-
         while let Some(page) = rx.blocking_recv() {
             db.process_page(&page.url, &page.title, &page.content);
 
-            // Commit and report status every 10 seconds
-            if last_status.elapsed().as_secs() >= 10 {
-                if let Ok(total) = db.commit() {
-                    let indexed = state_for_writer.pages_indexed.load(Ordering::Relaxed);
-                    let failed = state_for_writer.pages_failed.load(Ordering::Relaxed);
-                    println!(
-                        "Status: {} indexed, {} failed | {} total docs",
-                        indexed, failed, total
-                    );
-                }
-                last_status = std::time::Instant::now();
+            if last_status.elapsed().as_secs() < 10 {
+                continue;
             }
+            last_status = std::time::Instant::now();
+
+            if let Err(e) = db.commit() {
+                eprintln!("Error committing to index: {}", e);
+                continue;
+            }
+            println!(
+                "Status: {} indexed, {} failed",
+                state_for_writer.pages_indexed.load(Ordering::Relaxed),
+                state_for_writer.pages_failed.load(Ordering::Relaxed),
+            );
         }
-        // Final commit
         db.commit()
     });
 
