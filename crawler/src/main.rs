@@ -290,8 +290,8 @@ async fn main() -> Result<()> {
     let file_content = read_to_string(cli_args.input_file)?;
     // Crawl all domains concurrently
     futures::stream::iter(file_content.lines().filter_map(|line| {
-        let url_str = format!("https://{}", line.trim());
-        url::Url::parse(&url_str).ok().map(|url| url.to_string())
+        let url = format!("https://{}", line.trim());
+        url::Url::parse(&url).ok().map(|_| url)
     }))
     .for_each_concurrent(max_concurrent, |domain| {
         let state = state.clone();

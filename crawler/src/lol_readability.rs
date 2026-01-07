@@ -23,7 +23,9 @@
 use html_escape::decode_html_entities;
 use lol_html::{element, text, HtmlRewriter, Settings};
 use regex::Regex;
+use std::borrow::Cow;
 use std::cell::RefCell;
+use std::mem;
 use std::rc::Rc;
 use std::sync::LazyLock;
 use unicode_normalization::UnicodeNormalization;
@@ -174,7 +176,20 @@ impl ElementFrame {
         }
     }
 
-    /// Append already-decoded text (used for bubbling child text to parent)
+    /// Append already-normalized text (used for bubbling child text to parent).
+    /// Skips whitespace normalization since child text is already normalized.
+    pub(crate) fn append_prenormalized_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if !self.extracted_text.is_empty() {
+            self.extracted_text.push(' ');
+        }
+        self.extracted_text.push_str(text);
+    }
+
+    /// Append text with whitespace normalization. Used by tests.
+    #[cfg(test)]
     pub(crate) fn append_text(&mut self, text: &str) {
         self.append_whitespace_normalized(text);
     }
@@ -372,27 +387,51 @@ impl ParsingContext {
         self.link_nesting_depth = self.link_nesting_depth.saturating_sub(1);
     }
 
-    /// Handle closing a content element: pop frame, bubble stats, maybe update best
+    /// Handle closing a content element: pop frame, bubble stats, maybe update best.
+    /// Optimized to avoid cloning text when possible:
+    /// - If new best with parent: clone to parent, move to best
+    /// - If new best without parent: move to best (no copy)
+    /// - If not best with parent: move to parent (no copy)
+    /// - If not best without parent: drop (no copy)
     fn close_content_element(&mut self) {
-        let Some(frame) = self.element_stack.pop() else {
+        let Some(mut frame) = self.element_stack.pop() else {
             return;
         };
 
         let score = frame.calculate_final_score();
         let is_new_best = frame.is_viable_candidate() && score > self.highest_score;
+        let has_parent = !self.element_stack.is_empty();
 
-        // Bubble stats to parent
+        // Bubble numeric stats to parent (always cheap)
         if let Some(parent) = self.element_stack.last_mut() {
             parent.char_count += frame.char_count;
             parent.link_char_count += frame.link_char_count;
             parent.comma_count += frame.comma_count;
-            parent.append_text(&frame.extracted_text);
         }
 
-        // Update best if this is better
-        if is_new_best {
-            self.highest_score = score;
-            self.best_extracted_text = Some(frame.extracted_text);
+        // Handle text ownership to minimize allocations
+        match (is_new_best, has_parent) {
+            (true, true) => {
+                // Need text for both: copy to parent (already normalized), move to best
+                let parent = self.element_stack.last_mut().unwrap();
+                parent.append_prenormalized_text(&frame.extracted_text);
+                self.highest_score = score;
+                self.best_extracted_text = Some(frame.extracted_text);
+            }
+            (true, false) => {
+                // Only best needs it: move directly (no copy)
+                self.highest_score = score;
+                self.best_extracted_text = Some(frame.extracted_text);
+            }
+            (false, true) => {
+                // Only parent needs it: move via mem::take (no copy)
+                let text = mem::take(&mut frame.extracted_text);
+                let parent = self.element_stack.last_mut().unwrap();
+                parent.append_prenormalized_text(&text);
+            }
+            (false, false) => {
+                // No one needs it: drop naturally
+            }
         }
     }
 
@@ -533,20 +572,35 @@ fn finalize_result(
     let resolved_url = resolve_url(url, final_context.canonical_url.as_deref())?;
     let content: String = extracted_text.nfkc().collect();
     let title: String = final_context.page_title.nfkc().collect();
-    Ok((content, title, resolved_url))
+    Ok((content, title, resolved_url.into_owned()))
 }
 
-/// Resolve canonical URL against base URL and normalize
-fn resolve_url(base: &str, canonical: Option<&str>) -> anyhow::Result<String> {
+/// Resolve canonical URL against base URL and normalize.
+/// Returns borrowed reference to `base` when no transformation needed.
+fn resolve_url<'a>(base: &'a str, canonical: Option<&str>) -> anyhow::Result<Cow<'a, str>> {
     let base_url = Url::parse(base)?;
+
+    // Determine which URL to use (base or resolved canonical)
     let resolved = match canonical {
         Some(c) => base_url.join(c)?,
         None => base_url,
     };
-    let mut url_str = resolved.to_string();
+
+    // Get the normalized string representation
+    let url_str = resolved.as_str();
+
     // Strip trailing slash (but not for root paths like "https://example.com/")
-    if url_str.ends_with('/') && resolved.path().len() > 1 {
-        url_str.pop();
+    let needs_trailing_strip = url_str.ends_with('/') && resolved.path().len() > 1;
+
+    // Fast path: if no changes needed and matches input exactly, borrow
+    if canonical.is_none() && !needs_trailing_strip && url_str == base {
+        return Ok(Cow::Borrowed(base));
     }
-    Ok(url_str)
+
+    // Slow path: need to allocate
+    let mut result = url_str.to_owned();
+    if needs_trailing_strip {
+        result.pop();
+    }
+    Ok(Cow::Owned(result))
 }
