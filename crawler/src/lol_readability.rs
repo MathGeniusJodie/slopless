@@ -140,26 +140,22 @@ impl ElementFrame {
 
     /// Append text content, decoding HTML entities and normalizing whitespace
     fn append_text(&mut self, text: &str) {
-        // Decode HTML entities like &amp; &lt; &#123; etc.
         let decoded = decode_html_entities(text);
+        let mut words = decoded.split_whitespace();
 
-        let mut words = decoded.split_whitespace().peekable();
-        if words.peek().is_none() {
+        let Some(first_word) = words.next() else {
             return; // Empty after whitespace normalization
-        }
+        };
 
         // Add space separator if needed
         if !self.accumulated_text.is_empty() && !self.accumulated_text.ends_with(' ') {
             self.accumulated_text.push(' ');
         }
 
-        // Join words with single spaces
-        if let Some(first_word) = words.next() {
-            self.accumulated_text.push_str(first_word);
-            for word in words {
-                self.accumulated_text.push(' ');
-                self.accumulated_text.push_str(word);
-            }
+        self.accumulated_text.push_str(first_word);
+        for word in words {
+            self.accumulated_text.push(' ');
+            self.accumulated_text.push_str(word);
         }
     }
 
@@ -200,11 +196,11 @@ impl ElementFrame {
 
         // Must have real words (filter out "a a a b b b" garbage)
         let word_count = self.accumulated_text.split_whitespace().count();
-        let avg_word_length = if word_count > 0 {
-            self.accumulated_text.len() / word_count
-        } else {
-            0
-        };
+        let avg_word_length = self
+            .accumulated_text
+            .len()
+            .checked_div(word_count)
+            .unwrap_or(0);
         let has_real_words = avg_word_length > 2;
 
         is_content_tag && has_enough_text && has_real_words

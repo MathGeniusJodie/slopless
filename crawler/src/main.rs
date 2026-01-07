@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use futures::StreamExt;
+use spider::compact_str::CompactString;
 use spider::website::Website;
 use std::fs::read_to_string;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tantivy::schema::{
@@ -145,11 +147,8 @@ fn parse_domain_line(line: &str) -> Option<String> {
         .trim_end_matches('/');
 
     let url_str = format!("https://{}/", clean_domain);
-    if Url::parse(&url_str).is_ok() {
-        Some(clean_domain.to_string())
-    } else {
-        None
-    }
+    Url::parse(&url_str).ok()?;
+    Some(clean_domain.to_string())
 }
 
 fn parse_domains(content: &str) -> Vec<String> {
@@ -179,11 +178,12 @@ async fn crawl_domain(
     website.configuration.delay = 4000;
     website.with_user_agent(Some(USER_AGENT));
 
-    if !excluded_prefixes.is_empty() {
-        website.with_blacklist_url(Some(
-            excluded_prefixes.iter().cloned().map(Into::into).collect(),
-        ));
-    }
+    website.with_blacklist_url((!excluded_prefixes.is_empty()).then(|| {
+        excluded_prefixes
+            .iter()
+            .filter_map(|s| CompactString::from_str(s).ok())
+            .collect()
+    }));
 
     let Some(mut rx) = website.subscribe(16384) else {
         eprintln!("Failed to subscribe to {} crawl events", domain);
