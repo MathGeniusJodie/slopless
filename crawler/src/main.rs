@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use futures::StreamExt;
+use reqwest::Client;
 use spider::compact_str::CompactString;
 use spider::website::Website;
 use std::fs::read_to_string;
@@ -183,6 +184,14 @@ async fn crawl_domain(
     website.configuration.only_html = true;
     website.configuration.delay = 4000;
     website.with_user_agent(Some(USER_AGENT));
+
+    // Use rustls instead of native-tls/OpenSSL to avoid pthread rwlock contention
+    let client = Client::builder()
+        .user_agent(USER_AGENT)
+        .use_rustls_tls()
+        .build()
+        .expect("Failed to build HTTP client with rustls");
+    website.set_http_client(client);
 
     website.with_blacklist_url((!excluded_prefixes.is_empty()).then(|| {
         excluded_prefixes

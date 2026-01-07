@@ -13,7 +13,22 @@ regex = "1.12.2"
 futures = "0.3.31"
 clap = { version = "4.5.54", features = ["derive"] }
 unicode-normalization = "0.1.25"
-spider = { version = "2.38.120", features = ["sync", "encoding"] }
+spider = { version = "2.38.120", default-features = false, features = [
+    "sync",
+    "encoding",
+    "cookies",
+    "ua_generator",
+    "reqwest_rustls_tls",  # Use rustls instead of native-tls/OpenSSL
+] }
+# Force reqwest to use only rustls, no native-tls/OpenSSL
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "http2",
+    "gzip",
+    "brotli",
+    "charset",
+    "cookies",
+] }
 html-escape = "0.2"
 
 [profile.release]
