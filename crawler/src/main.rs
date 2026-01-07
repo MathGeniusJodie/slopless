@@ -215,7 +215,10 @@ async fn crawl_domain(
         let page = match rx.recv().await {
             Ok(page) => page,
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                lagged_count += n as usize;
+                // Lagged pages are dropped by the broadcast channel - count as failed
+                let n = n as usize;
+                lagged_count += n;
+                state.pages_failed.fetch_add(n, Ordering::Relaxed);
                 continue;
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -234,13 +237,21 @@ async fn crawl_domain(
 
         match lol_readability::find_main_content(html.as_bytes(), &page_url) {
             Ok((content, title, url)) => {
-                let _ = state.tx.send(PageData {
-                    url,
-                    title,
-                    content,
-                });
-                pages_sent_to_index += 1;
-                state.pages_indexed.fetch_add(1, Ordering::Relaxed);
+                // Send to writer thread - if channel is closed (writer crashed), count as failed
+                if state
+                    .tx
+                    .send(PageData {
+                        url,
+                        title,
+                        content,
+                    })
+                    .is_ok()
+                {
+                    pages_sent_to_index += 1;
+                } else {
+                    eprintln!("Writer channel closed, page lost: {}", page_url);
+                    state.pages_failed.fetch_add(1, Ordering::Relaxed);
+                }
             }
             Err(_e) => {
                 state.pages_failed.fetch_add(1, Ordering::Relaxed);
@@ -250,9 +261,9 @@ async fn crawl_domain(
 
     let _ = crawl_handle.await;
 
-    if pages_sent_to_index > 0 {
+    if pages_sent_to_index > 0 || lagged_count > 0 {
         println!(
-            "Finished {} Indexed: {}, Lagged: {}",
+            "Finished {} Sent: {}, Lagged: {}",
             domain, pages_sent_to_index, lagged_count
         );
     }
@@ -276,13 +287,32 @@ async fn main() -> Result<()> {
     let excluded_prefixes = Arc::new(cli_args.excluded_url_prefixes);
     let max_concurrent = cli_args.max_concurrent_domains;
 
-    // Dedicated writer thread - owns CrawlDb exclusively, no locks needed
+    // Dedicated writer thread - owns CrawlDb exclusively, no locks needed.
+    // Note: If this thread panics entirely (e.g., CrawlDb::new fails), crawlers will
+    // detect the closed channel and count pages as failed. Per-page panics are caught
+    // and recovered from below.
     let state_for_writer = state.clone();
     let writer_handle = std::thread::spawn(move || -> Result<u64> {
         let mut db = CrawlDb::new()?;
         let mut last_status = std::time::Instant::now();
         while let Some(page) = rx.blocking_recv() {
-            db.process_page(&page.url, &page.title, &page.content);
+            // Catch panics from individual page processing to avoid killing the writer
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                db.process_page(&page.url, &page.title, &page.content);
+            }));
+
+            if result.is_err() {
+                eprintln!("Panic while indexing page: {}", page.url);
+                state_for_writer
+                    .pages_failed
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+
+            // Increment after successful write (not when sent to channel)
+            state_for_writer
+                .pages_indexed
+                .fetch_add(1, Ordering::Relaxed);
 
             if last_status.elapsed().as_secs() < 10 {
                 continue;

@@ -123,9 +123,8 @@ The `lol_readability.rs` module uses a single-pass streaming parser with a scori
 
 **Content quality signals:**
 - Text length contributes `sqrt(text_len)` to score
-- Link density penalty: if >50% of text is links, score *= (1 - density)
+- Link density penalty: score *= (1 - link_density), so navigation-heavy content scores low
 - Minimum 100 characters required
-- Average word length must be >2 (filters garbage like "a a a b b b")
 
 The element with the highest final score becomes the main content.
 

@@ -521,39 +521,6 @@ mod tests {
     }
 
     #[test]
-    fn test_rejects_single_letter_garbage() {
-        // Some pages have alphabetical indexes like "a a a b b b c c c"
-        // These should be rejected due to low average word length
-        let html = r#"
-            <html>
-                <body>
-                    <div id="index" class="content">
-                        a a a a a a b b b c c c d d d d d d d d d d d d d d d d e e e e e e f f f f f f f g g g h h h h h h h i i i i i i j j j k k k k l m m m n n n o o o o o o o o p p p q q q q q q q r r r r r r s s s s s t t u u u u u u v v v v v v w w w w x x y y z
-                    </div>
-                    <article>
-                        <p>This is the actual article content with real words and sentences.
-                        It contains substantial text discussing important topics in detail.
-                        The article has proper structure with commas, periods, and paragraphs.</p>
-                    </article>
-                </body>
-            </html>
-        "#;
-
-        let result = find_main_content(html.as_bytes(), "https://example.com/test");
-        assert!(result.is_ok());
-        let (text, _title, _canonical) = result.unwrap();
-        assert!(
-            text.contains("actual article content"),
-            "Should find article, not index garbage, got: {}",
-            text
-        );
-        assert!(
-            !text.contains("a a a"),
-            "Should not select single-letter garbage"
-        );
-    }
-
-    #[test]
     fn test_url_normalization_trailing_slash() {
         let html = r#"
             <html>
@@ -876,22 +843,10 @@ mod tests {
     }
 
     #[test]
-    fn test_is_viable_candidate_single_letter_words_not_filtered() {
-        // NOTE: Average word length filtering is documented in CLAUDE.md but NOT implemented.
-        // This test verifies the current behavior (single-letter content is accepted).
-        // If average word length filtering is added, this test should be updated.
-        let mut frame = ElementFrame::new("div", None, None);
-        frame.char_count = 150;
-        frame.extracted_text = "a b c d e f g h i j k l m n o p q r s t u v w x y z a b c d e f g h i j k l m n o p q r s t u v w x y z a b c d".to_string();
-        // Currently passes because only char_count >= 100 is checked
-        assert!(frame.is_viable_candidate());
-    }
-
-    #[test]
     fn test_is_viable_candidate_real_words_accepted() {
         let mut frame = ElementFrame::new("p", None, None);
         frame.char_count = 150;
-        frame.extracted_text = "These are real words with proper length that should pass the average word length check easily".to_string();
+        frame.extracted_text = "These are real words with proper length".to_string();
         assert!(frame.is_viable_candidate());
     }
 
@@ -1134,30 +1089,38 @@ mod tests {
         frame.char_count = 100;
         frame.link_char_count = 80; // 80% link density
                                     // base_score = 5, text = sqrt(100) = 10
-                                    // link_density = 0.8 > 0.5, so score *= (1 - 0.8) = 0.2
-                                    // final = (5 + 10) * 0.2 = 3
+                                    // With 40% threshold: excess = 0.4, range = 0.6
+                                    // multiplier = 1.0 - 0.4/0.6 = 0.333...
+                                    // final = (5 + 10) * 0.333 = 5
         let score = frame.calculate_final_score();
-        assert!((score - 3.0).abs() < 0.001, "Expected ~3.0, got {}", score);
+        assert!((score - 5.0).abs() < 0.001, "Expected ~5.0, got {}", score);
     }
 
     #[test]
     fn test_calculate_final_score_low_link_density() {
         let mut frame = ElementFrame::new("div", None, None);
         frame.char_count = 100;
-        frame.link_char_count = 30; // 30% link density - no penalty
+        frame.link_char_count = 30; // 30% link density - below 40% threshold
                                     // base_score = 5, text = sqrt(100) = 10
-                                    // link_density = 0.3 <= 0.5, no penalty
-                                    // final = 5 + 10 = 15
+                                    // multiplier = 1.0 (no penalty below threshold)
+                                    // final = (5 + 10) * 1.0 = 15
         assert_eq!(frame.calculate_final_score(), 15.0);
     }
 
     #[test]
-    fn test_calculate_final_score_exactly_half_link_density() {
+    fn test_calculate_final_score_half_link_density() {
         let mut frame = ElementFrame::new("div", None, None);
         frame.char_count = 100;
-        frame.link_char_count = 50; // exactly 50% - no penalty
-                                    // final = 5 + 10 = 15
-        assert_eq!(frame.calculate_final_score(), 15.0);
+        frame.link_char_count = 50; // 50% link density - slightly above 40% threshold
+                                    // excess = 0.1, range = 0.6
+                                    // multiplier = 1.0 - 0.1/0.6 = 0.833...
+                                    // final = (5 + 10) * 0.833 = 12.5
+        let score = frame.calculate_final_score();
+        assert!(
+            (score - 12.5).abs() < 0.001,
+            "Expected ~12.5, got {}",
+            score
+        );
     }
 
     #[test]
@@ -1166,7 +1129,7 @@ mod tests {
         frame.char_count = 100;
         frame.link_char_count = 100; // 100% links
                                      // base_score = 5, text = 10
-                                     // link_density = 1.0, score *= 0
+                                     // multiplier = 1.0 - 1.0 = 0.0
                                      // final = 0
         assert_eq!(frame.calculate_final_score(), 0.0);
     }

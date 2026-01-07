@@ -9,7 +9,7 @@
 //!    - Tag type: `<article>`, `<main>`, `<section>` score high; `<nav>`, `<footer>` score low
 //!    - Class/ID attributes: "content", "article" are positive; "sidebar", "nav" are negative
 //!    - Text length: More text = more likely to be content (uses sqrt to avoid over-weighting)
-//!    - Link density: Navigation has lots of links, articles don't (>50% links = penalty)
+//!    - Link density: Navigation has lots of links; penalty only above 40% (Wikipedia-style ok)
 //!    - Commas: Real sentences have punctuation, spam doesn't
 //! 3. **Track nested elements** - Child stats bubble up to parents
 //! 4. **Return the highest-scoring element's text**
@@ -39,8 +39,10 @@ const MAX_ELEMENT_STACK_DEPTH: usize = 256;
 /// Minimum text length required for an element to be considered main content
 const MIN_TEXT_LENGTH: usize = 100;
 
-/// Link density threshold above which content is penalized
-const LINK_DENSITY_THRESHOLD: f32 = 0.5;
+/// Link density threshold below which no penalty is applied.
+/// Wikipedia and gwern.net articles often have 30-40% of text as links.
+/// Only penalize above this to avoid hurting link-rich but legitimate content.
+const LINK_DENSITY_THRESHOLD: f32 = 0.4;
 
 // Regex patterns for scoring element class/id attributes
 
@@ -198,17 +200,27 @@ impl ElementFrame {
     fn text_length_score(&self) -> f32 {
         (self.char_count as f32).sqrt()
     }
-    /// Multiplier based on link density (penalizes navigation-heavy content)
+    /// Multiplier based on link density (penalizes navigation-heavy content).
+    ///
+    /// Link density = fraction of text that's inside <a> tags.
+    /// - Below threshold (40%): multiplier 1.0 (no penalty)
+    /// - Above threshold: linear penalty ramping to 0.0 at 100% links
+    ///
+    /// The 40% threshold allows Wikipedia/gwern-style content with many inline links
+    /// to score normally, while navigation menus (mostly links) are still penalized.
     fn link_density_multiplier(&self) -> f32 {
         if self.char_count == 0 {
             return 1.0;
         }
         let link_density = self.link_char_count as f32 / self.char_count as f32;
-        if link_density > LINK_DENSITY_THRESHOLD {
-            1.0 - link_density
-        } else {
-            1.0
+        if link_density <= LINK_DENSITY_THRESHOLD {
+            return 1.0;
         }
+        // Linear penalty from threshold to 100%
+        // At threshold: 1.0, at 100%: 0.0
+        let excess = link_density - LINK_DENSITY_THRESHOLD;
+        let range = 1.0 - LINK_DENSITY_THRESHOLD;
+        (1.0 - excess / range).clamp(0.0, 1.0)
     }
     /// Check if this element is a viable candidate for main content
     pub(crate) fn is_viable_candidate(&self) -> bool {
@@ -349,7 +361,7 @@ impl ParsingContext {
 
     /// Decrement non-content depth when closing a skipped element
     fn close_skipped(&mut self) {
-        self.non_content_depth -= 1;
+        self.non_content_depth = self.non_content_depth.saturating_sub(1);
     }
 
     /// Handle closing a link element (lightweight - just decrement depth)
