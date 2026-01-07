@@ -262,7 +262,7 @@ async fn crawl_domain(
 
     // Spawn crawl so website is dropped when done, closing the channel
     let crawl_handle = tokio::spawn(async move {
-        website.crawl_smart().await;
+        website.crawl().await; // temporarily disable crawl_smart
     });
 
     // Process pages as they stream in
@@ -316,7 +316,7 @@ async fn crawl_domain(
     }
 
     let _ = crawl_handle.await;
-    if pages_received != 0 {
+    if pages_received > 1 {
         println!(
             "Finished crawling {} - received: {}, empty: {}, readability_failed: {}, indexed: {}, lagged: {}",
             domain, pages_received, pages_empty_html, pages_readability_failed, pages_indexed, lagged_count
