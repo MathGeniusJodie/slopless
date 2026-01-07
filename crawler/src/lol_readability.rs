@@ -20,7 +20,6 @@
 //! let (text, title, url) = find_main_content(html_bytes, "https://example.com")?;
 //! ```
 
-use bytecount::count;
 use html_escape::decode_html_entities;
 use lol_html::{element, text, HtmlRewriter, Settings};
 use regex::Regex;
@@ -78,7 +77,6 @@ static NEGATIVE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 pub(crate) enum TagType {
     Div,
     P,
-    A,
     Header,  // h1-h6
     List,    // ul, ol, dl
     Article, // article, main, section - semantic content tags
@@ -117,7 +115,6 @@ impl ElementFrame {
         match tag_name {
             "div" => TagType::Div,
             "p" => TagType::P,
-            "a" => TagType::A,
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => TagType::Header,
             "ul" | "ol" | "dl" => TagType::List,
             "article" | "main" | "section" => TagType::Article,
@@ -153,24 +150,41 @@ impl ElementFrame {
             _ => 0.0,
         }
     }
-    /// Append text content, decoding HTML entities and normalizing whitespace
-    pub(crate) fn append_text(&mut self, text: &str) {
+    /// Add text content, updating all counters. Decodes HTML entities and normalizes whitespace.
+    /// If `is_link_text` is true, also counts toward link_char_count.
+    pub(crate) fn add_text(&mut self, text: &str, is_link_text: bool) {
         let decoded = decode_html_entities(text);
+        let len_before = self.extracted_text.len();
+
         for part in decoded.split_whitespace() {
             if !self.extracted_text.is_empty() {
                 self.extracted_text.push(' ');
             }
             self.extracted_text.push_str(part);
         }
-    }
-    /// Append text and return the number of characters added (excluding separator spaces)
-    pub(crate) fn add_text(&mut self, text: &str) -> usize {
-        let mut len_before = self.extracted_text.len();
-        self.append_text(text);
-        if self.extracted_text.as_bytes().get(len_before) == Some(&b' ') {
-            len_before += 1; // space separators don't count towards length
+
+        // Count chars added, excluding the leading separator space (if any)
+        let mut start = len_before;
+        if self.extracted_text.as_bytes().get(start) == Some(&b' ') {
+            start += 1;
         }
-        self.extracted_text.len().saturating_sub(len_before)
+        let chars_added = self.extracted_text.len().saturating_sub(start);
+
+        self.char_count += chars_added;
+        self.comma_count += bytecount::count(decoded.as_bytes(), b',');
+        if is_link_text {
+            self.link_char_count += chars_added;
+        }
+    }
+
+    /// Append already-decoded text (used for bubbling child text to parent)
+    pub(crate) fn append_text(&mut self, text: &str) {
+        for part in text.split_whitespace() {
+            if !self.extracted_text.is_empty() {
+                self.extracted_text.push(' ');
+            }
+            self.extracted_text.push_str(part);
+        }
     }
     /// Calculate final score including text-based heuristics
     pub(crate) fn calculate_final_score(&self) -> f32 {
@@ -254,12 +268,12 @@ pub(crate) fn categorize_tag(tag: &str) -> TagCategory {
 enum ElementAction {
     /// Track title element specially (want its text even though it's in skipped <head>)
     TrackTitle,
-    /// Increment skip depth (inside a non-content container)
-    IncrementSkipDepth,
-    /// Start skipping a non-content container
-    StartSkipping,
+    /// Skip this element and its contents (non-content container like script, style, head)
+    Skip,
     /// Push a frame for this content element
     PushFrame,
+    /// Push a lightweight link tracker (no full frame, just nesting depth)
+    PushLink,
     /// Ignore this element entirely (void, leaf, or depth limit)
     Ignore,
 }
@@ -299,22 +313,26 @@ impl ParsingContext {
         }
 
         let category = categorize_tag(tag_name);
-        let is_void = category == TagCategory::VoidElement;
 
         // Inside a non-content container?
         if self.non_content_depth > 0 {
-            return if is_void {
+            return if category == TagCategory::VoidElement {
                 ElementAction::Ignore
             } else {
-                ElementAction::IncrementSkipDepth
+                ElementAction::Skip
             };
         }
 
         // Check tag category
         match category {
-            TagCategory::NonContentContainer => return ElementAction::StartSkipping,
+            TagCategory::NonContentContainer => return ElementAction::Skip,
             TagCategory::NonContentLeaf | TagCategory::VoidElement => return ElementAction::Ignore,
             TagCategory::Content => {}
+        }
+
+        // Links get lightweight tracking (no full frame needed)
+        if tag_name == "a" {
+            return ElementAction::PushLink;
         }
 
         // Stack depth limit reached?
@@ -334,11 +352,13 @@ impl ParsingContext {
         self.non_content_depth -= 1;
     }
 
+    /// Handle closing a link element (lightweight - just decrement depth)
+    fn close_link(&mut self) {
+        self.link_nesting_depth = self.link_nesting_depth.saturating_sub(1);
+    }
+
     /// Handle closing a content element: pop frame, bubble stats, maybe update best
-    fn close_content_element(&mut self, is_link: bool) {
-        if is_link {
-            self.link_nesting_depth -= 1;
-        }
+    fn close_content_element(&mut self) {
         let Some(frame) = self.element_stack.pop() else {
             return;
         };
@@ -378,13 +398,7 @@ impl ParsingContext {
         let Some(frame) = self.element_stack.last_mut() else {
             return;
         };
-        let chars_added = frame.add_text(text);
-        frame.char_count += chars_added;
-        frame.comma_count += count(text.as_bytes(), b',');
-
-        if self.link_nesting_depth > 0 {
-            frame.link_char_count += chars_added;
-        }
+        frame.add_text(text, self.link_nesting_depth > 0);
     }
 }
 
@@ -417,11 +431,8 @@ pub fn find_main_content(html: &[u8], url: &str) -> anyhow::Result<(String, Stri
                 // Process all elements for scoring
                 element!("*", move |element| {
                     let tag_name = element.tag_name();
-                    let is_link = tag_name == "a";
-
                     let action = ctx_for_elements.borrow().classify_element(&tag_name);
-                    if !execute_open_action(&ctx_for_elements, &element, &tag_name, action, is_link)
-                    {
+                    if !execute_open_action(&ctx_for_elements, &element, &tag_name, action) {
                         return Ok(());
                     }
                     let Some(end_tag_handlers) = element.end_tag_handlers() else {
@@ -433,10 +444,9 @@ pub fn find_main_content(html: &[u8], url: &str) -> anyhow::Result<(String, Stri
                         let mut ctx = ctx_for_close.borrow_mut();
                         match action {
                             ElementAction::TrackTitle => ctx.close_title(),
-                            ElementAction::IncrementSkipDepth | ElementAction::StartSkipping => {
-                                ctx.close_skipped()
-                            }
-                            ElementAction::PushFrame => ctx.close_content_element(is_link),
+                            ElementAction::Skip => ctx.close_skipped(),
+                            ElementAction::PushLink => ctx.close_link(),
+                            ElementAction::PushFrame => ctx.close_content_element(),
                             ElementAction::Ignore => {}
                         }
                         Ok(())
@@ -474,25 +484,22 @@ fn execute_open_action(
     element: &lol_html::html_content::Element<'_, '_>,
     tag_name: &str,
     action: ElementAction,
-    is_link: bool,
 ) -> bool {
     match action {
         ElementAction::TrackTitle => {
             ctx.borrow_mut().inside_title_tag = true;
         }
-        ElementAction::IncrementSkipDepth | ElementAction::StartSkipping => {
+        ElementAction::Skip => {
             ctx.borrow_mut().non_content_depth += 1;
+        }
+        ElementAction::PushLink => {
+            ctx.borrow_mut().link_nesting_depth += 1;
         }
         ElementAction::PushFrame => {
             let id = element.get_attribute("id");
             let class = element.get_attribute("class");
             let frame = ElementFrame::new(tag_name, id.as_deref(), class.as_deref());
-
-            let mut ctx = ctx.borrow_mut();
-            ctx.element_stack.push(frame);
-            if is_link {
-                ctx.link_nesting_depth += 1;
-            }
+            ctx.borrow_mut().element_stack.push(frame);
         }
         ElementAction::Ignore => return false,
     }

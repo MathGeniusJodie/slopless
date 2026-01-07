@@ -614,7 +614,8 @@ mod tests {
 
     #[test]
     fn test_classify_tag_anchor() {
-        assert_eq!(ElementFrame::classify_tag("a"), TagType::A);
+        // Links are now handled separately (PushLink action), classified as Other
+        assert_eq!(ElementFrame::classify_tag("a"), TagType::Other);
     }
 
     #[test]
@@ -679,11 +680,6 @@ mod tests {
         // Other gets 0
         assert_eq!(
             ElementFrame::calculate_base_score(TagType::Other, None, None),
-            0.0
-        );
-        // A (anchor) gets 0
-        assert_eq!(
-            ElementFrame::calculate_base_score(TagType::A, None, None),
             0.0
         );
     }
@@ -866,13 +862,17 @@ mod tests {
     }
 
     #[test]
-    fn test_is_viable_candidate_anchor_not_content_tag() {
+    fn test_is_viable_candidate_other_tag_is_content() {
+        // Links are now handled via PushLink action (no frame created).
+        // TagType::Other (which includes "a" after refactoring) IS a content tag.
+        // This tests that Other tags with enough text are viable.
         let mut frame = ElementFrame::new("a", None, None);
         frame.char_count = 150;
         frame.extracted_text =
             "This is a very long anchor that should not be considered main content ever"
                 .to_string();
-        assert!(!frame.is_viable_candidate());
+        // Now classified as Other, which is a content tag
+        assert!(frame.is_viable_candidate());
     }
 
     #[test]
@@ -986,16 +986,18 @@ mod tests {
     }
 
     #[test]
-    fn test_append_text_decodes_html_entities() {
+    fn test_append_text_does_not_decode_entities() {
+        // append_text is for already-decoded text (bubbling from child to parent)
         let mut frame = ElementFrame::new("div", None, None);
-        frame.append_text("Tom &amp; Jerry");
+        frame.append_text("Tom & Jerry"); // pre-decoded
         assert_eq!(frame.extracted_text, "Tom & Jerry");
     }
 
     #[test]
-    fn test_append_text_decodes_numeric_entities() {
+    fn test_append_text_preserves_literal_text() {
+        // append_text passes through literal text without decoding
         let mut frame = ElementFrame::new("div", None, None);
-        frame.append_text("&#60;div&#62;");
+        frame.append_text("<div>"); // already decoded
         assert_eq!(frame.extracted_text, "<div>");
     }
 
@@ -1022,42 +1024,43 @@ mod tests {
     #[test]
     fn test_add_text_first_append() {
         let mut frame = ElementFrame::new("div", None, None);
-        let len = frame.add_text("Hello world");
-        assert_eq!(len, 11); // "Hello world" = 11 chars
+        frame.add_text("Hello world", false);
+        assert_eq!(frame.char_count, 11); // "Hello world" = 11 chars
         assert_eq!(frame.extracted_text, "Hello world");
     }
 
     #[test]
     fn test_add_text_subsequent_excludes_separator() {
         let mut frame = ElementFrame::new("div", None, None);
-        frame.add_text("Hello");
-        let len = frame.add_text("world");
-        assert_eq!(len, 5); // "world" = 5 chars, separator space not counted
+        frame.add_text("Hello", false);
+        frame.add_text("world", false);
+        assert_eq!(frame.char_count, 10); // "Hello" + "world" = 10 chars (separator not counted)
         assert_eq!(frame.extracted_text, "Hello world");
     }
 
     #[test]
     fn test_add_text_normalizes_whitespace() {
         let mut frame = ElementFrame::new("div", None, None);
-        let len = frame.add_text("Hello    world");
-        assert_eq!(len, 11); // Normalized to "Hello world"
+        frame.add_text("Hello    world", false);
+        assert_eq!(frame.char_count, 11); // Normalized to "Hello world"
         assert_eq!(frame.extracted_text, "Hello world");
     }
 
     #[test]
     fn test_add_text_decodes_entities() {
         let mut frame = ElementFrame::new("div", None, None);
-        let len = frame.add_text("&amp;&lt;&gt;");
-        assert_eq!(len, 3); // Decoded to "&<>" = 3 chars
+        frame.add_text("&amp;&lt;&gt;", false);
+        assert_eq!(frame.char_count, 3); // Decoded to "&<>" = 3 chars
         assert_eq!(frame.extracted_text, "&<>");
     }
 
     #[test]
-    fn test_add_text_whitespace_only_returns_zero() {
+    fn test_add_text_whitespace_only_adds_zero() {
         let mut frame = ElementFrame::new("div", None, None);
-        frame.add_text("Hello");
-        let len = frame.add_text("   \t\n   ");
-        assert_eq!(len, 0);
+        frame.add_text("Hello", false);
+        let count_before = frame.char_count;
+        frame.add_text("   \t\n   ", false);
+        assert_eq!(frame.char_count, count_before); // Unchanged
         assert_eq!(frame.extracted_text, "Hello"); // Unchanged
     }
 
@@ -1065,17 +1068,33 @@ mod tests {
     fn test_add_text_nbsp_normalized() {
         let mut frame = ElementFrame::new("div", None, None);
         // &nbsp; entities should be decoded and treated as whitespace
-        let len = frame.add_text("Hello&nbsp;&nbsp;&nbsp;world");
-        assert_eq!(len, 11); // "Hello world" after normalization
+        frame.add_text("Hello&nbsp;&nbsp;&nbsp;world", false);
+        assert_eq!(frame.char_count, 11); // "Hello world" after normalization
         assert_eq!(frame.extracted_text, "Hello world");
     }
 
     #[test]
     fn test_add_text_empty_string() {
         let mut frame = ElementFrame::new("div", None, None);
-        let len = frame.add_text("");
-        assert_eq!(len, 0);
+        frame.add_text("", false);
+        assert_eq!(frame.char_count, 0);
         assert_eq!(frame.extracted_text, "");
+    }
+
+    #[test]
+    fn test_add_text_link_text_tracking() {
+        let mut frame = ElementFrame::new("div", None, None);
+        frame.add_text("normal text", false);
+        frame.add_text("link text", true);
+        assert_eq!(frame.char_count, 20); // 11 + 9 = 20
+        assert_eq!(frame.link_char_count, 9); // Only "link text" counted
+    }
+
+    #[test]
+    fn test_add_text_counts_commas_after_decoding() {
+        let mut frame = ElementFrame::new("div", None, None);
+        frame.add_text("one, two, three", false);
+        assert_eq!(frame.comma_count, 2);
     }
 
     // =========================================================================

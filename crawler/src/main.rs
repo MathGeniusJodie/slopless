@@ -5,7 +5,6 @@ use reqwest::Client;
 use spider::compact_str::CompactString;
 use spider::website::Website;
 use std::fs::read_to_string;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tantivy::schema::{
@@ -198,7 +197,7 @@ async fn crawl_domain(
     website.with_blacklist_url((!excluded_prefixes.is_empty()).then(|| {
         excluded_prefixes
             .iter()
-            .filter_map(|s| CompactString::from_str(s).ok())
+            .map(CompactString::new)
             .collect()
     }));
 
