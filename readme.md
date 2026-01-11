@@ -101,15 +101,11 @@ Google and Bing suck now, they're overrun by SEO slop. The internet as most peop
 - [ ] https://educational-channels.com
 - [ ] kagi small yt
 
-### Implementation Todos
-- [ ] Scraper for automatically finding new safelist sources
-- [ ] Actual search engine implementation
-- [ ] Rankings algorithm
-- [ ] Website UI
+### Implementation Ideas to investigate
 - [ ] Investigate https://yacy.net/
 - [ ] Investigate https://github.com/medialab/hyphe
 - [ ] Offline/datahoarder mode? https://www.httrack.com/ https://en.wikipedia.org/wiki/Heritrix
-- [ ] Don't crawl websites that have search pages of their own and integrate their search instead
+- [ ] Don't crawl websites that have search pages of their own and integrate their search instead?
 
 
 ### AI Content
