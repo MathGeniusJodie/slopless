@@ -4,7 +4,20 @@ A search engine with currated sources free from SEO slop. This project also aims
 # Why?
 Google and Bing suck now, they're overrun by SEO slop. The internet as most people know it is a cesspool of garbage. The good internet that we are all nostalgic for is still out there, but it's not easy to find. This project aims to fix that.
 
-**THIS ISN'T EVEN A WIP RIGHT NOW, THIS IS JUST A PLAN/BRAINSTORM/DRAFT**
+# Related Projects
+* https://github.com/MathGeniusJodie/slopless_embeddings
+* https://github.com/MathGeniusJodie/tl_readability
+
+# Status
+- [x] Automated scraping of safelist sources
+- [ ] Automated scraping of blocklist sources
+- [x] Crawler
+- [x] HTML content extraction initial implementation
+- [ ] Fancy HTML content extraction
+- [ ] Cross-language support
+- [ ] Vector embedding index
+- [ ] ANN search
+- [ ] Website UI
 
 ### Safelist Sources
 * Independent blogs
