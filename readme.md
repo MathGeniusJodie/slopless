@@ -106,7 +106,7 @@ Google and Bing suck now, they're overrun by SEO slop. The internet as most peop
 - [ ] Investigate https://github.com/medialab/hyphe
 - [ ] Offline/datahoarder mode? https://www.httrack.com/ https://en.wikipedia.org/wiki/Heritrix
 - [ ] Don't crawl websites that have search pages of their own and integrate their search instead?
-
+- [ ] https://caddyserver.com
 
 ### AI Content
 I want to add an option to filter out AI generated content because many people want that, but I don't want to make it the default. AI content that was prompted and well-curated by humans is kinda fine in my book.
