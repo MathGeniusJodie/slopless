@@ -2,7 +2,7 @@
 A search engine with currated sources free from SEO slop. This project also aims to recommend websites to other aggregators and search engines to help them improve their own results.
 
 # Why?
-Google and Bing suck now, they're overrun by SEO slop. The internet as most people know it is a cesspool of garbage. The good internet that we are all nostalgic for is still out there, but it's not easy to find. This project aims to fix that.
+Google and Bing suck now, they're overrun by SEO slop. The internet as most people know it is a cesspool of garbage. The good internet that we are all nostalgic for is still out there, but it's not easy to find. This project aims to fix that. Other projects such as marginalia and wiby only have obsure websites which makes them less useful as a general purpose search engine, this project WILL include popular websites in the search results
 
 # Related Projects
 * https://github.com/MathGeniusJodie/slopless_embeddings
