@@ -264,7 +264,7 @@
                 return;
             }
 
-            status.textContent = total + ' results';
+            status.innerHTML = total + ' results &nbsp;·&nbsp; <a href="https://search.brave.com/images?q=' + encodeURIComponent(q) + '" target="_blank" rel="noopener" style="color:var(--muted)">images</a>';
             results.innerHTML = `
                 <div class="column">
                     <div class="column-label">Smol</div>

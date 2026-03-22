@@ -63,18 +63,22 @@ async fn fetch_wiby(client: &Client, query: &str) -> Vec<SearchResult> {
         return vec![];
     };
     match resp.json::<Vec<WibyResult>>().await {
-        Ok(results) => results
-            .into_iter()
-            .filter_map(|r| {
-                Some(SearchResult {
-                    title: r.title?,
-                    url: r.url?,
-                    description: r.snippet.unwrap_or_default(),
-                    source: "wiby".to_string(),
-                    image: None,
+        Ok(results) => {
+            let out: Vec<_> = results
+                .into_iter()
+                .filter_map(|r| {
+                    Some(SearchResult {
+                        title: r.title?,
+                        url: r.url?,
+                        description: r.snippet.unwrap_or_default(),
+                        source: "wiby".to_string(),
+                        image: None,
+                    })
                 })
-            })
-            .collect(),
+                .collect();
+            eprintln!("wiby: {} results", out.len());
+            out
+        }
         Err(e) => {
             eprintln!("wiby: parse error: {e}");
             vec![]
@@ -100,8 +104,13 @@ async fn fetch_brave(client: &Client, query: &str) -> Vec<SearchResult> {
         eprintln!("brave: request failed");
         return vec![];
     };
+    let resp_status = resp.status();
     match resp.text().await {
-        Ok(html) => parse_brave(&html),
+        Ok(html) => {
+            let out = parse_brave(&html);
+            eprintln!("brave: {} results (status {})", out.len(), resp_status);
+            out
+        }
         Err(e) => {
             eprintln!("brave: read error: {e}");
             vec![]
@@ -158,18 +167,22 @@ async fn fetch_marginalia(client: &Client, query: &str) -> Vec<SearchResult> {
         return vec![];
     };
     match resp.json::<MarginaliaResponse>().await {
-        Ok(data) => data
-            .results
-            .unwrap_or_default()
-            .into_iter()
-            .map(|r| SearchResult {
-                title: r.title,
-                url: r.url,
-                description: r.description.unwrap_or_default(),
-                source: "marginalia".to_string(),
-                image: None,
-            })
-            .collect(),
+        Ok(data) => {
+            let out: Vec<_> = data
+                .results
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| SearchResult {
+                    title: r.title,
+                    url: r.url,
+                    description: r.description.unwrap_or_default(),
+                    source: "marginalia".to_string(),
+                    image: None,
+                })
+                .collect();
+            eprintln!("marginalia: {} results", out.len());
+            out
+        }
         Err(e) => {
             eprintln!("marginalia: parse error: {e}");
             vec![]
@@ -192,7 +205,11 @@ async fn fetch_mwmbl(client: &Client, query: &str) -> Vec<SearchResult> {
         return vec![];
     };
     match resp.text().await {
-        Ok(html) => parse_mwmbl(&html),
+        Ok(html) => {
+            let out = parse_mwmbl(&html);
+            eprintln!("mwmbl: {} results", out.len());
+            out
+        }
         Err(e) => {
             eprintln!("mwmbl: read error: {e}");
             vec![]
@@ -242,7 +259,11 @@ async fn fetch_searchmysite(client: &Client, query: &str) -> Vec<SearchResult> {
         return vec![];
     };
     match resp.text().await {
-        Ok(html) => parse_searchmysite(&html),
+        Ok(html) => {
+            let out = parse_searchmysite(&html);
+            eprintln!("searchmysite: {} results", out.len());
+            out
+        }
         Err(e) => {
             eprintln!("searchmysite: read error: {e}");
             vec![]
@@ -297,7 +318,11 @@ async fn fetch_britannica(client: &Client, query: &str) -> Vec<SearchResult> {
         return vec![];
     };
     match resp.text().await {
-        Ok(html) => parse_britannica(&html),
+        Ok(html) => {
+            let out = parse_britannica(&html);
+            eprintln!("britannica: {} results", out.len());
+            out
+        }
         Err(e) => {
             eprintln!("britannica: read error: {e}");
             vec![]
@@ -373,21 +398,25 @@ async fn fetch_reddit(client: &Client, query: &str) -> Vec<SearchResult> {
     match resp.text().await {
         Ok(body) => {
             match serde_json::from_str::<RedditListing>(&body) {
-                Ok(listing) => listing
-                    .data
-                    .children
-                    .into_iter()
-                    .map(|post| {
-                        let image = post.data.thumbnail.filter(|t| t.starts_with("http"));
-                        SearchResult {
-                            title: post.data.title,
-                            url: format!("https://old.reddit.com{}", post.data.permalink),
-                            description: post.data.selftext.unwrap_or_default(),
-                            source: "reddit".to_string(),
-                            image,
-                        }
-                    })
-                    .collect(),
+                Ok(listing) => {
+                    let out: Vec<_> = listing
+                        .data
+                        .children
+                        .into_iter()
+                        .map(|post| {
+                            let image = post.data.thumbnail.filter(|t| t.starts_with("http"));
+                            SearchResult {
+                                title: post.data.title,
+                                url: format!("https://old.reddit.com{}", post.data.permalink),
+                                description: post.data.selftext.unwrap_or_default(),
+                                source: "reddit".to_string(),
+                                image,
+                            }
+                        })
+                        .collect();
+                    eprintln!("reddit: {} results", out.len());
+                    out
+                }
                 Err(e) => {
                     eprintln!("reddit: json parse error: {e}");
                     vec![]
