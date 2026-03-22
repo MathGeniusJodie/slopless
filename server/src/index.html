@@ -84,6 +84,10 @@
             text-align: center;
         }
 
+        #status a {
+            color: var(--muted);
+        }
+
         #results {
             width: 100%;
             padding: 0 1rem 3rem;
@@ -202,13 +206,6 @@
             overflow: hidden;
         }
 
-        .error {
-            color: #f66;
-            text-align: center;
-            padding: 2rem;
-            grid-column: 1 / -1;
-        }
-
         @media (max-width: 900px) {
             #results { grid-template-columns: 1fr; }
             .column-big { grid-template-columns: 1fr; }
@@ -219,90 +216,14 @@
 
 <header>
     <h1>SlopLess Search</h1>
-    <form class="search-bar" id="form">
-        <input type="text" id="q" name="q" placeholder="Search..." autofocus autocomplete="off">
+    <form class="search-bar" method="get" action="/">
+        <input type="text" id="q" name="q" placeholder="Search..." autofocus autocomplete="off" value="{{QUERY}}">
         <button type="submit">Search</button>
     </form>
-    <div id="status"></div>
+    <div id="status">{{STATUS}}</div>
 </header>
 
-<div id="results"></div>
-
-<script>
-    const form = document.getElementById('form');
-    const input = document.getElementById('q');
-    const status = document.getElementById('status');
-    const results = document.getElementById('results');
-
-    const params = new URLSearchParams(location.search);
-    if (params.get('q')) {
-        input.value = params.get('q');
-        doSearch(params.get('q'));
-    }
-
-    form.addEventListener('submit', e => {
-        e.preventDefault();
-        const q = input.value.trim();
-        if (!q) return;
-        history.pushState({}, '', '?q=' + encodeURIComponent(q));
-        doSearch(q);
-    });
-
-    function renderColumn(items) {
-        return items.map(r => `
-            <div class="result">
-                <div class="result-source source-${r.source}">${r.source}</div>
-                ${r.image ? `<img class="result-img" src="${esc(r.image)}" alt="" loading="lazy">` : ''}
-                <div class="result-title"><a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.title)}</a></div>
-                <div class="result-url">${esc(r.url)}</div>
-                ${r.description ? `<div class="result-desc">${esc(r.description)}</div>` : ''}
-            </div>
-        `).join('');
-    }
-
-    async function doSearch(q) {
-        results.innerHTML = '';
-        status.textContent = 'Searching...';
-
-        try {
-            const resp = await fetch('/search?q=' + encodeURIComponent(q));
-            if (!resp.ok) throw new Error('HTTP ' + resp.status);
-            const data = await resp.json();
-
-            const total = data.smol.length + data.big.length;
-            if (total === 0) {
-                status.textContent = 'No results.';
-                results.innerHTML = '';
-                return;
-            }
-
-            status.innerHTML = total + ' results &nbsp;·&nbsp; <a href="https://search.brave.com/images?q=' + encodeURIComponent(q) + '" target="_blank" rel="noopener" style="color:var(--muted)">images</a>';
-            results.innerHTML = `
-                <div class="column">
-                    <div class="column-label">Smol</div>
-                    ${renderColumn(data.smol)}
-                </div>
-                <div class="column column-big">
-                    <div class="column-label">Big</div>
-                    ${renderColumn(data.big)}
-                </div>
-            `;
-        } catch (err) {
-            status.textContent = '';
-            results.innerHTML = `<div class="error">Error: ${esc(err.message)}</div>`;
-        }
-    }
-
-    function decode(s) {
-        const el = document.createElement('textarea');
-        el.innerHTML = s;
-        return el.value;
-    }
-
-    function esc(s) {
-        return decode(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-    }
-</script>
+{{RESULTS}}
 
 </body>
 </html>

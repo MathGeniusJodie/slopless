@@ -1,6 +1,6 @@
 use axum::{
     extract::{Query, State},
-    response::{Html, Json},
+    response::Html,
     routing::get,
     Router,
 };
@@ -10,6 +10,50 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+
+struct AppState {
+    client: Client,
+    blocked: HashSet<String>,
+}
+
+fn load_blocklist(paths: &[&str]) -> HashSet<String> {
+    let mut set = HashSet::new();
+    for path in paths {
+        match std::fs::read_to_string(path) {
+            Ok(content) => {
+                for line in content.lines() {
+                    let line = line.trim().to_lowercase();
+                    if !line.is_empty() && !line.starts_with('#') {
+                        set.insert(line);
+                    }
+                }
+                eprintln!("blocklist: loaded {path}");
+            }
+            Err(e) => eprintln!("blocklist: could not read {path}: {e}"),
+        }
+    }
+    set
+}
+
+fn url_host(url: &str) -> String {
+    // Strip scheme
+    let s = url.find("://").map_or(url, |i| &url[i + 3..]);
+    // Strip path/query/fragment
+    let s = s.split('/').next().unwrap_or(s);
+    let s = s.split('?').next().unwrap_or(s);
+    // Strip port
+    let s = match s.rfind(':') {
+        Some(i) if s[i + 1..].chars().all(|c| c.is_ascii_digit()) => &s[..i],
+        _ => s,
+    };
+    // Strip www.
+    s.strip_prefix("www.").unwrap_or(s).to_lowercase()
+}
+
+fn is_blocked(url: &str, blocked: &HashSet<String>) -> bool {
+    let host = url_host(url);
+    blocked.contains(&host) || blocked.iter().any(|b| host.ends_with(&format!(".{b}")))
+}
 
 #[derive(Deserialize)]
 struct SearchParams {
@@ -24,12 +68,6 @@ struct SearchResult {
     source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     image: Option<String>,
-}
-
-#[derive(Serialize)]
-struct SearchResponse {
-    smol: Vec<SearchResult>,
-    big: Vec<SearchResult>,
 }
 
 // Wiby JSON API response
@@ -464,7 +502,9 @@ async fn fetch_reddit(client: &Client, query: &str) -> Vec<SearchResult> {
                         .children
                         .into_iter()
                         .map(|post| {
-                            let image = post.data.thumbnail.filter(|t| t.starts_with("http"));
+                            let image = post.data.thumbnail
+                                .filter(|t| t.starts_with("http"))
+                                .map(|t| t.replace("&amp;", "&"));
                             SearchResult {
                                 title: post.data.title,
                                 url: format!("https://old.reddit.com{}", post.data.permalink),
@@ -509,53 +549,115 @@ fn interleave(sources: &[Vec<SearchResult>], seen: &mut HashSet<String>) -> Vec<
     out
 }
 
-async fn search(
-    Query(params): Query<SearchParams>,
-    State(client): State<Arc<Client>>,
-) -> Json<SearchResponse> {
-    let Some(query) = params.q.filter(|q| !q.is_empty()) else {
-        return Json(SearchResponse { smol: vec![], big: vec![] });
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+     .replace('<', "&lt;")
+     .replace('>', "&gt;")
+     .replace('"', "&quot;")
+}
+
+fn render_result(r: &SearchResult) -> String {
+    let img_html = match &r.image {
+        Some(src) => format!(
+            "<img class=\"result-img\" src=\"{}\" alt=\"\" loading=\"lazy\" referrerpolicy=\"no-referrer\">",
+            html_escape(src)
+        ),
+        None => String::new(),
     };
-
-    let (wiby, brave, marginalia, mwmbl, searchmysite, britannica, reddit) = tokio::join!(
-        fetch_wiby(&client, &query),
-        fetch_brave(&client, &query),
-        fetch_marginalia(&client, &query),
-        fetch_mwmbl(&client, &query),
-        fetch_searchmysite(&client, &query),
-        fetch_britannica(&client, &query),
-        fetch_reddit(&client, &query),
-    );
-
-    // Big column: reddit first (priority), then brave, then mwmbl
-    let mut seen = HashSet::new();
-    let big = interleave(&[reddit, brave, mwmbl], &mut seen);
-
-    // Smol column: wiby + marginalia + searchmysite + britannica, skip URLs already in big
-    let smol = interleave(&[wiby, marginalia, searchmysite, britannica], &mut seen);
-
-    Json(SearchResponse { smol, big })
+    format!(
+        "<div class=\"result\">\
+{img}\
+<div class=\"result-source source-{source}\">{source}</div>\
+<div class=\"result-title\"><a href=\"{url}\">{title}</a></div>\
+<div class=\"result-url\">{url_text}</div>\
+<div class=\"result-desc\">{desc}</div>\
+</div>",
+        source = html_escape(&r.source),
+        url = html_escape(&r.url),
+        title = html_escape(&r.title),
+        url_text = html_escape(&r.url),
+        img = img_html,
+        desc = html_escape(&r.description),
+    )
 }
 
 const INDEX_HTML: &str = include_str!("index.html");
 
-async fn index() -> Html<&'static str> {
-    Html(INDEX_HTML)
+async fn index(
+    Query(params): Query<SearchParams>,
+    State(state): State<Arc<AppState>>,
+) -> Html<String> {
+    let query = params.q.filter(|q| !q.is_empty());
+
+    let (status, results_html) = match query.as_deref() {
+        None => (String::new(), String::new()),
+        Some(q) => {
+            let (wiby, brave, marginalia, mwmbl, searchmysite, britannica, reddit) = tokio::join!(
+                fetch_wiby(&state.client, q),
+                fetch_brave(&state.client, q),
+                fetch_marginalia(&state.client, q),
+                fetch_mwmbl(&state.client, q),
+                fetch_searchmysite(&state.client, q),
+                fetch_britannica(&state.client, q),
+                fetch_reddit(&state.client, q),
+            );
+
+            let filter = |mut results: Vec<SearchResult>| -> Vec<SearchResult> {
+                results.retain(|r| !is_blocked(&r.url, &state.blocked));
+                results
+            };
+
+            let mut seen = HashSet::new();
+            let big = interleave(&[filter(reddit), filter(brave), filter(mwmbl)], &mut seen);
+            let smol = interleave(&[filter(wiby), filter(marginalia), filter(searchmysite), filter(britannica)], &mut seen);
+
+            let total = smol.len() + big.len();
+            let images_url = format!("https://search.brave.com/images?q={}", urlencoding::encode(q));
+            let status = format!(
+                "{total} results &nbsp;&middot;&nbsp; <a href=\"{}\">images</a>",
+                html_escape(&images_url)
+            );
+
+            let smol_html: String = smol.iter().map(render_result).collect();
+            let big_html: String = big.iter().map(render_result).collect();
+            let results_html = format!(
+                "<div id=\"results\">\
+<div class=\"column\"><div class=\"column-label\">Discovery</div>{smol_html}</div>\
+<div class=\"column-big\"><div class=\"column-label\">Web</div>{big_html}</div>\
+</div>"
+            );
+
+            (status, results_html)
+        }
+    };
+
+    let page = INDEX_HTML
+        .replace("{{QUERY}}", &html_escape(query.as_deref().unwrap_or("")))
+        .replace("{{STATUS}}", &status)
+        .replace("{{RESULTS}}", &results_html);
+
+    Html(page)
 }
 
 #[tokio::main]
 async fn main() {
-    let client = Arc::new(
-        Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .expect("failed to build HTTP client"),
-    );
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("failed to build HTTP client");
+
+    let blocked = load_blocklist(&[
+        "../handpicked-fakenews.txt",
+        "../handpicked-blocklist.txt",
+    ]);
+    eprintln!("blocklist: {} domains total", blocked.len());
+
+    let state = Arc::new(AppState { client, blocked });
 
     let app = Router::new()
         .route("/", get(index))
-        .route("/search", get(search))
-        .with_state(client);
+
+        .with_state(state);
 
     let listener = TcpListener::bind("0.0.0.0:3000").await.unwrap();
     println!("listening on http://0.0.0.0:3000");
