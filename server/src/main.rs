@@ -807,10 +807,23 @@ async fn index(
 
             let mut seen = HashSet::new();
             let news_sources = ["apnews", "brave news"];
+            let query_words: Vec<String> = q.split_whitespace()
+                .map(|w| w.to_lowercase()).collect();
+            let relevance_penalty = |r: &SearchResult, rank: f64| -> f64 {
+                let text = format!("{} {}", r.title, r.description).to_lowercase();
+                let text_words: HashSet<&str> = text
+                    .split(|c: char| !c.is_alphanumeric())
+                    .filter(|w: &&str| !w.is_empty())
+                    .collect();
+                let all_present = query_words.iter()
+                    .all(|w| text_words.contains(w.as_str()));
+                if all_present { rank } else { rank * 2.0 + 6.0 }
+            };
             let big = rank_and_dedup(
                 &[filter(brave), filter(brave_news), filter(mwmbl), filter(britannica), filter(apnews)],
                 &mut seen,
                 |r, rank| {
+                    let rank = relevance_penalty(r, rank);
                     if r.sources.iter().any(|s| news_sources.contains(&s.as_str())) {
                         rank * 2.0 + 6.0
                     } else {
@@ -821,7 +834,7 @@ async fn index(
             let smol = rank_and_dedup(
                 &[filter(reddit), filter(wiby), filter(marginalia), filter(searchmysite), filter(smallweb)],
                 &mut seen,
-                |_, rank| rank,
+                |r, rank| relevance_penalty(r, rank),
             );
 
             let total = smol.len() + big.len();
