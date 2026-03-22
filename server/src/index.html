@@ -88,7 +88,7 @@
             width: 100%;
             padding: 0 1rem 3rem;
             display: grid;
-            grid-template-columns: repeat(2, minmax(0, calc(50vw - 1rem)));
+            grid-template-columns: minmax(0, 1fr) minmax(0, 2fr);
             gap: 1.5rem;
             align-items: start;
         }
@@ -97,6 +97,17 @@
             display: flex;
             flex-direction: column;
             gap: 1rem;
+        }
+
+        .column-big {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+            gap: 1rem;
+            align-items: start;
+        }
+
+        .column-big .column-label {
+            grid-column: 1 / -1;
         }
 
         .column-label {
@@ -200,6 +211,7 @@
 
         @media (max-width: 900px) {
             #results { grid-template-columns: 1fr; }
+            .column-big { grid-template-columns: 1fr; }
         }
     </style>
 </head>
@@ -270,7 +282,7 @@
                     <div class="column-label">Smol</div>
                     ${renderColumn(data.smol)}
                 </div>
-                <div class="column">
+                <div class="column column-big">
                     <div class="column-label">Big</div>
                     ${renderColumn(data.big)}
                 </div>
