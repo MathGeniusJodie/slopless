@@ -65,7 +65,7 @@ struct SearchResult {
     title: String,
     url: String,
     description: String,
-    source: String,
+    sources: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     image: Option<String>,
 }
@@ -109,7 +109,7 @@ async fn fetch_wiby(client: &Client, query: &str) -> Vec<SearchResult> {
                         title: r.title?,
                         url: r.url?,
                         description: r.snippet.unwrap_or_default(),
-                        source: "wiby".to_string(),
+                        sources: vec!["wiby".to_string()],
                         image: None,
                     })
                 })
@@ -255,7 +255,7 @@ fn parse_brave(html: &str) -> Vec<SearchResult> {
                 title: title.trim().to_string(),
                 url: href,
                 description: description.trim().to_string(),
-                source: "brave".to_string(),
+                sources: vec!["brave".to_string()],
                 image,
             })
         })
@@ -281,7 +281,7 @@ async fn fetch_marginalia(client: &Client, query: &str) -> Vec<SearchResult> {
                     title: r.title,
                     url: r.url,
                     description: r.description.unwrap_or_default(),
-                    source: "marginalia".to_string(),
+                    sources: vec!["marginalia".to_string()],
                     image: None,
                 })
                 .collect();
@@ -348,7 +348,7 @@ fn parse_mwmbl(html: &str) -> Vec<SearchResult> {
             title,
             url,
             description,
-            source: "mwmbl".to_string(),
+            sources: vec!["mwmbl".to_string()],
             image: None,
         })
         .collect()
@@ -401,7 +401,7 @@ fn parse_searchmysite(html: &str) -> Vec<SearchResult> {
                 title: title.trim().to_string(),
                 url: href,
                 description: description.split_whitespace().collect::<Vec<_>>().join(" "),
-                source: "searchmysite".to_string(),
+                sources: vec!["searchmysite".to_string()],
                 image: None,
             })
         })
@@ -455,7 +455,7 @@ fn parse_britannica(html: &str) -> Vec<SearchResult> {
                 title: title.trim().to_string(),
                 url: format!("https://www.britannica.com{href}"),
                 description: description.split_whitespace().collect::<Vec<_>>().join(" "),
-                source: "britannica".to_string(),
+                sources: vec!["britannica".to_string()],
                 image: None,
             })
         })
@@ -516,7 +516,7 @@ async fn fetch_reddit(client: &Client, query: &str) -> Vec<SearchResult> {
                                 title: post.data.title,
                                 url: format!("https://old.reddit.com{}", post.data.permalink),
                                 description: post.data.selftext.unwrap_or_default(),
-                                source: "reddit".to_string(),
+                                sources: vec!["reddit".to_string()],
                                 image,
                             }
                         })
@@ -551,8 +551,15 @@ fn rank_and_dedup(sources: &[Vec<SearchResult>], seen: &mut HashSet<String>) -> 
                 continue;
             }
             let rank = (i + 1) as f64;
+            let new_source = result.sources[0].clone();
             entries.entry(key)
-                .and_modify(|(_, total, count)| { *total += rank; *count += 1; })
+                .and_modify(|(r, total, count)| {
+                    *total += rank;
+                    *count += 1;
+                    if !r.sources.contains(&new_source) {
+                        r.sources.push(new_source.clone());
+                    }
+                })
                 .or_insert_with(|| (result.clone(), rank, 1));
         }
     }
@@ -575,7 +582,7 @@ fn html_escape(s: &str) -> String {
 }
 
 fn render_result(r: &SearchResult) -> String {
-    let img_class = if r.source == "brave" { "result-img result-img-square" } else { "result-img" };
+    let img_class = if r.sources.contains(&"brave".to_string()) { "result-img result-img-square" } else { "result-img" };
     let img_html = match &r.image {
         Some(src) => format!(
             "<img class=\"{img_class}\" src=\"{}\" alt=\"\" loading=\"lazy\" referrerpolicy=\"no-referrer\">",
@@ -583,15 +590,18 @@ fn render_result(r: &SearchResult) -> String {
         ),
         None => String::new(),
     };
+    let sources_html: String = r.sources.iter()
+        .map(|s| format!("<span class=\"source-{}\">{}</span>", html_escape(s), html_escape(s)))
+        .collect::<Vec<_>>()
+        .join(" ");
     format!(
         "<div class=\"result\">\
 {img}\
-<div class=\"result-source source-{source}\">{source}</div>\
+<div class=\"result-source\">{sources_html}</div>\
 <div class=\"result-title\"><a href=\"{url}\">{title}</a></div>\
 <div class=\"result-url\">{url_text}</div>\
 <div class=\"result-desc\">{desc}</div>\
 </div>",
-        source = html_escape(&r.source),
         url = html_escape(&r.url),
         title = html_escape(&r.title),
         url_text = html_escape(&r.url),
