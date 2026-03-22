@@ -22,6 +22,8 @@ struct SearchResult {
     url: String,
     description: String,
     source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -70,6 +72,7 @@ async fn fetch_wiby(client: &Client, query: &str) -> Vec<SearchResult> {
                     url: r.url?,
                     description: r.snippet.unwrap_or_default(),
                     source: "wiby".to_string(),
+                    image: None,
                 })
             })
             .collect(),
@@ -140,6 +143,7 @@ fn parse_brave(html: &str) -> Vec<SearchResult> {
                 url: href,
                 description: description.trim().to_string(),
                 source: "brave".to_string(),
+                image: None,
             })
         })
         .collect()
@@ -164,6 +168,7 @@ async fn fetch_marginalia(client: &Client, query: &str) -> Vec<SearchResult> {
                 url: r.url,
                 description: r.description.unwrap_or_default(),
                 source: "marginalia".to_string(),
+                image: None,
             })
             .collect(),
         Err(e) => {
@@ -223,6 +228,7 @@ fn parse_mwmbl(html: &str) -> Vec<SearchResult> {
             url,
             description,
             source: "mwmbl".to_string(),
+            image: None,
         })
         .collect()
 }
@@ -271,6 +277,7 @@ fn parse_searchmysite(html: &str) -> Vec<SearchResult> {
                 url: href,
                 description: description.split_whitespace().collect::<Vec<_>>().join(" "),
                 source: "searchmysite".to_string(),
+                image: None,
             })
         })
         .collect()
@@ -320,6 +327,7 @@ fn parse_britannica(html: &str) -> Vec<SearchResult> {
                 url: format!("https://www.britannica.com{href}"),
                 description: description.split_whitespace().collect::<Vec<_>>().join(" "),
                 source: "britannica".to_string(),
+                image: None,
             })
         })
         .collect()
@@ -346,6 +354,7 @@ struct RedditPostData {
     title: String,
     permalink: String,
     selftext: Option<String>,
+    thumbnail: Option<String>,
 }
 
 async fn fetch_reddit(client: &Client, query: &str) -> Vec<SearchResult> {
@@ -369,11 +378,15 @@ async fn fetch_reddit(client: &Client, query: &str) -> Vec<SearchResult> {
                     .data
                     .children
                     .into_iter()
-                    .map(|post| SearchResult {
-                        title: post.data.title,
-                        url: format!("https://old.reddit.com{}", post.data.permalink),
-                        description: post.data.selftext.unwrap_or_default(),
-                        source: "reddit".to_string(),
+                    .map(|post| {
+                        let image = post.data.thumbnail.filter(|t| t.starts_with("http"));
+                        SearchResult {
+                            title: post.data.title,
+                            url: format!("https://old.reddit.com{}", post.data.permalink),
+                            description: post.data.selftext.unwrap_or_default(),
+                            source: "reddit".to_string(),
+                            image,
+                        }
                     })
                     .collect(),
                 Err(e) => {

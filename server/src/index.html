@@ -116,6 +116,7 @@
             border-radius: 8px;
             padding: 1rem 1.2rem;
             transition: border-color 0.15s;
+            overflow: hidden;
         }
 
         .result:hover {
@@ -160,6 +161,15 @@
             overflow: hidden;
             text-overflow: ellipsis;
             white-space: nowrap;
+        }
+
+        .result-img {
+            float: right;
+            width: 140px;
+            height: 78px;
+            object-fit: cover;
+            border-radius: 4px;
+            margin-left: 0.6rem;
         }
 
         .result-desc {
@@ -222,6 +232,7 @@
         return items.map(r => `
             <div class="result">
                 <div class="result-source source-${r.source}">${r.source}</div>
+                ${r.image ? `<img class="result-img" src="${esc(r.image)}" alt="" loading="lazy">` : ''}
                 <div class="result-title"><a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.title)}</a></div>
                 <div class="result-url">${esc(r.url)}</div>
                 ${r.description ? `<div class="result-desc">${esc(r.description)}</div>` : ''}
