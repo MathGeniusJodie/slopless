@@ -11,9 +11,17 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
+#[derive(Clone)]
+struct FeedEntry {
+    title: String,
+    url: String,
+    summary: String,
+}
+
 struct AppState {
     client: Client,
     blocked: HashSet<String>,
+    feed_cache: tokio::sync::Mutex<Option<(Vec<FeedEntry>, std::time::Instant)>>,
 }
 
 fn load_blocklist(paths: &[&str]) -> HashSet<String> {
@@ -574,6 +582,111 @@ fn rank_and_dedup(sources: &[Vec<SearchResult>], seen: &mut HashSet<String>) -> 
     sorted.into_iter().map(|(key, result, _)| { seen.insert(key); result }).collect()
 }
 
+fn strip_html(html: &str) -> String {
+    let doc = ScraperHtml::parse_fragment(html);
+    doc.root_element()
+        .text()
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn parse_atom_feed(xml: &str) -> Vec<FeedEntry> {
+    let doc = match roxmltree::Document::parse(xml) {
+        Ok(d) => d,
+        Err(e) => { eprintln!("smallweb: XML parse error: {e}"); return vec![]; }
+    };
+    doc.descendants()
+        .filter(|n| n.tag_name().name() == "entry")
+        .filter_map(|entry| {
+            let title = entry.descendants()
+                .find(|n| n.tag_name().name() == "title")
+                .and_then(|n| n.text())
+                .unwrap_or("").trim().to_string();
+            let url = entry.descendants()
+                .find(|n| n.tag_name().name() == "link")
+                .and_then(|n| n.attribute("href"))
+                .unwrap_or("").to_string();
+            if url.is_empty() { return None; }
+            let summary_html = entry.descendants()
+                .find(|n| n.tag_name().name() == "summary" || n.tag_name().name() == "content")
+                .and_then(|n| n.text())
+                .unwrap_or("").to_string();
+            let summary = strip_html(&summary_html);
+            Some(FeedEntry { title, url, summary })
+        })
+        .collect()
+}
+
+fn search_feed(entries: &[FeedEntry], query: &str) -> Vec<SearchResult> {
+    let words: Vec<String> = query.split_whitespace().map(|w| w.to_lowercase()).collect();
+    if words.is_empty() { return vec![]; }
+    let mut scored: Vec<(usize, &FeedEntry)> = entries.iter()
+        .filter_map(|entry| {
+            let text = format!("{} {}", entry.title, entry.summary).to_lowercase();
+            let text_words: HashSet<&str> = text
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|w| !w.is_empty())
+                .collect();
+            let score = words.iter().filter(|w| text_words.contains(w.as_str())).count();
+            if score > 0 { Some((score, entry)) } else { None }
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.into_iter()
+        .map(|(_, e)| SearchResult {
+            title: e.title.clone(),
+            url: e.url.clone(),
+            description: e.summary.clone(),
+            sources: vec!["smallweb news".to_string()],
+            image: None,
+        })
+        .collect()
+}
+
+async fn fetch_smallweb(state: &AppState, query: &str) -> Vec<SearchResult> {
+    use std::time::{Duration, Instant};
+    // Return cached entries if fresh
+    {
+        let cache = state.feed_cache.lock().await;
+        if let Some((entries, cached_at)) = &*cache {
+            if cached_at.elapsed() < Duration::from_secs(3600) {
+                let results = search_feed(entries, query);
+                eprintln!("smallweb: {} results (cached)", results.len());
+                return results;
+            }
+        }
+    }
+    // Fetch fresh feed
+    let fresh = match state.client
+        .get("https://kagi.com/api/v1/smallweb/feed/")
+        .header("User-Agent", "slopless-search/1.0")
+        .send()
+        .await
+    {
+        Ok(resp) => match resp.text().await {
+            Ok(xml) => {
+                let entries = parse_atom_feed(&xml);
+                eprintln!("smallweb: fetched {} feed entries", entries.len());
+                Some(entries)
+            }
+            Err(e) => { eprintln!("smallweb: read error: {e}"); None }
+        },
+        Err(e) => { eprintln!("smallweb: request failed: {e}"); None }
+    };
+    let mut cache = state.feed_cache.lock().await;
+    let entries = if let Some(entries) = fresh {
+        *cache = Some((entries.clone(), Instant::now()));
+        entries
+    } else {
+        cache.as_ref().map(|(e, _)| e.clone()).unwrap_or_default()
+    };
+    let results = search_feed(&entries, query);
+    eprintln!("smallweb: {} results", results.len());
+    results
+}
+
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
      .replace('<', "&lt;")
@@ -591,7 +704,7 @@ fn render_result(r: &SearchResult) -> String {
         None => String::new(),
     };
     let sources_html: String = r.sources.iter()
-        .map(|s| format!("<span class=\"source-{}\">{}</span>", html_escape(s), html_escape(s)))
+        .map(|s| format!("<span class=\"source-{}\">{}</span>", html_escape(&s.replace(' ', "-")), html_escape(s)))
         .collect::<Vec<_>>()
         .join(" ");
     format!(
@@ -621,7 +734,7 @@ async fn index(
     let (status, results_html) = match query.as_deref() {
         None => (String::new(), String::new()),
         Some(q) => {
-            let (wiby, brave, marginalia, mwmbl, searchmysite, britannica, reddit) = tokio::join!(
+            let (wiby, brave, marginalia, mwmbl, searchmysite, britannica, reddit, smallweb) = tokio::join!(
                 fetch_wiby(&state.client, q),
                 fetch_brave(&state.client, q),
                 fetch_marginalia(&state.client, q),
@@ -629,6 +742,7 @@ async fn index(
                 fetch_searchmysite(&state.client, q),
                 fetch_britannica(&state.client, q),
                 fetch_reddit(&state.client, q),
+                fetch_smallweb(&state, q),
             );
 
             let filter = |mut results: Vec<SearchResult>| -> Vec<SearchResult> {
@@ -638,7 +752,7 @@ async fn index(
 
             let mut seen = HashSet::new();
             let big = rank_and_dedup(&[filter(reddit), filter(brave), filter(mwmbl)], &mut seen);
-            let smol = rank_and_dedup(&[filter(wiby), filter(marginalia), filter(searchmysite), filter(britannica)], &mut seen);
+            let smol = rank_and_dedup(&[filter(wiby), filter(marginalia), filter(searchmysite), filter(britannica), filter(smallweb)], &mut seen);
 
             let total = smol.len() + big.len();
             let images_url = format!("https://search.brave.com/images?q={}", urlencoding::encode(q));
@@ -681,7 +795,7 @@ async fn main() {
     ]);
     eprintln!("blocklist: {} domains total", blocked.len());
 
-    let state = Arc::new(AppState { client, blocked });
+    let state = Arc::new(AppState { client, blocked, feed_cache: tokio::sync::Mutex::new(None) });
 
     let app = Router::new()
         .route("/", get(index))
