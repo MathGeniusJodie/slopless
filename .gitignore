@@ -3,3 +3,4 @@ get_domains/*.txt
 crawler/search_db/*
 crawler/perf.data
 crawler/perf.data.old
+server/target/

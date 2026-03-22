@@ -99,7 +99,7 @@
         .btn-reddit {
             background: oklch(50% 0.3 90);
         }
-        .btn-chatgpt{
+	.btn-brave{
             background: oklch(50% 0.3 135);
         }
 
@@ -121,10 +121,11 @@
     <h1>SlopLess 0.0</h1>
     <div class="button-grid">
         <!-- Search Engines -->
-        <button class="search-btn btn-mwmbl" onclick="go('https://mwmbl.org/?q=canada')">Mwmbl</button>
+        <button class="search-btn btn-brave" onclick="go('https://search.brave.com/search?q=')">Brave</button>
         <button class="search-btn btn-wiby" onclick="go('https://wiby.me/?q=')">Wiby</button>
+        <button class="search-btn btn-mwmbl" onclick="go('https://mwmbl.org/?q=canada')">Mwmbl</button>
         <button class="search-btn btn-marginalia" onclick="go('https://search.marginalia.nu/search?query=')">Marginalia</button>
-        <button class="search-btn btn-duck" onclick="go('https://duckduckgo.com/?q=')">DuckDuckGo</button>
+        <!--<button class="search-btn btn-duck" onclick="go('https://duckduckgo.com/?q=')">DuckDuckGo</button>-->
         <button class="search-btn btn-sms" onclick="go('https://searchmysite.net/search/?q=')">SearchMySite</button>
 
         <!-- Reference -->
@@ -135,7 +136,6 @@
         <!-- Academic/Social -->
         <button class="search-btn btn-arxiv" onclick="go('https://arxiv.org/search/?searchtype=all&source=header&query=')">ArXiv</button>
         <button class="search-btn btn-reddit" onclick="go('https://old.reddit.com/search?q=')">Reddit</button>
-        <button class="search-btn btn-chatgpt" onclick="go('https://chat.openai.com/?hints=search&prompt=')">ChatGPT</button>
     </div>
     <input type="text" id="query" placeholder="Enter search term..." autofocus>
 </div>
