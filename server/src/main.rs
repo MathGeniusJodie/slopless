@@ -132,23 +132,7 @@ async fn fetch_wiby(client: &Client, query: &str) -> Vec<SearchResult> {
     }
 }
 
-async fn fetch_brave(client: &Client, query: &str) -> Vec<SearchResult> {
-    let url = format!(
-        "https://search.brave.com/search?q={}",
-        urlencoding::encode(query)
-    );
-
-    // Attempt 1: emulate Firefox as closely as possible with headers
-    if let Some(results) = fetch_brave_http(client, &url).await {
-        return results;
-    }
-
-    // Attempt 2: headless browser (real TLS fingerprint, handles JS challenges)
-    eprintln!("brave: HTTP failed, trying headless browser");
-    fetch_brave_headless(&url).await
-}
-
-async fn fetch_brave_http(client: &Client, url: &str) -> Option<Vec<SearchResult>> {
+async fn fetch_brave_http_raw(client: &Client, url: &str) -> Option<String> {
     let resp = client
         .get(url)
         .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0")
@@ -164,20 +148,15 @@ async fn fetch_brave_http(client: &Client, url: &str) -> Option<Vec<SearchResult
         .send()
         .await
         .ok()?;
-
     let status = resp.status();
     if !status.is_success() {
         eprintln!("brave: HTTP status {status}");
         return None;
     }
-
-    let html = resp.text().await.ok()?;
-    let results = parse_brave(&html);
-    eprintln!("brave: {} results (HTTP)", results.len());
-    if results.is_empty() { None } else { Some(results) }
+    resp.text().await.ok()
 }
 
-async fn fetch_brave_headless(url: &str) -> Vec<SearchResult> {
+async fn fetch_brave_headless_raw(url: &str) -> Option<String> {
     use tokio::process::Command;
     use tokio::time::{timeout, Duration};
     use std::process::Stdio;
@@ -192,41 +171,41 @@ async fn fetch_brave_headless(url: &str) -> Vec<SearchResult> {
 
     for (bin, args) in &browsers {
         let mut cmd = Command::new(bin);
-        cmd.args(args)
-            .arg("--dump-dom")
-            .arg(url)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-
-        let child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
+        cmd.args(args).arg("--dump-dom").arg(url)
+            .stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
+        let child = match cmd.spawn() { Ok(c) => c, Err(_) => continue };
         match timeout(Duration::from_secs(25), child.wait_with_output()).await {
             Ok(Ok(out)) if !out.stdout.is_empty() => {
-                let html = String::from_utf8_lossy(&out.stdout);
-                let results = parse_brave(&html);
-                eprintln!("brave: {} results (headless {bin})", results.len());
-                if !results.is_empty() {
-                    return results;
-                }
-                eprintln!("brave: headless {bin} returned empty DOM");
+                return Some(String::from_utf8_lossy(&out.stdout).into_owned());
             }
             Ok(Ok(_)) => eprintln!("brave: headless {bin} produced no output"),
             Ok(Err(e)) => eprintln!("brave: headless {bin} error: {e}"),
             Err(_) => eprintln!("brave: headless {bin} timed out"),
         }
     }
-
-    eprintln!("brave: all attempts failed, 0 results");
-    vec![]
+    None
 }
 
-fn parse_brave(html: &str) -> Vec<SearchResult> {
+async fn fetch_brave(client: &Client, query: &str) -> Vec<SearchResult> {
+    let url = format!("https://search.brave.com/search?q={}", urlencoding::encode(query));
+    let html = match fetch_brave_http_raw(client, &url).await {
+        Some(h) => h,
+        None => {
+            eprintln!("brave: HTTP failed, trying headless");
+            match fetch_brave_headless_raw(&url).await {
+                Some(h) => h,
+                None => { eprintln!("brave: all attempts failed"); return vec![]; }
+            }
+        }
+    };
+    let results = parse_brave(&html);
+    eprintln!("brave: {} results", results.len());
+    results
+}
+
+fn parse_brave_typed(html: &str, data_type: &str, source_name: &str) -> Vec<SearchResult> {
     let doc = ScraperHtml::parse_document(html);
-    let sel_snippet = Selector::parse("div.snippet[data-type='web']").unwrap();
+    let sel_snippet = Selector::parse(&format!("div.snippet[data-type='{data_type}']")).unwrap();
     let sel_link = Selector::parse("a.l1").unwrap();
     let sel_title = Selector::parse("div.title").unwrap();
     let sel_desc = Selector::parse("div.generic-snippet div.content").unwrap();
@@ -234,28 +213,13 @@ fn parse_brave(html: &str) -> Vec<SearchResult> {
 
     doc.select(&sel_snippet)
         .filter_map(|snippet| {
-            let href = snippet
-                .select(&sel_link)
-                .next()
-                .and_then(|a| a.value().attr("href"))
-                .unwrap_or("")
-                .to_string();
-            if href.is_empty() {
-                return None;
-            }
-            let title = snippet
-                .select(&sel_title)
-                .next()?
-                .text()
-                .collect::<String>();
-            let description = snippet
-                .select(&sel_desc)
-                .next()
-                .map(|d| d.text().collect::<String>())
-                .unwrap_or_default();
-            let image = snippet
-                .select(&sel_img)
-                .next()
+            let href = snippet.select(&sel_link).next()
+                .and_then(|a| a.value().attr("href")).unwrap_or("").to_string();
+            if href.is_empty() { return None; }
+            let title = snippet.select(&sel_title).next()?.text().collect::<String>();
+            let description = snippet.select(&sel_desc).next()
+                .map(|d| d.text().collect::<String>()).unwrap_or_default();
+            let image = snippet.select(&sel_img).next()
                 .and_then(|img| img.value().attr("src"))
                 .filter(|src| src.starts_with("http"))
                 .map(|s| s.to_string());
@@ -263,11 +227,32 @@ fn parse_brave(html: &str) -> Vec<SearchResult> {
                 title: title.trim().to_string(),
                 url: href,
                 description: description.trim().to_string(),
-                sources: vec!["brave".to_string()],
+                sources: vec![source_name.to_string()],
                 image,
             })
         })
         .collect()
+}
+
+fn parse_brave(html: &str) -> Vec<SearchResult> {
+    parse_brave_typed(html, "web", "brave")
+}
+
+async fn fetch_brave_news(client: &Client, query: &str) -> Vec<SearchResult> {
+    let url = format!("https://search.brave.com/news?q={}", urlencoding::encode(query));
+    let html = match fetch_brave_http_raw(client, &url).await {
+        Some(h) => h,
+        None => {
+            eprintln!("brave news: HTTP failed, trying headless");
+            match fetch_brave_headless_raw(&url).await {
+                Some(h) => h,
+                None => { eprintln!("brave news: all attempts failed"); return vec![]; }
+            }
+        }
+    };
+    let results = parse_brave_typed(&html, "news", "brave news");
+    eprintln!("brave news: {} results", results.len());
+    results
 }
 
 async fn fetch_marginalia(client: &Client, query: &str) -> Vec<SearchResult> {
@@ -549,7 +534,11 @@ fn reddit_normalize(url: &str) -> String {
     url.replace("old.reddit.com", "www.reddit.com")
 }
 
-fn rank_and_dedup(sources: &[Vec<SearchResult>], seen: &mut HashSet<String>) -> Vec<SearchResult> {
+fn rank_and_dedup(
+    sources: &[Vec<SearchResult>],
+    seen: &mut HashSet<String>,
+    rank_adjust: impl Fn(&SearchResult, f64) -> f64,
+) -> Vec<SearchResult> {
     // For each URL, accumulate sum of 1-based ranks and count across all sources
     let mut entries: HashMap<String, (SearchResult, f64, usize)> = HashMap::new();
     for source in sources {
@@ -558,7 +547,7 @@ fn rank_and_dedup(sources: &[Vec<SearchResult>], seen: &mut HashSet<String>) -> 
             if seen.contains(&key) {
                 continue;
             }
-            let rank = (i + 1) as f64;
+            let rank = rank_adjust(result, (i + 1) as f64);
             let new_source = result.sources[0].clone();
             entries.entry(key)
                 .and_modify(|(r, total, count)| {
@@ -580,6 +569,70 @@ fn rank_and_dedup(sources: &[Vec<SearchResult>], seen: &mut HashSet<String>) -> 
     sorted.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
 
     sorted.into_iter().map(|(key, result, _)| { seen.insert(key); result }).collect()
+}
+
+async fn fetch_apnews(client: &Client, query: &str) -> Vec<SearchResult> {
+    let url = format!("https://apnews.com/search?q={}", urlencoding::encode(query));
+    let Ok(resp) = client
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0")
+        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+        .send()
+        .await
+    else {
+        eprintln!("apnews: request failed");
+        return vec![];
+    };
+    match resp.text().await {
+        Ok(html) => {
+            let out = parse_apnews(&html);
+            eprintln!("apnews: {} results", out.len());
+            out
+        }
+        Err(e) => { eprintln!("apnews: read error: {e}"); vec![] }
+    }
+}
+
+fn parse_apnews(html: &str) -> Vec<SearchResult> {
+    let doc = ScraperHtml::parse_document(html);
+    let sel_result = Selector::parse("div.PagePromo").unwrap();
+    let sel_title_link = Selector::parse("div.PagePromo-title a.Link").unwrap();
+    let sel_title_text = Selector::parse("div.PagePromo-title span.PagePromoContentIcons-text").unwrap();
+    let sel_desc = Selector::parse("div.PagePromo-description span.PagePromoContentIcons-text").unwrap();
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let one_month_ago = now_secs.saturating_sub(7 * 24 * 3600);
+
+    doc.select(&sel_result)
+        .filter_map(|result| {
+            let ts_secs = result.value()
+                .attr("data-posted-date-timestamp")
+                .and_then(|t| t.parse::<u64>().ok())
+                .map(|ms| ms / 1000)
+                .unwrap_or(0);
+            if ts_secs < one_month_ago {
+                return None;
+            }
+            let url = result.select(&sel_title_link).next()
+                .and_then(|a| a.value().attr("href"))?.to_string();
+            let title = result.select(&sel_title_text).next()
+                .map(|el| el.text().collect::<String>())
+                .unwrap_or_default();
+            let description = result.select(&sel_desc).next()
+                .map(|el| el.text().collect::<String>())
+                .unwrap_or_default();
+            Some(SearchResult {
+                title: title.trim().to_string(),
+                url,
+                description: description.trim().to_string(),
+                sources: vec!["apnews".to_string()],
+                image: None,
+            })
+        })
+        .collect()
 }
 
 fn strip_html(html: &str) -> String {
@@ -734,15 +787,17 @@ async fn index(
     let (status, results_html) = match query.as_deref() {
         None => (String::new(), String::new()),
         Some(q) => {
-            let (wiby, brave, marginalia, mwmbl, searchmysite, britannica, reddit, smallweb) = tokio::join!(
+            let (wiby, brave, brave_news, marginalia, mwmbl, searchmysite, britannica, reddit, smallweb, apnews) = tokio::join!(
                 fetch_wiby(&state.client, q),
                 fetch_brave(&state.client, q),
+                fetch_brave_news(&state.client, q),
                 fetch_marginalia(&state.client, q),
                 fetch_mwmbl(&state.client, q),
                 fetch_searchmysite(&state.client, q),
                 fetch_britannica(&state.client, q),
                 fetch_reddit(&state.client, q),
                 fetch_smallweb(&state, q),
+                fetch_apnews(&state.client, q),
             );
 
             let filter = |mut results: Vec<SearchResult>| -> Vec<SearchResult> {
@@ -751,8 +806,23 @@ async fn index(
             };
 
             let mut seen = HashSet::new();
-            let big = rank_and_dedup(&[filter(reddit), filter(brave), filter(mwmbl)], &mut seen);
-            let smol = rank_and_dedup(&[filter(wiby), filter(marginalia), filter(searchmysite), filter(britannica), filter(smallweb)], &mut seen);
+            let news_sources = ["apnews", "brave news"];
+            let big = rank_and_dedup(
+                &[filter(brave), filter(brave_news), filter(mwmbl), filter(britannica), filter(apnews)],
+                &mut seen,
+                |r, rank| {
+                    if r.sources.iter().any(|s| news_sources.contains(&s.as_str())) {
+                        rank * 2.0 + 6.0
+                    } else {
+                        rank
+                    }
+                },
+            );
+            let smol = rank_and_dedup(
+                &[filter(reddit), filter(wiby), filter(marginalia), filter(searchmysite), filter(smallweb)],
+                &mut seen,
+                |_, rank| rank,
+            );
 
             let total = smol.len() + big.len();
             let images_url = format!("https://search.brave.com/images?q={}", urlencoding::encode(q));
