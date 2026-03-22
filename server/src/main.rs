@@ -7,7 +7,7 @@ use axum::{
 use reqwest::Client;
 use scraper::{Html as ScraperHtml, Selector};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
@@ -541,19 +541,30 @@ fn reddit_normalize(url: &str) -> String {
     url.replace("old.reddit.com", "www.reddit.com")
 }
 
-fn interleave(sources: &[Vec<SearchResult>], seen: &mut HashSet<String>) -> Vec<SearchResult> {
-    let max_len = sources.iter().map(|s| s.len()).max().unwrap_or(0);
-    let mut out = Vec::new();
-    for i in 0..max_len {
-        for source in sources {
-            if let Some(r) = source.get(i) {
-                if seen.insert(reddit_normalize(&r.url)) {
-                    out.push(r.clone());
-                }
+fn rank_and_dedup(sources: &[Vec<SearchResult>], seen: &mut HashSet<String>) -> Vec<SearchResult> {
+    // For each URL, accumulate sum of 1-based ranks and count across all sources
+    let mut entries: HashMap<String, (SearchResult, f64, usize)> = HashMap::new();
+    for source in sources {
+        for (i, result) in source.iter().enumerate() {
+            let key = reddit_normalize(&result.url);
+            if seen.contains(&key) {
+                continue;
             }
+            let rank = (i + 1) as f64;
+            entries.entry(key)
+                .and_modify(|(_, total, count)| { *total += rank; *count += 1; })
+                .or_insert_with(|| (result.clone(), rank, 1));
         }
     }
-    out
+
+    // Sort by average rank ascending (lower = better)
+    let mut sorted: Vec<(String, SearchResult, f64)> = entries
+        .into_iter()
+        .map(|(key, (result, total, count))| (key, result, total / count as f64))
+        .collect();
+    sorted.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+
+    sorted.into_iter().map(|(key, result, _)| { seen.insert(key); result }).collect()
 }
 
 fn html_escape(s: &str) -> String {
@@ -616,8 +627,8 @@ async fn index(
             };
 
             let mut seen = HashSet::new();
-            let big = interleave(&[filter(reddit), filter(brave), filter(mwmbl)], &mut seen);
-            let smol = interleave(&[filter(wiby), filter(marginalia), filter(searchmysite), filter(britannica)], &mut seen);
+            let big = rank_and_dedup(&[filter(reddit), filter(brave), filter(mwmbl)], &mut seen);
+            let smol = rank_and_dedup(&[filter(wiby), filter(marginalia), filter(searchmysite), filter(britannica)], &mut seen);
 
             let total = smol.len() + big.len();
             let images_url = format!("https://search.brave.com/images?q={}", urlencoding::encode(q));
