@@ -91,31 +91,91 @@ async fn fetch_brave(client: &Client, query: &str) -> Vec<SearchResult> {
         "https://search.brave.com/search?q={}",
         urlencoding::encode(query)
     );
-    let Ok(resp) = client
-        .get(&url)
-        .header(
-            "User-Agent",
-            "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
-        )
+
+    // Attempt 1: emulate Firefox as closely as possible with headers
+    if let Some(results) = fetch_brave_http(client, &url).await {
+        return results;
+    }
+
+    // Attempt 2: headless browser (real TLS fingerprint, handles JS challenges)
+    eprintln!("brave: HTTP failed, trying headless browser");
+    fetch_brave_headless(&url).await
+}
+
+async fn fetch_brave_http(client: &Client, url: &str) -> Option<Vec<SearchResult>> {
+    let resp = client
+        .get(url)
+        .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0")
+        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
         .header("Accept-Language", "en-US,en;q=0.5")
+        .header("Upgrade-Insecure-Requests", "1")
+        .header("Sec-Fetch-Dest", "document")
+        .header("Sec-Fetch-Mode", "navigate")
+        .header("Sec-Fetch-Site", "none")
+        .header("Sec-Fetch-User", "?1")
+        .header("DNT", "1")
+        .header("Cache-Control", "max-age=0")
         .send()
         .await
-    else {
-        eprintln!("brave: request failed");
-        return vec![];
-    };
-    let resp_status = resp.status();
-    match resp.text().await {
-        Ok(html) => {
-            let out = parse_brave(&html);
-            eprintln!("brave: {} results (status {})", out.len(), resp_status);
-            out
-        }
-        Err(e) => {
-            eprintln!("brave: read error: {e}");
-            vec![]
+        .ok()?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        eprintln!("brave: HTTP status {status}");
+        return None;
+    }
+
+    let html = resp.text().await.ok()?;
+    let results = parse_brave(&html);
+    eprintln!("brave: {} results (HTTP)", results.len());
+    if results.is_empty() { None } else { Some(results) }
+}
+
+async fn fetch_brave_headless(url: &str) -> Vec<SearchResult> {
+    use tokio::process::Command;
+    use tokio::time::{timeout, Duration};
+    use std::process::Stdio;
+
+    let browsers = [
+        ("librewolf", vec!["--headless", "--no-remote", "--profile", "/tmp/slopless-brave-profile"]),
+        ("firefox",   vec!["--headless", "--no-remote", "--profile", "/tmp/slopless-brave-profile"]),
+        ("chromium",  vec!["--headless=new", "--disable-gpu", "--no-sandbox"]),
+        ("chromium-browser",   vec!["--headless=new", "--disable-gpu", "--no-sandbox"]),
+        ("google-chrome-stable", vec!["--headless=new", "--disable-gpu", "--no-sandbox"]),
+    ];
+
+    for (bin, args) in &browsers {
+        let mut cmd = Command::new(bin);
+        cmd.args(args)
+            .arg("--dump-dom")
+            .arg(url)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+
+        let child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        match timeout(Duration::from_secs(25), child.wait_with_output()).await {
+            Ok(Ok(out)) if !out.stdout.is_empty() => {
+                let html = String::from_utf8_lossy(&out.stdout);
+                let results = parse_brave(&html);
+                eprintln!("brave: {} results (headless {bin})", results.len());
+                if !results.is_empty() {
+                    return results;
+                }
+                eprintln!("brave: headless {bin} returned empty DOM");
+            }
+            Ok(Ok(_)) => eprintln!("brave: headless {bin} produced no output"),
+            Ok(Err(e)) => eprintln!("brave: headless {bin} error: {e}"),
+            Err(_) => eprintln!("brave: headless {bin} timed out"),
         }
     }
+
+    eprintln!("brave: all attempts failed, 0 results");
+    vec![]
 }
 
 fn parse_brave(html: &str) -> Vec<SearchResult> {
