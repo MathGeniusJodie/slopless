@@ -359,7 +359,7 @@ struct RedditPostData {
 
 async fn fetch_reddit(client: &Client, query: &str) -> Vec<SearchResult> {
     let url = format!(
-        "https://www.reddit.com/search.json?q={}&limit=25&type=link",
+        "https://www.reddit.com/search.json?q={}&limit=25",
         urlencoding::encode(query)
     );
     let Ok(resp) = client
