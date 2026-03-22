@@ -222,6 +222,7 @@ fn parse_brave(html: &str) -> Vec<SearchResult> {
     let sel_link = Selector::parse("a.l1").unwrap();
     let sel_title = Selector::parse("div.title").unwrap();
     let sel_desc = Selector::parse("div.generic-snippet div.content").unwrap();
+    let sel_img = Selector::parse("a.thumbnail img").unwrap();
 
     doc.select(&sel_snippet)
         .filter_map(|snippet| {
@@ -244,12 +245,18 @@ fn parse_brave(html: &str) -> Vec<SearchResult> {
                 .next()
                 .map(|d| d.text().collect::<String>())
                 .unwrap_or_default();
+            let image = snippet
+                .select(&sel_img)
+                .next()
+                .and_then(|img| img.value().attr("src"))
+                .filter(|src| src.starts_with("http"))
+                .map(|s| s.to_string());
             Some(SearchResult {
                 title: title.trim().to_string(),
                 url: href,
                 description: description.trim().to_string(),
                 source: "brave".to_string(),
-                image: None,
+                image,
             })
         })
         .collect()
@@ -557,9 +564,10 @@ fn html_escape(s: &str) -> String {
 }
 
 fn render_result(r: &SearchResult) -> String {
+    let img_class = if r.source == "brave" { "result-img result-img-square" } else { "result-img" };
     let img_html = match &r.image {
         Some(src) => format!(
-            "<img class=\"result-img\" src=\"{}\" alt=\"\" loading=\"lazy\" referrerpolicy=\"no-referrer\">",
+            "<img class=\"{img_class}\" src=\"{}\" alt=\"\" loading=\"lazy\" referrerpolicy=\"no-referrer\">",
             html_escape(src)
         ),
         None => String::new(),
