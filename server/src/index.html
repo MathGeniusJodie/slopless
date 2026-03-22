@@ -88,7 +88,7 @@
             width: 100%;
             padding: 0 1rem 3rem;
             display: grid;
-            grid-template-columns: repeat(3, minmax(0, calc(33.333vw - 1rem)));
+            grid-template-columns: repeat(2, minmax(0, calc(50vw - 1rem)));
             gap: 1.5rem;
             align-items: start;
         }
@@ -257,7 +257,7 @@
             if (!resp.ok) throw new Error('HTTP ' + resp.status);
             const data = await resp.json();
 
-            const total = data.smol.length + data.big.length + data.reddit.length;
+            const total = data.smol.length + data.big.length;
             if (total === 0) {
                 status.textContent = 'No results.';
                 results.innerHTML = '';
@@ -273,10 +273,6 @@
                 <div class="column">
                     <div class="column-label">Big</div>
                     ${renderColumn(data.big)}
-                </div>
-                <div class="column">
-                    <div class="column-label">Reddit</div>
-                    ${renderColumn(data.reddit)}
                 </div>
             `;
         } catch (err) {

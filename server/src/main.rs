@@ -30,7 +30,6 @@ struct SearchResult {
 struct SearchResponse {
     smol: Vec<SearchResult>,
     big: Vec<SearchResult>,
-    reddit: Vec<SearchResult>,
 }
 
 // Wiby JSON API response
@@ -402,13 +401,17 @@ async fn fetch_reddit(client: &Client, query: &str) -> Vec<SearchResult> {
     }
 }
 
+fn reddit_normalize(url: &str) -> String {
+    url.replace("old.reddit.com", "www.reddit.com")
+}
+
 fn interleave(sources: &[Vec<SearchResult>], seen: &mut HashSet<String>) -> Vec<SearchResult> {
     let max_len = sources.iter().map(|s| s.len()).max().unwrap_or(0);
     let mut out = Vec::new();
     for i in 0..max_len {
         for source in sources {
             if let Some(r) = source.get(i) {
-                if seen.insert(r.url.clone()) {
+                if seen.insert(reddit_normalize(&r.url)) {
                     out.push(r.clone());
                 }
             }
@@ -422,7 +425,7 @@ async fn search(
     State(client): State<Arc<Client>>,
 ) -> Json<SearchResponse> {
     let Some(query) = params.q.filter(|q| !q.is_empty()) else {
-        return Json(SearchResponse { smol: vec![], big: vec![], reddit: vec![] });
+        return Json(SearchResponse { smol: vec![], big: vec![] });
     };
 
     let (wiby, brave, marginalia, mwmbl, searchmysite, britannica, reddit) = tokio::join!(
@@ -435,18 +438,14 @@ async fn search(
         fetch_reddit(&client, &query),
     );
 
-    // Big column first (higher dedup priority): brave > mwmbl
+    // Big column: reddit first (priority), then brave, then mwmbl
     let mut seen = HashSet::new();
-    let big = interleave(&[brave, mwmbl], &mut seen);
+    let big = interleave(&[reddit, brave, mwmbl], &mut seen);
 
     // Smol column: wiby + marginalia + searchmysite + britannica, skip URLs already in big
     let smol = interleave(&[wiby, marginalia, searchmysite, britannica], &mut seen);
 
-    // Reddit is independent — dedup within itself only
-    let mut reddit_seen = HashSet::new();
-    let reddit = interleave(&[reddit], &mut reddit_seen);
-
-    Json(SearchResponse { smol, big, reddit })
+    Json(SearchResponse { smol, big })
 }
 
 const INDEX_HTML: &str = include_str!("index.html");
