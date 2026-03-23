@@ -530,8 +530,12 @@ async fn fetch_reddit(client: &Client, query: &str) -> Vec<SearchResult> {
     }
 }
 
-fn reddit_normalize(url: &str) -> String {
-    url.replace("old.reddit.com", "www.reddit.com")
+fn url_dedup_key(url: &str) -> String {
+    let url = url.replace("old.reddit.com", "www.reddit.com");
+    let url = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(&url).to_string();
+    let url = url.strip_prefix("www.").unwrap_or(&url).to_string();
+    url.trim_end_matches('/').to_lowercase()
 }
 
 fn rank_and_dedup(
@@ -543,7 +547,7 @@ fn rank_and_dedup(
     let mut entries: HashMap<String, (SearchResult, f64, usize)> = HashMap::new();
     for source in sources {
         for (i, result) in source.iter().enumerate() {
-            let key = reddit_normalize(&result.url);
+            let key = url_dedup_key(&result.url);
             if seen.contains(&key) {
                 continue;
             }
@@ -819,7 +823,14 @@ async fn index(
                     .all(|w| text_words.contains(w.as_str()));
                 if all_present { rank } else { rank * 2.0 + 6.0 }
             };
-            let big = rank_and_dedup(
+
+            // Pre-filter smol sources so we can augment big results with their source names
+            let smol_vecs = [
+                filter(reddit), filter(wiby), filter(marginalia),
+                filter(searchmysite), filter(smallweb),
+            ];
+
+            let mut big = rank_and_dedup(
                 &[filter(brave), filter(brave_news), filter(mwmbl), filter(britannica), filter(apnews)],
                 &mut seen,
                 |r, rank| {
@@ -831,8 +842,28 @@ async fn index(
                     }
                 },
             );
+
+            // For any smol result whose URL is already in big, add its source name to the big result
+            let big_key_to_idx: HashMap<String, usize> = big.iter().enumerate()
+                .map(|(i, r)| (url_dedup_key(&r.url), i))
+                .collect();
+            for source_vec in &smol_vecs {
+                for result in source_vec {
+                    let key = url_dedup_key(&result.url);
+                    if let Some(&idx) = big_key_to_idx.get(&key) {
+                        let new_src = &result.sources[0];
+                        if !big[idx].sources.contains(new_src) {
+                            big[idx].sources.push(new_src.clone());
+                        }
+                        if new_src == "reddit" {
+                            big[idx].url = result.url.clone();
+                        }
+                    }
+                }
+            }
+
             let smol = rank_and_dedup(
-                &[filter(reddit), filter(wiby), filter(marginalia), filter(searchmysite), filter(smallweb)],
+                &smol_vecs,
                 &mut seen,
                 |r, rank| relevance_penalty(r, rank),
             );
