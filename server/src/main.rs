@@ -845,11 +845,15 @@ async fn index(
             );
 
             let smol_html: String = smol.iter().map(render_result).collect();
-            let big_html: String = big.iter().map(render_result).collect();
+            let big_col1: String = big.iter().step_by(2).map(render_result).collect();
+            let big_col2: String = big.iter().skip(1).step_by(2).map(render_result).collect();
             let results_html = format!(
                 "<div id=\"results\">\
 <div class=\"column\"><div class=\"column-label\">Discovery</div>{smol_html}</div>\
-<div class=\"column-big\"><div class=\"column-label\">Web</div>{big_html}</div>\
+<div class=\"column-big\"><div class=\"column-label\">Web</div>\
+<div class=\"column\">{big_col1}</div>\
+<div class=\"column\">{big_col2}</div>\
+</div>\
 </div>"
             );
 
