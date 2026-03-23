@@ -814,24 +814,31 @@ async fn index(
             let query_words: Vec<String> = q.split_whitespace()
                 .map(|w| w.to_lowercase()).collect();
             let relevance_penalty = |r: &SearchResult, rank: f64| -> f64 {
+                if r.sources.iter().any(|s| s == "smallweb news") {
+                    return rank;
+                }
                 let text = format!("{} {}", r.title, r.description).to_lowercase();
-                let text_words: HashSet<&str> = text
-                    .split(|c: char| !c.is_alphanumeric())
-                    .filter(|w: &&str| !w.is_empty())
-                    .collect();
-                let all_present = query_words.iter()
-                    .all(|w| text_words.contains(w.as_str()));
+                let all_present = query_words.iter().all(|w| text.contains(w.as_str()));
                 if all_present { rank } else { rank * 2.0 + 6.0 }
+            };
+
+            let kw_cull = |mut results: Vec<SearchResult>| -> Vec<SearchResult> {
+                if query_words.is_empty() { return results; }
+                results.retain(|r| {
+                    let text = format!("{} {} {}", r.title, r.description, r.url).to_lowercase();
+                    query_words.iter().any(|w| text.contains(w.as_str()))
+                });
+                results
             };
 
             // Pre-filter smol sources so we can augment big results with their source names
             let smol_vecs = [
-                filter(reddit), filter(wiby), filter(marginalia),
-                filter(searchmysite), filter(smallweb),
+                kw_cull(filter(reddit)), kw_cull(filter(wiby)), kw_cull(filter(marginalia)),
+                kw_cull(filter(searchmysite)), kw_cull(filter(smallweb)),
             ];
 
             let mut big = rank_and_dedup(
-                &[filter(brave), filter(brave_news), filter(mwmbl), filter(britannica), filter(apnews)],
+                &[filter(brave), kw_cull(filter(brave_news)), kw_cull(filter(mwmbl)), kw_cull(filter(britannica)), kw_cull(filter(apnews))],
                 &mut seen,
                 |r, rank| {
                     let rank = relevance_penalty(r, rank);
