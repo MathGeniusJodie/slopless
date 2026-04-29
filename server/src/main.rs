@@ -1,15 +1,20 @@
 use axum::{
+    body::Body,
     extract::{Query, State},
-    response::Html,
+    response::Response,
     routing::get,
     Router,
 };
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use reqwest::Client;
 use scraper::{Html as ScraperHtml, Selector};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio_stream::wrappers::ReceiverStream;
 
 #[derive(Clone)]
 struct FeedEntry {
@@ -702,7 +707,7 @@ fn search_feed(entries: &[FeedEntry], query: &str) -> Vec<SearchResult> {
         .collect()
 }
 
-async fn fetch_smallweb(state: &AppState, query: &str) -> Vec<SearchResult> {
+async fn fetch_smallweb(state: Arc<AppState>, query: &str) -> Vec<SearchResult> {
     use std::time::{Duration, Instant};
     // Return cached entries if fresh
     {
@@ -752,6 +757,10 @@ fn html_escape(s: &str) -> String {
 }
 
 fn render_result(r: &SearchResult) -> String {
+    render_result_cls(r, "")
+}
+
+fn render_result_cls(r: &SearchResult, extra_class: &str) -> String {
     let img_class = if r.sources.contains(&"brave".to_string()) { "result-img result-img-square" } else { "result-img" };
     let img_html = match &r.image {
         Some(src) => format!(
@@ -764,8 +773,9 @@ fn render_result(r: &SearchResult) -> String {
         .map(|s| format!("<span class=\"source-{}\">{}</span>", html_escape(&s.replace(' ', "-")), html_escape(s)))
         .collect::<Vec<_>>()
         .join(" ");
+    let div_class = if extra_class.is_empty() { "result".to_string() } else { format!("result {extra_class}") };
     format!(
-        "<div class=\"result\">\
+        "<div class=\"{div_class}\">\
 {img}\
 <div class=\"result-source\">{sources_html}</div>\
 <div class=\"result-title\"><a href=\"{url}\">{title}</a></div>\
@@ -785,126 +795,126 @@ const INDEX_HTML: &str = include_str!("index.html");
 async fn index(
     Query(params): Query<SearchParams>,
     State(state): State<Arc<AppState>>,
-) -> Html<String> {
+) -> Response {
     let query = params.q.filter(|q| !q.is_empty());
 
-    let (status, results_html) = match query.as_deref() {
-        None => (String::new(), String::new()),
-        Some(q) => {
-            let (wiby, brave, brave_news, marginalia, mwmbl, searchmysite, britannica, reddit, smallweb, apnews) = tokio::join!(
-                fetch_wiby(&state.client, q),
-                fetch_brave(&state.client, q),
-                fetch_brave_news(&state.client, q),
-                fetch_marginalia(&state.client, q),
-                fetch_mwmbl(&state.client, q),
-                fetch_searchmysite(&state.client, q),
-                fetch_britannica(&state.client, q),
-                fetch_reddit(&state.client, q),
-                fetch_smallweb(&state, q),
-                fetch_apnews(&state.client, q),
-            );
-
-            let filter = |mut results: Vec<SearchResult>| -> Vec<SearchResult> {
-                results.retain(|r| !is_blocked(&r.url, &state.blocked));
-                results
-            };
-
-            let mut seen = HashSet::new();
-            let news_sources = ["apnews", "brave news"];
-            let query_words: Vec<String> = q.split_whitespace()
-                .map(|w| w.to_lowercase()).collect();
-            let relevance_penalty = |r: &SearchResult, rank: f64| -> f64 {
-                if r.sources.iter().any(|s| s == "smallweb news") {
-                    return rank;
-                }
-                let text = format!("{} {}", r.title, r.description).to_lowercase();
-                let all_present = query_words.iter().all(|w| text.contains(w.as_str()));
-                if all_present { rank } else { rank * 2.0 + 6.0 }
-            };
-
-            let kw_cull = |mut results: Vec<SearchResult>| -> Vec<SearchResult> {
-                if query_words.is_empty() { return results; }
-                results.retain(|r| {
-                    let text = format!("{} {} {}", r.title, r.description, r.url).to_lowercase();
-                    query_words.iter().any(|w| text.contains(w.as_str()))
-                });
-                results
-            };
-
-            // Pre-filter smol sources so we can augment big results with their source names
-            let smol_vecs = [
-                kw_cull(filter(reddit)), kw_cull(filter(wiby)), kw_cull(filter(marginalia)),
-                kw_cull(filter(searchmysite)), kw_cull(filter(smallweb)),
-            ];
-
-            let mut big = rank_and_dedup(
-                &[filter(brave), kw_cull(filter(brave_news)), kw_cull(filter(mwmbl)), kw_cull(filter(britannica)), kw_cull(filter(apnews))],
-                &mut seen,
-                |r, rank| {
-                    let rank = relevance_penalty(r, rank);
-                    if r.sources.iter().any(|s| news_sources.contains(&s.as_str())) {
-                        rank * 2.0 + 6.0
-                    } else {
-                        rank
-                    }
-                },
-            );
-
-            // For any smol result whose URL is already in big, add its source name to the big result
-            let big_key_to_idx: HashMap<String, usize> = big.iter().enumerate()
-                .map(|(i, r)| (url_dedup_key(&r.url), i))
-                .collect();
-            for source_vec in &smol_vecs {
-                for result in source_vec {
-                    let key = url_dedup_key(&result.url);
-                    if let Some(&idx) = big_key_to_idx.get(&key) {
-                        let new_src = &result.sources[0];
-                        if !big[idx].sources.contains(new_src) {
-                            big[idx].sources.push(new_src.clone());
-                        }
-                        if new_src == "reddit" {
-                            big[idx].url = result.url.clone();
-                        }
-                    }
-                }
-            }
-
-            let smol = rank_and_dedup(
-                &smol_vecs,
-                &mut seen,
-                |r, rank| relevance_penalty(r, rank),
-            );
-
-            let total = smol.len() + big.len();
-            let images_url = format!("https://search.brave.com/images?q={}", urlencoding::encode(q));
-            let status = format!(
-                "{total} results &nbsp;&middot;&nbsp; <a href=\"{}\">images</a>",
-                html_escape(&images_url)
-            );
-
-            let smol_html: String = smol.iter().map(render_result).collect();
-            let big_col1: String = big.iter().step_by(2).map(render_result).collect();
-            let big_col2: String = big.iter().skip(1).step_by(2).map(render_result).collect();
-            let results_html = format!(
-                "<div id=\"results\">\
-<div class=\"column\"><div class=\"column-label\">Discovery</div>{smol_html}</div>\
-<div class=\"column-big\"><div class=\"column-label\">Web</div>\
-<div class=\"column\">{big_col1}</div>\
-<div class=\"column\">{big_col2}</div>\
-</div>\
-</div>"
-            );
-
-            (status, results_html)
-        }
+    let Some(q) = query else {
+        let page = INDEX_HTML
+            .replace("{{QUERY}}", "")
+            .replace("{{STATUS}}", "")
+            .replace("{{RESULTS}}", "");
+        return Response::builder()
+            .header("content-type", "text/html; charset=utf-8")
+            .body(Body::from(page))
+            .unwrap();
     };
 
-    let page = INDEX_HTML
-        .replace("{{QUERY}}", &html_escape(query.as_deref().unwrap_or("")))
-        .replace("{{STATUS}}", &status)
-        .replace("{{RESULTS}}", &results_html);
+    let images_url = format!("https://search.brave.com/images?q={}", urlencoding::encode(&q));
+    let status = format!("<a href=\"{}\">images</a>", html_escape(&images_url));
+    let full = INDEX_HTML
+        .replace("{{QUERY}}", &html_escape(&q))
+        .replace("{{STATUS}}", &status);
+    let (head, tail) = full.split_once("{{RESULTS}}").unwrap();
+    let head = head.to_string();
+    let tail = tail.to_string();
 
-    Html(page)
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(32);
+
+    tokio::spawn(async move {
+        macro_rules! send {
+            ($s:expr) => {
+                if tx.send(Ok(String::from($s).into_bytes())).await.is_err() { return; }
+            }
+        }
+
+        let query_words: Vec<String> = q.split_whitespace().map(|w| w.to_lowercase()).collect();
+        let filter_chunk = |results: Vec<SearchResult>| -> Vec<SearchResult> {
+            results.into_iter()
+                .filter(|r| !is_blocked(&r.url, &state.blocked))
+                .filter(|r| {
+                    if query_words.is_empty() { return true; }
+                    let text = format!("{} {} {}", r.title, r.description, r.url).to_lowercase();
+                    query_words.iter().any(|w| text.contains(w.as_str()))
+                })
+                .collect()
+        };
+
+        send!(head);
+        send!("<div id=\"results\">");
+
+        // Web column streams first; CSS grid-column: 2 places it on the right
+        send!("<div class=\"column-big\"><div class=\"column-label\">Web</div>");
+
+        type Fut = Pin<Box<dyn std::future::Future<Output = Vec<SearchResult>> + Send>>;
+
+        macro_rules! fetch {
+            ($fn:ident, $client:expr, $q:expr) => {{
+                let c = $client.clone();
+                let q = $q.clone();
+                Box::pin(async move { $fn(&c, &q).await }) as Fut
+            }};
+        }
+
+        let mut web_futs: FuturesUnordered<Fut> = FuturesUnordered::new();
+        web_futs.push(fetch!(fetch_brave, state.client, q));
+        web_futs.push(fetch!(fetch_brave_news, state.client, q));
+        web_futs.push(fetch!(fetch_mwmbl, state.client, q));
+        web_futs.push(fetch!(fetch_britannica, state.client, q));
+        web_futs.push(fetch!(fetch_apnews, state.client, q));
+
+        let mut side = 0u8;
+        let mut web_remainder: Vec<SearchResult> = Vec::new();
+        while let Some(results) = web_futs.next().await {
+            let mut iter = filter_chunk(results).into_iter();
+            for r in iter.by_ref().take(4) {
+                let cls = if side % 2 == 0 { "result-left" } else { "result-right" };
+                send!(render_result_cls(&r, cls));
+                side += 1;
+            }
+            web_remainder.extend(iter);
+        }
+        for r in web_remainder {
+            let cls = if side % 2 == 0 { "result-left" } else { "result-right" };
+            send!(render_result_cls(&r, cls));
+            side += 1;
+        }
+        send!("</div>"); // close column-big
+
+        // Discovery column streams second; CSS grid-column: 1 places it on the left
+        send!("<div class=\"column\"><div class=\"column-label\">Discovery</div>");
+
+        let mut disc_futs: FuturesUnordered<Fut> = FuturesUnordered::new();
+        disc_futs.push(fetch!(fetch_wiby, state.client, q));
+        disc_futs.push(fetch!(fetch_marginalia, state.client, q));
+        disc_futs.push(fetch!(fetch_searchmysite, state.client, q));
+        disc_futs.push(fetch!(fetch_reddit, state.client, q));
+        {
+            let s = Arc::clone(&state);
+            let q = q.clone();
+            disc_futs.push(Box::pin(async move { fetch_smallweb(s, &q).await }));
+        }
+
+        let mut disc_remainder: Vec<SearchResult> = Vec::new();
+        while let Some(results) = disc_futs.next().await {
+            let mut iter = filter_chunk(results).into_iter();
+            for r in iter.by_ref().take(4) {
+                send!(render_result(&r));
+            }
+            disc_remainder.extend(iter);
+        }
+        for r in disc_remainder {
+            send!(render_result(&r));
+        }
+        send!("</div>"); // close column
+
+        send!("</div>"); // close #results
+        send!(tail);
+    });
+
+    Response::builder()
+        .header("content-type", "text/html; charset=utf-8")
+        .body(Body::from_stream(ReceiverStream::new(rx)))
+        .unwrap()
 }
 
 #[tokio::main]
